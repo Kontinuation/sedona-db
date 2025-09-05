@@ -29,6 +29,11 @@ pub(crate) struct ConcurrentReservation {
     /// The size of reservation. This should be equal to `reservation.size()`. This is used to
     /// minimize contention and avoid growing the underlying reservation in the fast path.
     reserved_size: AtomicUsize,
+    /// Current size of the logical reservation. `reserved_size` will be incremented
+    /// and `reservation` will be grown when current_size overshoots `reserved_size`.
+    current_size: AtomicUsize,
+    /// Extra amount of memory allocated ahead of time each time we grow the `reservation`.
+    /// This is for reducing the frequency of growing the underlying reservation.
     prealloc_size: usize,
 }
 
@@ -39,8 +44,16 @@ impl ConcurrentReservation {
         Ok(Self {
             reservation: Mutex::new(reservation),
             reserved_size: AtomicUsize::new(actual_size),
+            current_size: AtomicUsize::new(actual_size),
             prealloc_size,
         })
+    }
+
+    /// Reserve additional memory for the reservation.
+    pub fn reserve(&self, additional: usize) -> Result<()> {
+        let old_size = self.current_size.fetch_add(additional, Ordering::Relaxed);
+        let new_size = old_size + additional;
+        self.resize(new_size)
     }
 
     /// Resize the reservation to the given size. If the new size is smaller or equal to the current
@@ -48,26 +61,26 @@ impl ConcurrentReservation {
     /// the new size. This is for reducing the frequency of growing the underlying reservation.
     pub fn resize(&self, new_size: usize) -> Result<()> {
         // Fast path: the reserved size is already large enough, no need to lock and grow the reservation
-        if new_size <= self.reserved_size.load(Ordering::Relaxed) {
+        if new_size <= self.reserved_size.load(Ordering::Acquire) {
             return Ok(());
         }
 
         // Slow path: lock the mutex for possible reservation growth
         let mut reservation = self.reservation.lock();
-        let current_size = reservation.size();
+        let underlying_size = reservation.size();
 
         // Double-check under the lock in case another thread already grew it
-        if new_size <= current_size {
+        if new_size <= underlying_size {
             return Ok(());
         }
 
         // Grow the reservation to the target size
-        let growth_needed = new_size + self.prealloc_size - current_size;
+        let growth_needed = new_size + self.prealloc_size - underlying_size;
         reservation.try_grow(growth_needed)?;
 
         // Update our atomic to reflect the new size
         let final_size = reservation.size();
-        self.reserved_size.store(final_size, Ordering::Relaxed);
+        self.reserved_size.store(final_size, Ordering::Release);
 
         Ok(())
     }
