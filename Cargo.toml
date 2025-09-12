@@ -87,7 +87,8 @@ libmimalloc-sys = { version = "0.1", default-features = false }
 geos = { version = "10.0.0", features = ["geo"] }
 
 # Use our own fork of georust/geo, which implements generic computational geometry algorithms for geo-traits
-geo-generic-alg = { git = "https://github.com/wherobots/geo.git", branch = "generic-alg", package = "geo-generic-alg" }
+# geo-generic-alg = { git = "https://github.com/wherobots/geo.git", branch = "generic-alg", package = "geo-generic-alg" }
+geo-generic-alg = { path = "/Users/bopeng/workspace/github/geo/geo-generic-alg" }
 geo-types = "0.7.16"
 geo-traits = "0.2.0"
 geo-traits-ext = "0.1.0"

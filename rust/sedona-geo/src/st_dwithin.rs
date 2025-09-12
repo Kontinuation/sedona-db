@@ -20,15 +20,13 @@ use arrow_array::builder::BooleanBuilder;
 use arrow_schema::DataType;
 use datafusion_common::{error::Result, DataFusionError};
 use datafusion_expr::ColumnarValue;
-use geo::{Distance, Euclidean};
+use geo_generic_alg::line_measures::DistanceExt;
 use sedona_expr::scalar_udf::{ScalarKernelRef, SedonaScalarKernel};
 use sedona_functions::executor::WkbExecutor;
 use sedona_schema::{datatypes::SedonaType, matchers::ArgMatcher};
 use wkb::reader::Wkb;
 
-use crate::to_geo::item_to_geometry;
-
-/// ST_DWithin() implementation using [EuclideanDistance]
+/// ST_DWithin() implementation using [DistanceExt]
 pub fn st_dwithin_impl() -> ScalarKernelRef {
     Arc::new(STDWithin {})
 }
@@ -89,12 +87,7 @@ impl SedonaScalarKernel for STDWithin {
 }
 
 fn invoke_scalar(wkb_a: &Wkb, wkb_b: &Wkb, max_distance: f64) -> Result<bool> {
-    // Convert WKB to geo types for distance calculation
-    let geom_a = item_to_geometry(wkb_a)?;
-    let geom_b = item_to_geometry(wkb_b)?;
-
-    // Calculate euclidean distance and compare with max_distance
-    let actual_distance = Euclidean.distance(&geom_a, &geom_b);
+    let actual_distance = wkb_a.distance_ext(wkb_b);
     Ok(actual_distance <= max_distance)
 }
 

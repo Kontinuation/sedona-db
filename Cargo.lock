@@ -2617,7 +2617,6 @@ dependencies = [
 [[package]]
 name = "geo-generic-alg"
 version = "0.1.0"
-source = "git+https://github.com/wherobots/geo.git?branch=generic-alg#86f5f3aba769d998336a3c36ac0a3d9f5536596f"
 dependencies = [
  "earcutr",
  "float_next_after",
