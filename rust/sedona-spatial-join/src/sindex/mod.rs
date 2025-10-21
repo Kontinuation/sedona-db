@@ -1,7 +1,6 @@
-pub mod index_builder;
-pub mod collect;
-pub mod indexed_batch;
-
-pub trait SpatialIndex {
-
-}
+mod index_builder;
+mod collect;
+mod build_side_batch;
+mod index;
+mod inmem;
+mod external;

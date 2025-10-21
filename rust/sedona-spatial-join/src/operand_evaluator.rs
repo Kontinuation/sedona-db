@@ -98,15 +98,9 @@ pub(crate) struct EvaluatedGeometryArray {
     pub rects: Vec<(usize, Rect<f32>)>,
     /// The distance value produced by evaluating the distance expression.
     pub distance: Option<ColumnarValue>,
-    /// The array of WKBs of the geometries unwrapped from the geometry array. It is a reference to
-    /// some of the columns of the `geometry_array`. We need to keep it here since the WKB values reference
-    /// buffers inside the geometry array, but we'll only allow accessing Wkb<'a> where 'a is the lifetime of
-    /// the GeometryBatchResult to make the interfaces safe.
-    #[allow(dead_code)]
-    wkb_array: ArrayRef,
-    /// WKBs of the geometries in `wkb_array`. The wkb values reference buffers inside the geometry array,
+    /// WKBs of the geometries in `geometry_array`. The wkb values reference buffers inside the geometry array,
     /// but we'll only allow accessing Wkb<'a> where 'a is the lifetime of the GeometryBatchResult to make
-    /// the interfaces safe. The buffers in `wkb_array` are allocated on the heap and won't be moved when
+    /// the interfaces safe. The buffers in `geometry_array` are allocated on the heap and won't be moved when
     /// the GeometryBatchResult is moved, so we don't need to worry about pinning.
     wkbs: Vec<Option<Wkb<'static>>>,
 }
@@ -115,10 +109,9 @@ impl EvaluatedGeometryArray {
     pub fn try_new(geometry_array: ArrayRef, sedona_type: &SedonaType) -> Result<Self> {
         let num_rows = geometry_array.len();
         let mut rect_vec = Vec::with_capacity(num_rows);
-        let wkb_array = geometry_array.clone();
         let mut wkbs = Vec::with_capacity(num_rows);
         let mut idx = 0;
-        wkb_array.iter_as_wkb(sedona_type, num_rows, |wkb_opt| {
+        geometry_array.iter_as_wkb(sedona_type, num_rows, |wkb_opt| {
             if let Some(wkb) = &wkb_opt {
                 if let Some(rect) = wkb.bounding_rect() {
                     let min = rect.min();
@@ -134,7 +127,10 @@ impl EvaluatedGeometryArray {
             Ok(())
         })?;
 
-        // Safety: The wkbs must reference buffers inside the `wkb_array`.
+        // Safety: The wkbs must reference buffers inside the `geometry_array`. Since the `geometry_array` and
+        // `wkbs` are both owned by the `EvaluatedGeometryArray`, so they have the same lifetime. We'll never
+        // have a situation where the `EvaluatedGeometryArray` is dropped while the `wkbs` are still in use
+        // (guaranteed by the scope of the `wkbs` field and lifetime signature of the `wkbs` method).
         let wkbs = wkbs
             .into_iter()
             .map(|wkb| wkb.map(|wkb| unsafe { transmute(wkb) }))
@@ -143,7 +139,6 @@ impl EvaluatedGeometryArray {
             geometry_array,
             rects: rect_vec,
             distance: None,
-            wkb_array,
             wkbs,
         })
     }
@@ -167,8 +162,6 @@ impl EvaluatedGeometryArray {
         // should be small, so the inaccuracy does not matter too much.
         let wkb_vec_size = self.wkbs.allocated_size();
 
-        // We do not take wkb_array into consideration, since it is a reference to some of the
-        // columns of the geometry_array.
         self.geometry_array.get_array_memory_size()
             + self.rects.allocated_size()
             + distance_in_mem_size
