@@ -151,7 +151,7 @@ impl SpatialJoinProbeMetrics {
                 .counter("probe_input_batches", partition),
             probe_input_rows: MetricBuilder::new(metrics).counter("probe_input_rows", partition),
             output_batches: MetricBuilder::new(metrics).counter("output_batches", partition),
-            output_rows: MetricBuilder::new(metrics).counter("output_rows", partition),
+            output_rows: MetricBuilder::new(metrics).output_rows(partition),
             join_result_candidates: MetricBuilder::new(metrics)
                 .counter("join_result_candidates", partition),
             join_result_count: MetricBuilder::new(metrics).counter("join_result_count", partition),
