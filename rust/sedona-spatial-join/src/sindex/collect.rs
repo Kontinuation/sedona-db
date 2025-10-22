@@ -76,8 +76,8 @@ impl futures::Stream for ExternalBuildSideBatchStream {
 }
 
 pub(crate) struct BuildPartition {
-    build_side_batch_stream: SendableBuildSideBatchStream,
-    geo_statistics: GeoStatistics,
+    pub build_side_batch_stream: SendableBuildSideBatchStream,
+    pub geo_statistics: GeoStatistics,
 }
 
 pub(crate) struct CollectBuildSideMetrics {
@@ -179,6 +179,7 @@ impl BuildSideBatchesCollector {
                 Some(spill_file) => {
                     // TODO: create a temporary batch with extended schema to include evaluated geometry columns
                     spill_file.append_batch(&build_side_batch.batch)?;
+                    unimplemented!("spilling build side to disk while collecting is not implemented")
                 }
             }
         }

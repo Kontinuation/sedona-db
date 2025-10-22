@@ -32,5 +32,5 @@ pub use optimizer::register_spatial_join_optimizer;
 // Re-export option types from sedona-common for convenience
 pub use sedona_common::option::*;
 
-// TODO: WIP out-of-core spatial join
+// TODO: WIP restored spatial index to support both in-memory and out-of-core spatial join
 mod sindex;
