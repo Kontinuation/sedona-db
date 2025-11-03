@@ -90,12 +90,13 @@ pub(crate) fn create_operand_evaluator(
 
 /// Result of evaluating a geometry batch.
 pub(crate) struct EvaluatedGeometryArray {
+    /// Type of geometry_array
+    pub sedona_type: SedonaType,
     /// The array of geometries produced by evaluating the geometry expression.
     pub geometry_array: ArrayRef,
-    /// The rects of the geometries in the geometry array. Each geometry could be covered by a collection
-    /// of multiple rects. The first element of the tuple is the index of the geometry in the geometry array.
-    /// This array is guaranteed to be sorted by the index of the geometry.
-    pub rects: Vec<(usize, Rect<f32>)>,
+    /// The rects of the geometries in the geometry array. The length of this array is equal to the number of geometries.
+    /// The rects will be None for empty or null geometries.
+    pub rects: Vec<Option<Rect<f32>>>,
     /// The distance value produced by evaluating the distance expression.
     pub distance: Option<ColumnarValue>,
     /// WKBs of the geometries in `geometry_array`. The wkb values reference buffers inside the geometry array,
@@ -119,7 +120,9 @@ impl EvaluatedGeometryArray {
                     // f64_box_to_f32 will ensure the resulting `f32` box is no smaller than the `f64` box.
                     let (min_x, min_y, max_x, max_y) = f64_box_to_f32(min.x, min.y, max.x, max.y);
                     let rect = Rect::new(coord!(x: min_x, y: min_y), coord!(x: max_x, y: max_y));
-                    rect_vec.push((idx, rect));
+                    rect_vec.push(Some(rect));
+                } else {
+                    rect_vec.push(None);
                 }
             }
             wkbs.push(wkb_opt);
@@ -136,6 +139,7 @@ impl EvaluatedGeometryArray {
             .map(|wkb| wkb.map(|wkb| unsafe { transmute(wkb) }))
             .collect();
         Ok(Self {
+            sedona_type: sedona_type.clone(),
             geometry_array,
             rects: rect_vec,
             distance: None,
@@ -238,7 +242,10 @@ impl DistanceOperandEvaluator {
         let distance_columnar_value = distance_columnar_value.cast_to(&DataType::Float64, None)?;
         match &distance_columnar_value {
             ColumnarValue::Scalar(ScalarValue::Float64(Some(distance))) => {
-                result.rects.iter_mut().for_each(|(_, rect)| {
+                result.rects.iter_mut().for_each(|rect_opt| {
+                    let Some(rect) = rect_opt else {
+                        return;
+                    };
                     expand_rect_in_place(rect, *distance);
                 });
             }
@@ -248,9 +255,12 @@ impl DistanceOperandEvaluator {
             }
             ColumnarValue::Array(array) => {
                 if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
-                    for (geom_idx, rect) in result.rects.iter_mut() {
-                        if !array.is_null(*geom_idx) {
-                            let dist = array.value(*geom_idx);
+                    for (geom_idx, rect_opt) in result.rects.iter_mut().enumerate() {
+                        if !array.is_null(geom_idx) {
+                            let dist = array.value(geom_idx);
+                            let Some(rect) = rect_opt else {
+                                continue;
+                            };
                             expand_rect_in_place(rect, dist);
                         }
                     }
