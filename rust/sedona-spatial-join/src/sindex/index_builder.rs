@@ -8,7 +8,7 @@ use sedona_common::{SedonaOptions, SpatialJoinOptions};
 use sedona_expr::statistics::GeoStatistics;
 use datafusion_common::Result;
 
-use crate::{concurrent_reservation::ConcurrentReservation, operand_evaluator::create_operand_evaluator, sindex::{build_side_batch::{BuildSideBatch, SendableBuildSideBatchStream}, collect::{BuildPartition, BuildSideBatchesCollector, CollectBuildSideMetrics}, index::SpatialIndex, inmem::index_builder::InMemorySpatialIndexBuilder}, spatial_predicate::SpatialPredicate};
+use crate::{operand_evaluator::create_operand_evaluator, sindex::{build_side_batch::{BuildSideBatch, SendableBuildSideBatchStream}, collect::{BuildPartition, BuildSideBatchesCollector, CollectBuildSideMetrics}, index::SpatialIndex, inmem::index_builder::InMemorySpatialIndexBuilder}, spatial_predicate::SpatialPredicate};
 
 pub(crate) trait SpatialIndexBuilder {
     async fn add_partitions(&mut self, partitions: Vec<BuildPartition>) -> Result<()>;
@@ -71,7 +71,7 @@ const REFINER_RESERVATION_PREALLOC_SIZE: usize = 10 * 1024 * 1024; // 10MB
 
 pub(crate) async fn build_index(
     context: Arc<TaskContext>,
-    mut build_schema: SchemaRef,
+    build_schema: SchemaRef,
     build_streams: Vec<SendableRecordBatchStream>,
     spatial_predicate: SpatialPredicate,
     join_type: JoinType,
@@ -89,22 +89,19 @@ pub(crate) async fn build_index(
     let memory_pool = context.memory_pool();
     let runtime_env = context.runtime_env();
     let spill_compression = session_config.spill_compression();
-
-    let consumer = MemoryConsumer::new("collect_build_side").with_can_spill(true);
-    let reservation = consumer.register(memory_pool);
-    let concurrent_reservation = ConcurrentReservation::try_new(REFINER_RESERVATION_PREALLOC_SIZE, reservation)?;
-
     let evaluator = create_operand_evaluator(&spatial_predicate, sedona_options.spatial_join.clone());
-
-    let collector = BuildSideBatchesCollector::new(evaluator, Arc::new(concurrent_reservation), runtime_env, spill_compression);
-
+    let collector = BuildSideBatchesCollector::new(evaluator, runtime_env, spill_compression);
     let num_partitions = build_streams.len();
     let mut build_metrics = Vec::with_capacity(num_partitions);
+    let mut reservations = Vec::with_capacity(num_partitions);
     for k in 0..num_partitions {
+        let consumer = MemoryConsumer::new(format!("SpatialJoinCollectBuildSide[{}]", k)).with_can_spill(true);
+        let reservation = consumer.register(memory_pool);
+        reservations.push(reservation);
         build_metrics.push(CollectBuildSideMetrics::new(k, metrics));
     }
 
-    let build_partitions = collector.collect_all(build_streams, build_metrics).await?;
+    let build_partitions = collector.collect_all(build_streams, reservations, build_metrics).await?;
 
     build_spatial_index(
         build_schema,

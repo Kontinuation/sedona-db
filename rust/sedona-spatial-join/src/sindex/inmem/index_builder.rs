@@ -112,11 +112,14 @@ impl InMemorySpatialIndexBuilder {
 
         for (batch_idx, batch) in self.indexed_batches.iter().enumerate() {
             let rects = batch.rects();
-            for (idx, rect) in rects {
+            for (idx, rect_opt) in rects.iter().enumerate() {
+                let Some(rect) = rect_opt else {
+                    continue;
+                };
                 let min = rect.min();
                 let max = rect.max();
                 let data_idx = rtree_builder.add(min.x, min.y, max.x, max.y);
-                batch_pos_vec[data_idx as usize] = (batch_idx as i32, *idx as i32);
+                batch_pos_vec[data_idx as usize] = (batch_idx as i32, idx as i32);
             }
         }
 
