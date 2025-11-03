@@ -111,22 +111,23 @@ impl EvaluatedGeometryArray {
         let num_rows = geometry_array.len();
         let mut rect_vec = Vec::with_capacity(num_rows);
         let mut wkbs = Vec::with_capacity(num_rows);
-        let mut idx = 0;
         geometry_array.iter_as_wkb(sedona_type, num_rows, |wkb_opt| {
-            if let Some(wkb) = &wkb_opt {
+            let rect_opt = if let Some(wkb) = &wkb_opt {
                 if let Some(rect) = wkb.bounding_rect() {
                     let min = rect.min();
                     let max = rect.max();
                     // f64_box_to_f32 will ensure the resulting `f32` box is no smaller than the `f64` box.
                     let (min_x, min_y, max_x, max_y) = f64_box_to_f32(min.x, min.y, max.x, max.y);
                     let rect = Rect::new(coord!(x: min_x, y: min_y), coord!(x: max_x, y: max_y));
-                    rect_vec.push(Some(rect));
+                    Some(rect)
                 } else {
-                    rect_vec.push(None);
+                    None
                 }
-            }
+            } else {
+                None
+            };
+            rect_vec.push(rect_opt);
             wkbs.push(wkb_opt);
-            idx += 1;
             Ok(())
         })?;
 

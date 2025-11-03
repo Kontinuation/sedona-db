@@ -20,7 +20,20 @@ use futures::StreamExt;
 use geo_index::rtree::{sort::HilbertSort, RTree, RTreeBuilder};
 use parking_lot::Mutex;
 
-use crate::{operand_evaluator::create_operand_evaluator, refine::create_refiner, sindex::{build_side_batch::{BuildSideBatch, SendableBuildSideBatchStream}, collect::BuildPartition, index::SpatialIndex, index_builder::{SpatialIndexBuilder, SpatialJoinBuildMetrics}, inmem::{index::InMemorySpatialIndex, RTreeBuildResult, RTREE_MEMORY_ESTIMATE_PER_RECT}, utils::KnnComponents}, spatial_predicate::SpatialPredicate, utils::need_produce_result_in_final};
+use crate::{
+    operand_evaluator::create_operand_evaluator,
+    refine::create_refiner,
+    sindex::{
+        build_side_batch::{BuildSideBatch, SendableBuildSideBatchStream},
+        collect::BuildPartition,
+        index::SpatialIndex,
+        index_builder::{SpatialIndexBuilder, SpatialJoinBuildMetrics},
+        inmem::{index::InMemorySpatialIndex, RTreeBuildResult, RTREE_MEMORY_ESTIMATE_PER_RECT},
+        utils::KnnComponents,
+    },
+    spatial_predicate::SpatialPredicate,
+    utils::need_produce_result_in_final,
+};
 
 /// Builder for constructing a SpatialIndex from geometry batches.
 ///
@@ -100,11 +113,11 @@ impl InMemorySpatialIndexBuilder {
         let num_rects = self
             .indexed_batches
             .iter()
-            .map(|batch| batch.rects().len())
+            .map(|batch| batch.rects().iter().flatten().count())
             .sum::<usize>();
 
         let mut rtree_builder = RTreeBuilder::<f32>::new(num_rects as u32);
-        let mut batch_pos_vec = vec![(0, 0); num_rects];
+        let mut batch_pos_vec = vec![(-1, -1); num_rects];
         let rtree_mem_estimate = num_rects * RTREE_MEMORY_ESTIMATE_PER_RECT;
 
         self.reservation
@@ -247,8 +260,9 @@ impl SpatialIndexBuilder for InMemorySpatialIndexBuilder {
         self.with_stats(stats);
         Ok(())
     }
-    
+
     fn build(self) -> Result<Arc<dyn SpatialIndex>> {
-        self.finish().map(|index| Arc::new(index) as Arc<dyn SpatialIndex>)
+        self.finish()
+            .map(|index| Arc::new(index) as Arc<dyn SpatialIndex>)
     }
 }

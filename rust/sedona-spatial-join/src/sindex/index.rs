@@ -7,7 +7,7 @@ use datafusion_common::Result;
 pub trait SpatialIndex {
     /// Get the batch at the given index.
     fn get_indexed_batch(&self, batch_idx: usize) -> &RecordBatch;
-    
+
     /// Query the spatial index with a probe geometry to find matching build-side geometries.
     ///
     /// This method implements a two-phase spatial join query:
@@ -61,7 +61,6 @@ pub trait SpatialIndex {
         build_batch_positions: &mut Vec<(i32, i32)>,
     ) -> Result<JoinResultMetrics>;
 }
-
 
 #[derive(Debug)]
 pub struct JoinResultMetrics {

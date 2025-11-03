@@ -7,8 +7,8 @@ use futures::Stream;
 use geo::Rect;
 use wkb::reader::Wkb;
 
-use datafusion_common::Result;
 use crate::operand_evaluator::EvaluatedGeometryArray;
+use datafusion_common::Result;
 
 /// BuildSide batch containing the original record batch from the build side and the evaluated
 /// geometry array.

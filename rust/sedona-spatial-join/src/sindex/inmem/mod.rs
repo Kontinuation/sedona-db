@@ -8,5 +8,5 @@ type RTreeBuildResult = (SpatialRTree, DataIdToBatchPos);
 /// Rough estimate for in-memory size of the rtree per rect in bytes
 const RTREE_MEMORY_ESTIMATE_PER_RECT: usize = 60;
 
-pub(crate) mod index_builder;
 pub(crate) mod index;
+pub(crate) mod index_builder;
