@@ -61,7 +61,7 @@ pub struct GeometryTypeSet {
     ///   1 << 4: MULTILINESTRING
     ///   1 << 5: MULTIPOLYGON
     ///   1 << 6: GEOMETRYCOLLECTION
-    /// 
+    ///
     /// XYZ types (ordinary XY types shifts 8 bits left):
     ///   1 << 8: POINTZ
     ///   1 << 9: LINESTRINGZ
@@ -70,7 +70,7 @@ pub struct GeometryTypeSet {
     ///   1 << 12: MULTILINESTRINGZ
     ///   1 << 13: MULTIPOLYGONZ
     ///   1 << 14: GEOMETRYCOLLECTIONZ
-    /// 
+    ///
     /// XYM types (ordinary XY types shifts 16 bits left):
     ///   1 << 16: POINTM
     ///   1 << 17: LINESTRINGM
@@ -79,7 +79,7 @@ pub struct GeometryTypeSet {
     ///   1 << 20: MULTILINESTRINGM
     ///   1 << 21: MULTIPOLYGONM
     ///   1 << 22: GEOMETRYCOLLECTIONM
-    /// 
+    ///
     /// XYZM types: (ordinary XY types shifts 24 bits left):
     ///   1 << 24: POINTZM
     ///   1 << 25: LINESTRINGZM
@@ -92,7 +92,7 @@ pub struct GeometryTypeSet {
 }
 
 impl GeometryTypeSet {
-    fn new() -> Self  {
+    fn new() -> Self {
         Self { types: 0 }
     }
 
@@ -100,7 +100,7 @@ impl GeometryTypeSet {
         let bit_position = match type_and_dim.geometry_type() {
             sedona_geometry::types::GeometryTypeId::Geometry => {
                 return;
-            },
+            }
             sedona_geometry::types::GeometryTypeId::Point => 0,
             sedona_geometry::types::GeometryTypeId::LineString => 1,
             sedona_geometry::types::GeometryTypeId::Polygon => 2,

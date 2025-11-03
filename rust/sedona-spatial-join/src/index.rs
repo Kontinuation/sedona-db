@@ -164,11 +164,11 @@ impl SpatialIndexBuilder {
         let num_rects = self
             .indexed_batches
             .iter()
-            .map(|batch| batch.rects().len())
+            .map(|batch| batch.rects().iter().flatten().count())
             .sum::<usize>();
 
         let mut rtree_builder = RTreeBuilder::<f32>::new(num_rects as u32);
-        let mut batch_pos_vec = vec![(0, 0); num_rects];
+        let mut batch_pos_vec = vec![(-1, -1); num_rects];
         let rtree_mem_estimate = num_rects * RTREE_MEMORY_ESTIMATE_PER_RECT;
 
         self.reservation
@@ -464,18 +464,13 @@ impl SpatialIndex {
     ) -> Result<JoinResultMetrics> {
         let min = probe_rect.min();
         let max = probe_rect.max();
-        let mut candidates = self.rtree.search(min.x, min.y, max.x, max.y);
+        let candidates = self.rtree.search(min.x, min.y, max.x, max.y);
         if candidates.is_empty() {
             return Ok(JoinResultMetrics {
                 count: 0,
                 candidate_count: 0,
             });
         }
-
-        // Sort and dedup candidates to avoid duplicate results when we index one geometry
-        // using several boxes.
-        candidates.sort_unstable();
-        candidates.dedup();
 
         // Refine the candidates retrieved from the r-tree index by evaluating the actual spatial predicate
         self.refine(probe_wkb, &candidates, distance, build_batch_positions)

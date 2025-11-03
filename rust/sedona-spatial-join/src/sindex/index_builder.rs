@@ -1,14 +1,26 @@
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
-use datafusion_execution::{memory_pool::{MemoryConsumer, MemoryPool}, SendableRecordBatchStream, TaskContext};
+use datafusion_common::Result;
+use datafusion_execution::{
+    memory_pool::{MemoryConsumer, MemoryPool},
+    SendableRecordBatchStream, TaskContext,
+};
 use datafusion_expr::JoinType;
 use datafusion_physical_plan::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder};
 use sedona_common::{SedonaOptions, SpatialJoinOptions};
 use sedona_expr::statistics::GeoStatistics;
-use datafusion_common::Result;
 
-use crate::{operand_evaluator::create_operand_evaluator, sindex::{build_side_batch::{BuildSideBatch, SendableBuildSideBatchStream}, collect::{BuildPartition, BuildSideBatchesCollector, CollectBuildSideMetrics}, index::SpatialIndex, inmem::index_builder::InMemorySpatialIndexBuilder}, spatial_predicate::SpatialPredicate};
+use crate::{
+    operand_evaluator::create_operand_evaluator,
+    sindex::{
+        build_side_batch::{BuildSideBatch, SendableBuildSideBatchStream},
+        collect::{BuildPartition, BuildSideBatchesCollector, CollectBuildSideMetrics},
+        index::SpatialIndex,
+        inmem::index_builder::InMemorySpatialIndexBuilder,
+    },
+    spatial_predicate::SpatialPredicate,
+};
 
 pub(crate) trait SpatialIndexBuilder {
     async fn add_partitions(&mut self, partitions: Vec<BuildPartition>) -> Result<()>;
@@ -46,7 +58,9 @@ pub(crate) async fn build_spatial_index(
     metrics: SpatialJoinBuildMetrics,
     build_partitions: Vec<BuildPartition>,
 ) -> Result<Arc<dyn SpatialIndex>> {
-    let contains_external_stream = build_partitions.iter().any(|partition| partition.build_side_batch_stream.is_external());
+    let contains_external_stream = build_partitions
+        .iter()
+        .any(|partition| partition.build_side_batch_stream.is_external());
     if !contains_external_stream {
         let mut index_builder = InMemorySpatialIndexBuilder::new(
             schema,
@@ -78,7 +92,6 @@ pub(crate) async fn build_index(
     probe_threads_count: usize,
     metrics: &ExecutionPlanMetricsSet,
 ) -> Result<Arc<dyn SpatialIndex>> {
-
     let session_config = context.session_config();
     let sedona_options = session_config
         .options()
@@ -89,19 +102,23 @@ pub(crate) async fn build_index(
     let memory_pool = context.memory_pool();
     let runtime_env = context.runtime_env();
     let spill_compression = session_config.spill_compression();
-    let evaluator = create_operand_evaluator(&spatial_predicate, sedona_options.spatial_join.clone());
+    let evaluator =
+        create_operand_evaluator(&spatial_predicate, sedona_options.spatial_join.clone());
     let collector = BuildSideBatchesCollector::new(evaluator, runtime_env, spill_compression);
     let num_partitions = build_streams.len();
     let mut build_metrics = Vec::with_capacity(num_partitions);
     let mut reservations = Vec::with_capacity(num_partitions);
     for k in 0..num_partitions {
-        let consumer = MemoryConsumer::new(format!("SpatialJoinCollectBuildSide[{}]", k)).with_can_spill(true);
+        let consumer =
+            MemoryConsumer::new(format!("SpatialJoinCollectBuildSide[{}]", k)).with_can_spill(true);
         let reservation = consumer.register(memory_pool);
         reservations.push(reservation);
         build_metrics.push(CollectBuildSideMetrics::new(k, metrics));
     }
 
-    let build_partitions = collector.collect_all(build_streams, reservations, build_metrics).await?;
+    let build_partitions = collector
+        .collect_all(build_streams, reservations, build_metrics)
+        .await?;
 
     build_spatial_index(
         build_schema,
@@ -112,5 +129,6 @@ pub(crate) async fn build_index(
         Arc::clone(memory_pool),
         SpatialJoinBuildMetrics::new(0, metrics),
         build_partitions,
-    ).await
+    )
+    .await
 }

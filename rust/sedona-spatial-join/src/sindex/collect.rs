@@ -1,23 +1,49 @@
-use std::{collections::VecDeque, pin::Pin, sync::Arc, task::{Context, Poll}, time::{Duration, Instant}};
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
 
-use arrow::{array::{Float32Array, Float32Builder, Float64Array, NullBufferBuilder, StructBuilder}, buffer::NullBuffer, ipc::{writer::StreamWriter, RecordBatchBuilder}};
+use arrow::{
+    array::{Float32Array, Float32Builder, Float64Array, NullBufferBuilder, StructBuilder},
+    buffer::NullBuffer,
+    ipc::{writer::StreamWriter, RecordBatchBuilder},
+};
 use arrow_array::{Array, RecordBatch, StructArray};
 use arrow_schema::{DataType, Field, Fields, Schema};
-use geo::coord;
 use datafusion::config::SpillCompression;
 use datafusion_common::{DataFusionError, Result, ScalarValue};
 use datafusion_common_runtime::JoinSet;
-use datafusion_execution::{disk_manager::RefCountedTempFile, memory_pool::{MemoryConsumer, MemoryReservation}, runtime_env::{self, RuntimeEnv}, SendableRecordBatchStream};
+use datafusion_execution::{
+    disk_manager::RefCountedTempFile,
+    memory_pool::{MemoryConsumer, MemoryReservation},
+    runtime_env::{self, RuntimeEnv},
+    SendableRecordBatchStream,
+};
 use datafusion_expr::ColumnarValue;
-use datafusion_physical_plan::{metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, ScopedTimerGuard, SpillMetrics, Time}, spill, SpillManager};
+use datafusion_physical_plan::{
+    metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, ScopedTimerGuard, SpillMetrics, Time},
+    spill, SpillManager,
+};
 use futures::{future, stream::Collect, Stream, StreamExt};
+use geo::coord;
 use geo_types::Rect;
 use sedona_expr::statistics::GeoStatistics;
 use sedona_functions::st_analyze_aggr::AnalyzeAccumulator;
 use sedona_schema::datatypes::{SedonaType, WKB_GEOMETRY};
 use wkb::reader::Wkb;
 
-use crate::{concurrent_reservation::ConcurrentReservation, index::SpatialJoinBuildMetrics, operand_evaluator::{EvaluatedGeometryArray, OperandEvaluator}, sindex::{build_side_batch::{BuildSideBatch, BuildSideBatchStream, SendableBuildSideBatchStream}, collect}};
+use crate::{
+    concurrent_reservation::ConcurrentReservation,
+    index::SpatialJoinBuildMetrics,
+    operand_evaluator::{EvaluatedGeometryArray, OperandEvaluator},
+    sindex::{
+        build_side_batch::{BuildSideBatch, BuildSideBatchStream, SendableBuildSideBatchStream},
+        collect,
+    },
+};
 
 struct InMemoryBuildSideBatchStream {
     batches: VecDeque<BuildSideBatch>,
@@ -25,7 +51,9 @@ struct InMemoryBuildSideBatchStream {
 
 impl InMemoryBuildSideBatchStream {
     fn new(batches: Vec<BuildSideBatch>) -> Self {
-        InMemoryBuildSideBatchStream { batches: VecDeque::from(batches) }
+        InMemoryBuildSideBatchStream {
+            batches: VecDeque::from(batches),
+        }
     }
 }
 
@@ -33,11 +61,11 @@ impl BuildSideBatchStream for InMemoryBuildSideBatchStream {
     fn is_external(&self) -> bool {
         false
     }
-    
+
     fn reservation(&self) -> &MemoryReservation {
         todo!()
     }
-    
+
     fn take_reservation(self) -> MemoryReservation {
         todo!()
     }
@@ -46,10 +74,7 @@ impl BuildSideBatchStream for InMemoryBuildSideBatchStream {
 impl futures::Stream for InMemoryBuildSideBatchStream {
     type Item = Result<BuildSideBatch>;
 
-    fn poll_next(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let front = self.get_mut().batches.pop_front();
         match front {
             Some(batch) => Poll::Ready(Some(Ok(batch))),
@@ -72,11 +97,11 @@ impl BuildSideBatchStream for ExternalBuildSideBatchStream {
     fn is_external(&self) -> bool {
         true
     }
-    
+
     fn reservation(&self) -> &MemoryReservation {
         todo!()
     }
-    
+
     fn take_reservation(self) -> MemoryReservation {
         todo!()
     }
@@ -85,10 +110,7 @@ impl BuildSideBatchStream for ExternalBuildSideBatchStream {
 impl futures::Stream for ExternalBuildSideBatchStream {
     type Item = Result<BuildSideBatch>;
 
-    fn poll_next(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         todo!()
     }
 }
@@ -119,8 +141,10 @@ impl CollectBuildSideMetrics {
         Self {
             num_batches: MetricBuilder::new(metrics).counter("build_input_batches", partition),
             num_rows: MetricBuilder::new(metrics).counter("build_input_rows", partition),
-            total_size_bytes: MetricBuilder::new(metrics).gauge("build_input_total_size_bytes", partition),
-            time_taken: MetricBuilder::new(metrics).subset_time("build_input_collection_time", partition),
+            total_size_bytes: MetricBuilder::new(metrics)
+                .gauge("build_input_total_size_bytes", partition),
+            time_taken: MetricBuilder::new(metrics)
+                .subset_time("build_input_collection_time", partition),
             spill_metrics: SpillMetrics::new(metrics, partition),
         }
     }
@@ -138,11 +162,24 @@ pub(crate) struct BuildSideBatchesCollector {
 }
 
 impl BuildSideBatchesCollector {
-    pub fn new(evaluator: Arc<dyn OperandEvaluator>, runtime_env: Arc<RuntimeEnv>, spill_compression: SpillCompression) -> Self {
-        BuildSideBatchesCollector { evaluator, runtime_env, spill_compression }
+    pub fn new(
+        evaluator: Arc<dyn OperandEvaluator>,
+        runtime_env: Arc<RuntimeEnv>,
+        spill_compression: SpillCompression,
+    ) -> Self {
+        BuildSideBatchesCollector {
+            evaluator,
+            runtime_env,
+            spill_compression,
+        }
     }
 
-    pub async fn collect(&self, mut stream: SendableRecordBatchStream, mut reservation: MemoryReservation, metrics: &CollectBuildSideMetrics) -> Result<BuildPartition> {
+    pub async fn collect(
+        &self,
+        mut stream: SendableRecordBatchStream,
+        mut reservation: MemoryReservation,
+        metrics: &CollectBuildSideMetrics,
+    ) -> Result<BuildPartition> {
         let evaluator = self.evaluator.as_ref();
         let mut spill_file_opt = None;
         let mut spill_manager_opt: Option<SpillManager> = None;
@@ -177,8 +214,13 @@ impl BuildSideBatchesCollector {
                 if reservation.try_grow(in_mem_size).is_err() {
                     // Spill all in memory batches, and write future batches to spill file
                     let schema = build_side_batch.batch.schema();
-                    let spill_manager = SpillManager::new(Arc::clone(&self.runtime_env), metrics.spill_metrics.clone(), schema);
-                    let mut in_progress_file = spill_manager.create_in_progress_file("collect_build_partition")?;
+                    let spill_manager = SpillManager::new(
+                        Arc::clone(&self.runtime_env),
+                        metrics.spill_metrics.clone(),
+                        schema,
+                    );
+                    let mut in_progress_file =
+                        spill_manager.create_in_progress_file("collect_build_partition")?;
                     for in_mem_batch in &in_mem_batches {
                         let spilled_batch = build_side_batch_to_spilled_batch(&in_mem_batch)?;
                         in_progress_file.append_batch(&spilled_batch)?;
@@ -207,34 +249,40 @@ impl BuildSideBatchesCollector {
                 match finished {
                     Some(temp_file) => {
                         // let stream = spill_manager_opt.unwrap().read_spill_as_stream(temp_file);
-                        Box::pin(ExternalBuildSideBatchStream::new(spill_manager_opt.unwrap(), temp_file))
-                    },
+                        Box::pin(ExternalBuildSideBatchStream::new(
+                            spill_manager_opt.unwrap(),
+                            temp_file,
+                        ))
+                    }
                     None => Box::pin(InMemoryBuildSideBatchStream::new(vec![])),
                 }
             }
-            None => {
-                Box::pin(InMemoryBuildSideBatchStream::new(in_mem_batches))
-            }
+            None => Box::pin(InMemoryBuildSideBatchStream::new(in_mem_batches)),
         };
-    
+
         Ok(BuildPartition {
             build_side_batch_stream,
             geo_statistics: analyzer.finish(),
         })
     }
 
-    pub async fn collect_all(&self, streams: Vec<SendableRecordBatchStream>, reservations: Vec<MemoryReservation>, metrics_vec: Vec<CollectBuildSideMetrics>) -> Result<Vec<BuildPartition>> {
+    pub async fn collect_all(
+        &self,
+        streams: Vec<SendableRecordBatchStream>,
+        reservations: Vec<MemoryReservation>,
+        metrics_vec: Vec<CollectBuildSideMetrics>,
+    ) -> Result<Vec<BuildPartition>> {
         if streams.is_empty() {
             return Ok(vec![]);
         }
 
         // Spawn all tasks to scan all build streams concurrently
         let mut join_set = JoinSet::new();
-        for (partition_id, ((stream, metrics), reservation)) in 
-            streams.into_iter()
-                .zip(metrics_vec)
-                .zip(reservations)
-                .enumerate() 
+        for (partition_id, ((stream, metrics), reservation)) in streams
+            .into_iter()
+            .zip(metrics_vec)
+            .zip(reservations)
+            .enumerate()
         {
             let collector = self.clone();
             join_set.spawn(async move {
@@ -243,7 +291,7 @@ impl BuildSideBatchesCollector {
             });
         }
 
-        // Wait for all async tasks to finish. Results may be returned in arbitrary order, 
+        // Wait for all async tasks to finish. Results may be returned in arbitrary order,
         // so we need to reorder them by partition_id later.
         let results = join_set.join_all().await;
 
@@ -260,22 +308,28 @@ impl BuildSideBatchesCollector {
     }
 }
 
-fn schema_of_spilled_build_side_batch(orig_schema: &Schema, sedona_type: &SedonaType) -> Result<Schema> {
-    let data_field = Field::new("data", DataType::Struct(orig_schema.fields().clone()), false);
+fn schema_of_spilled_build_side_batch(
+    orig_schema: &Schema,
+    sedona_type: &SedonaType,
+) -> Result<Schema> {
+    let data_field = Field::new(
+        "data",
+        DataType::Struct(orig_schema.fields().clone()),
+        false,
+    );
     let geom_field = sedona_type.to_storage_field("geom", true)?;
-    let rect_field = Field::new("rect", DataType::Struct(Fields::from(vec![
-        Field::new("min_x", DataType::Float32, false),
-        Field::new("min_y", DataType::Float32, false),
-        Field::new("max_x", DataType::Float32, false),
-        Field::new("max_y", DataType::Float32, false),
-    ])), true);
+    let rect_field = Field::new(
+        "rect",
+        DataType::Struct(Fields::from(vec![
+            Field::new("min_x", DataType::Float32, false),
+            Field::new("min_y", DataType::Float32, false),
+            Field::new("max_x", DataType::Float32, false),
+            Field::new("max_y", DataType::Float32, false),
+        ])),
+        true,
+    );
     let dist_field = Field::new("dist", DataType::Float64, true);
-    let schema = Schema::new(vec![
-        data_field,
-        geom_field,
-        rect_field,
-        dist_field,
-    ]);
+    let schema = Schema::new(vec![data_field, geom_field, rect_field, dist_field]);
     Ok(schema)
 }
 
@@ -295,12 +349,7 @@ fn build_side_batch_to_spilled_batch(build_side_batch: &BuildSideBatch) -> Resul
     ]);
     let rect_field = Field::new("rect", DataType::Struct(rect_inner_fields.clone()), true);
     let dist_field = Field::new("dist", DataType::Float64, true);
-    let schema = Schema::new(vec![
-        data_struct_field,
-        geom_field,
-        rect_field,
-        dist_field,
-    ]);
+    let schema = Schema::new(vec![data_struct_field, geom_field, rect_field, dist_field]);
 
     let data_batch = &build_side_batch.batch;
     let data_arrays = data_batch.columns().to_vec();
@@ -338,31 +387,36 @@ fn build_side_batch_to_spilled_batch(build_side_batch: &BuildSideBatch) -> Resul
     let max_y_array = max_y_builder.finish();
     let null_buffer = null_buffer_builder.finish();
 
-    let rect_array = StructArray::try_new(rect_inner_fields, vec![
-        Arc::new(min_x_array),
-        Arc::new(min_y_array),
-        Arc::new(max_x_array),
-        Arc::new(max_y_array),
-    ], null_buffer)?;
+    let rect_array = StructArray::try_new(
+        rect_inner_fields,
+        vec![
+            Arc::new(min_x_array),
+            Arc::new(min_y_array),
+            Arc::new(max_x_array),
+            Arc::new(max_y_array),
+        ],
+        null_buffer,
+    )?;
 
     let mut dist_builder = arrow::array::Float64Builder::with_capacity(num_rows);
     match &geom_array.distance {
-        Some(ColumnarValue::Scalar(scalar)) => {
-            match scalar {
-                ScalarValue::Float64(dist_value) => {
-                    for _ in 0..num_rows {
-                        dist_builder.append_option(*dist_value);
-                    }
-                },
-                _ => {
-                    return Err(DataFusionError::Internal(
-                        "Distance columnar value is not a Float64Array".to_string(),
-                    ));
+        Some(ColumnarValue::Scalar(scalar)) => match scalar {
+            ScalarValue::Float64(dist_value) => {
+                for _ in 0..num_rows {
+                    dist_builder.append_option(*dist_value);
                 }
             }
-        }
+            _ => {
+                return Err(DataFusionError::Internal(
+                    "Distance columnar value is not a Float64Array".to_string(),
+                ));
+            }
+        },
         Some(ColumnarValue::Array(array)) => {
-            let float_array = array.as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+            let float_array = array
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap();
             dist_builder.append_array(float_array);
         }
         None => {
@@ -387,67 +441,75 @@ fn build_side_batch_to_spilled_batch(build_side_batch: &BuildSideBatch) -> Resul
 
 fn spilled_batch_to_build_side_batch(record_batch: RecordBatch) -> Result<BuildSideBatch> {
     // Extract the data struct array (column 0) and convert back to the original RecordBatch
-    let data_array = record_batch.column(0)
+    let data_array = record_batch
+        .column(0)
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| DataFusionError::Internal(
-            "Expected data column to be a StructArray".to_string()
-        ))?;
-    
+        .ok_or_else(|| {
+            DataFusionError::Internal("Expected data column to be a StructArray".to_string())
+        })?;
+
     let data_schema = Arc::new(Schema::new(match data_array.data_type() {
         DataType::Struct(fields) => fields.clone(),
-        _ => return Err(DataFusionError::Internal(
-            "Expected data column to have Struct data type".to_string()
-        )),
+        _ => {
+            return Err(DataFusionError::Internal(
+                "Expected data column to have Struct data type".to_string(),
+            ))
+        }
     }));
-    
+
     let data_columns = (0..data_array.num_columns())
         .map(|i| Arc::clone(data_array.column(i)))
         .collect::<Vec<_>>();
-    
+
     let batch = RecordBatch::try_new(data_schema, data_columns)?;
-    
+
     // Extract the geometry array (column 1)
     let geom_array = Arc::clone(record_batch.column(1));
-    
+
     // Determine the SedonaType from the geometry field in the record batch schema
     let schema = record_batch.schema();
     let geom_field = schema.field(1);
     let sedona_type = SedonaType::from_storage_field(geom_field)?;
-    
+
     // Extract the rect array (column 2) and convert back to Vec<Option<Rect<f32>>>
-    let rect_array = record_batch.column(2)
+    let rect_array = record_batch
+        .column(2)
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| DataFusionError::Internal(
-            "Expected rect column to be a StructArray".to_string()
-        ))?;
-    
-    let min_x_array = rect_array.column(0)
+        .ok_or_else(|| {
+            DataFusionError::Internal("Expected rect column to be a StructArray".to_string())
+        })?;
+
+    let min_x_array = rect_array
+        .column(0)
         .as_any()
         .downcast_ref::<Float32Array>()
-        .ok_or_else(|| DataFusionError::Internal(
-            "Expected min_x to be Float32Array".to_string()
-        ))?;
-    let min_y_array = rect_array.column(1)
+        .ok_or_else(|| {
+            DataFusionError::Internal("Expected min_x to be Float32Array".to_string())
+        })?;
+    let min_y_array = rect_array
+        .column(1)
         .as_any()
         .downcast_ref::<Float32Array>()
-        .ok_or_else(|| DataFusionError::Internal(
-            "Expected min_y to be Float32Array".to_string()
-        ))?;
-    let max_x_array = rect_array.column(2)
+        .ok_or_else(|| {
+            DataFusionError::Internal("Expected min_y to be Float32Array".to_string())
+        })?;
+    let max_x_array = rect_array
+        .column(2)
         .as_any()
         .downcast_ref::<Float32Array>()
-        .ok_or_else(|| DataFusionError::Internal(
-            "Expected max_x to be Float32Array".to_string()
-        ))?;
-    let max_y_array = rect_array.column(3)
+        .ok_or_else(|| {
+            DataFusionError::Internal("Expected max_x to be Float32Array".to_string())
+        })?;
+    let max_y_array = rect_array
+        .column(3)
         .as_any()
         .downcast_ref::<Float32Array>()
-        .ok_or_else(|| DataFusionError::Internal(
-            "Expected max_y to be Float32Array".to_string()
-        ))?;
-    
+        .ok_or_else(|| {
+            DataFusionError::Internal("Expected max_y to be Float32Array".to_string())
+        })?;
+
     let mut rects = Vec::with_capacity(rect_array.len());
     for i in 0..rect_array.len() {
         if rect_array.is_null(i) {
@@ -457,22 +519,20 @@ fn spilled_batch_to_build_side_batch(record_batch: RecordBatch) -> Result<BuildS
             let min_y = min_y_array.value(i);
             let max_x = max_x_array.value(i);
             let max_y = max_y_array.value(i);
-            let rect = Rect::new(
-                coord! { x: min_x, y: min_y },
-                coord! { x: max_x, y: max_y }
-            );
+            let rect = Rect::new(coord! { x: min_x, y: min_y }, coord! { x: max_x, y: max_y });
             rects.push(Some(rect));
         }
     }
-    
+
     // Extract the distance array (column 3) and convert back to ColumnarValue
-    let dist_array = record_batch.column(3)
+    let dist_array = record_batch
+        .column(3)
         .as_any()
         .downcast_ref::<Float64Array>()
-        .ok_or_else(|| DataFusionError::Internal(
-            "Expected dist column to be Float64Array".to_string()
-        ))?;
-    
+        .ok_or_else(|| {
+            DataFusionError::Internal("Expected dist column to be Float64Array".to_string())
+        })?;
+
     let distance = if dist_array.len() > 0 {
         // Check if all values are the same (scalar case)
         let first_value = if dist_array.is_null(0) {
@@ -480,7 +540,7 @@ fn spilled_batch_to_build_side_batch(record_batch: RecordBatch) -> Result<BuildS
         } else {
             Some(dist_array.value(0))
         };
-        
+
         let all_same = (1..dist_array.len()).all(|i| {
             let current_value = if dist_array.is_null(i) {
                 None
@@ -489,7 +549,7 @@ fn spilled_batch_to_build_side_batch(record_batch: RecordBatch) -> Result<BuildS
             };
             current_value == first_value
         });
-        
+
         if all_same {
             Some(ColumnarValue::Scalar(ScalarValue::Float64(first_value)))
         } else {
@@ -498,16 +558,13 @@ fn spilled_batch_to_build_side_batch(record_batch: RecordBatch) -> Result<BuildS
     } else {
         None
     };
-    
+
     // Create EvaluatedGeometryArray
     let mut geom_array = EvaluatedGeometryArray::try_new(geom_array, &sedona_type)?;
     geom_array.distance = distance;
     // Note: rects are already computed in try_new, but we need to replace them with the ones from the spilled batch
     // because the spilled batch may have been modified (e.g., filtered)
     geom_array.rects = rects;
-    
-    Ok(BuildSideBatch {
-        batch,
-        geom_array,
-    })
+
+    Ok(BuildSideBatch { batch, geom_array })
 }

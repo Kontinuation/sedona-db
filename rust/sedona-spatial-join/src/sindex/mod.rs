@@ -1,7 +1,7 @@
-mod index_builder;
-mod collect;
 mod build_side_batch;
-mod index;
-mod inmem;
+mod collect;
 mod external;
+mod index;
+mod index_builder;
+mod inmem;
 mod utils;

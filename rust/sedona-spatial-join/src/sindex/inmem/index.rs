@@ -30,7 +30,17 @@ use sedona_schema::datatypes::WKB_GEOMETRY;
 use wkb::reader::Wkb;
 
 use crate::{
-    concurrent_reservation::ConcurrentReservation, index::IndexQueryResult, operand_evaluator::{create_operand_evaluator, EvaluatedGeometryArray, OperandEvaluator}, refine::{create_refiner, IndexQueryResultRefiner}, sindex::{build_side_batch::BuildSideBatch, index::{JoinResultMetrics, SpatialIndex}, utils::{KnnComponents, SedonaKnnAdapter}}, spatial_predicate::SpatialPredicate, utils::need_produce_result_in_final
+    concurrent_reservation::ConcurrentReservation,
+    index::IndexQueryResult,
+    operand_evaluator::{create_operand_evaluator, EvaluatedGeometryArray, OperandEvaluator},
+    refine::{create_refiner, IndexQueryResultRefiner},
+    sindex::{
+        build_side_batch::BuildSideBatch,
+        index::{JoinResultMetrics, SpatialIndex},
+        utils::{KnnComponents, SedonaKnnAdapter},
+    },
+    spatial_predicate::SpatialPredicate,
+    utils::need_produce_result_in_final,
 };
 use arrow::array::BooleanBufferBuilder;
 use sedona_common::{option::SpatialJoinOptions, ExecutionMode};
