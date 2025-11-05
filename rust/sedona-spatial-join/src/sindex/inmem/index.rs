@@ -30,7 +30,6 @@ use sedona_schema::datatypes::WKB_GEOMETRY;
 use wkb::reader::Wkb;
 
 use crate::{
-    concurrent_reservation::ConcurrentReservation,
     index::IndexQueryResult,
     operand_evaluator::{create_operand_evaluator, EvaluatedGeometryArray, OperandEvaluator},
     refine::{create_refiner, IndexQueryResultRefiner},
