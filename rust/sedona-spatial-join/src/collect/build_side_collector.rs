@@ -131,7 +131,7 @@ impl BuildSideBatchesCollector {
                     let mut in_progress_file =
                         spill_manager.create_in_progress_file("collect_build_partition")?;
                     for in_mem_batch in &in_mem_batches {
-                        let spilled_batch = build_side_batch_to_spilled_batch(&in_mem_batch)?;
+                        let spilled_batch = build_side_batch_to_spilled_batch(in_mem_batch)?;
                         in_progress_file.append_batch(&spilled_batch)?;
                     }
                     in_mem_batches.clear();

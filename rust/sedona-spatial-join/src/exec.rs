@@ -141,7 +141,7 @@ pub struct SpatialJoinExec {
 }
 
 impl SpatialJoinExec {
-    // Try to create a new [`SpatialJoinExec`]
+    /// Try to create a new [`SpatialJoinExec`]
     pub fn try_new(
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,

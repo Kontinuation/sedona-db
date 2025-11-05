@@ -228,6 +228,8 @@ impl SpatialIndexBuilder {
             num_geoms,
             self.stats,
         );
+        let refiner_mem_usage = refiner.estimate_max_memory_usage(&self.indexed_batches);
+        self.reservation.try_grow(refiner_mem_usage)?;
 
         let cache_size = batch_pos_vec.len();
         let knn_components =

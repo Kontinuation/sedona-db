@@ -21,7 +21,9 @@ use sedona_common::{ExecutionMode, SpatialJoinOptions, SpatialLibrary};
 use sedona_expr::statistics::GeoStatistics;
 use wkb::reader::Wkb;
 
-use crate::{index::IndexQueryResult, spatial_predicate::SpatialPredicate};
+use crate::{
+    collect::BuildSideBatch, index::IndexQueryResult, spatial_predicate::SpatialPredicate,
+};
 
 /// Trait for refining spatial index query results by evaluating exact geometric predicates.
 ///
@@ -58,6 +60,20 @@ pub(crate) trait IndexQueryResultRefiner: Send + Sync {
         probe: &Wkb<'_>,
         index_query_results: &[IndexQueryResult],
     ) -> Result<Vec<(i32, i32)>>;
+
+    /// Estimate the maximum memory usage of the refiner in bytes. Some refiner may hold prepared
+    /// geometry in memory to accelerate predicate evaluations and consume non-trivial amount of
+    /// memory. This method estimates the maximum memory usage based on the build-side geometry
+    /// batches that will be processed. The estimation may not be accurate. The actual memory usage
+    /// can be obtained from spatial join metrics (see [`crate::stream::SpatialJoinProbeMetrics`]
+    /// for more details)
+    ///
+    //// # Arguments
+    /// * `build_batches` - The build-side geometry batches that will be processed by the refiner.
+    ///
+    /// # Returns
+    /// * `usize` - Estimated maximum memory usage in bytes
+    fn estimate_max_memory_usage(&self, build_batches: &[BuildSideBatch]) -> usize;
 
     /// Get the current memory usage of the refiner in bytes.
     ///

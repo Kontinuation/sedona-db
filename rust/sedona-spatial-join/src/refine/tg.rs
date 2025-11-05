@@ -29,6 +29,7 @@ use sedona_tg::tg::{self, BinaryPredicate};
 use wkb::reader::Wkb;
 
 use crate::{
+    collect::BuildSideBatch,
     index::IndexQueryResult,
     refine::{
         exec_mode_selector::{get_or_update_execution_mode, ExecModeSelector, SelectOptimalMode},
@@ -264,6 +265,23 @@ impl IndexQueryResultRefiner for TgRefiner {
                     "Speculative execution mode should be translated to other execution modes"
                 )
             }
+        }
+    }
+
+    fn estimate_max_memory_usage(&self, build_batches: &[BuildSideBatch]) -> usize {
+        if self.exec_mode.get().unwrap_or(&ExecutionMode::PrepareBuild)
+            == &ExecutionMode::PrepareBuild
+        {
+            let mut total_bytes = 0;
+            for build_batch in build_batches {
+                for wkb in build_batch.geom_array.wkbs().iter().flatten() {
+                    // TODO: this is a rough estimation
+                    total_bytes += wkb.buf().len() * 2;
+                }
+            }
+            total_bytes
+        } else {
+            0
         }
     }
 

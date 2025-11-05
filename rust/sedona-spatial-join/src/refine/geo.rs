@@ -25,6 +25,7 @@ use sedona_geo_generic_alg::{line_measures::DistanceExt, Intersects};
 use wkb::reader::Wkb;
 
 use crate::{
+    collect::BuildSideBatch,
     index::IndexQueryResult,
     refine::{
         exec_mode_selector::{get_or_update_execution_mode, ExecModeSelector, SelectOptimalMode},
@@ -172,6 +173,10 @@ impl IndexQueryResultRefiner for GeoRefiner {
                 )
             }
         }
+    }
+
+    fn estimate_max_memory_usage(&self, _build_batches: &[BuildSideBatch]) -> usize {
+        0
     }
 
     fn mem_usage(&self) -> usize {

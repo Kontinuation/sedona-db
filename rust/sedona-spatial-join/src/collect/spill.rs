@@ -17,7 +17,7 @@ pub(crate) fn build_side_batch_to_spilled_batch(
     let orig_schema = build_side_batch.batch.schema();
     let geom_array = &build_side_batch.geom_array;
     let sedona_type = &geom_array.sedona_type;
-    let data_inner_fields = Fields::from(orig_schema.fields().clone());
+    let data_inner_fields = orig_schema.fields().clone();
     let data_struct_field = Field::new("data", DataType::Struct(data_inner_fields.clone()), false);
     let geom_field = sedona_type.to_storage_field("geom", true)?;
 
@@ -43,9 +43,7 @@ pub(crate) fn build_side_batch_to_spilled_batch(
     let mut max_y_builder = Float32Builder::with_capacity(num_rows);
     let mut null_buffer_builder = NullBufferBuilder::new_with_len(num_rows);
 
-    let rects = build_side_batch.rects();
-    for i in 0..num_rows {
-        let rect_opt = &rects[i];
+    for rect_opt in build_side_batch.rects() {
         if let Some(rect) = rect_opt {
             min_x_builder.append_value(rect.min().x);
             min_y_builder.append_value(rect.min().y);
@@ -216,7 +214,7 @@ pub(crate) fn spilled_batch_to_build_side_batch(
             DataFusionError::Internal("Expected dist column to be Float64Array".to_string())
         })?;
 
-    let distance = if dist_array.len() > 0 {
+    let distance = if !dist_array.is_empty() {
         // Check if all values are the same (scalar case)
         let first_value = if dist_array.is_null(0) {
             None

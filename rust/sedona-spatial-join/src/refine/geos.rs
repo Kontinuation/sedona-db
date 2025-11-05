@@ -28,6 +28,7 @@ use sedona_geos::wkb_to_geos::GEOSWkbFactory;
 use wkb::reader::Wkb;
 
 use crate::{
+    collect::BuildSideBatch,
     index::IndexQueryResult,
     refine::{
         exec_mode_selector::{get_or_update_execution_mode, ExecModeSelector, SelectOptimalMode},
@@ -283,9 +284,7 @@ impl GeosRefiner {
                 continue;
             };
             if is_newly_created {
-                // TODO: This ia a rough estimate of the memory usage of the prepared geometry and
-                // may not be accurate.
-                let prep_geom_size = index_result.wkb.buf().len() * 4;
+                let prep_geom_size = estimate_prep_geom_in_mem_size(index_result.wkb);
                 self.mem_usage.fetch_add(prep_geom_size, Ordering::Relaxed);
             }
             if self.evaluator.evaluate_prepare_build(
@@ -321,6 +320,12 @@ impl GeosRefiner {
     }
 }
 
+fn estimate_prep_geom_in_mem_size(wkb: &Wkb<'_>) -> usize {
+    // TODO: This is a rough estimate of the memory usage of the prepared geometry and
+    // may not be accurate.
+    wkb.buf().len() * 4
+}
+
 impl IndexQueryResultRefiner for GeosRefiner {
     fn refine(
         &self,
@@ -337,6 +342,23 @@ impl IndexQueryResultRefiner for GeosRefiner {
                     "Speculative execution mode should be translated to other execution modes"
                 )
             }
+        }
+    }
+
+    fn estimate_max_memory_usage(&self, build_batches: &[BuildSideBatch]) -> usize {
+        if self.exec_mode.get().unwrap_or(&ExecutionMode::PrepareBuild)
+            == &ExecutionMode::PrepareBuild
+        {
+            // Only estimate memory usage when exec mode could be prepare-build.
+            let mut total_bytes = 0;
+            for build_batch in build_batches {
+                for wkb in build_batch.geom_array.wkbs().iter().flatten() {
+                    total_bytes += estimate_prep_geom_in_mem_size(wkb);
+                }
+            }
+            total_bytes
+        } else {
+            0
         }
     }
 

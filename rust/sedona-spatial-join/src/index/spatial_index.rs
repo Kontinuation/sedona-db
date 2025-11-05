@@ -107,6 +107,7 @@ impl SpatialIndex {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         schema: SchemaRef,
         evaluator: Arc<dyn OperandEvaluator>,
