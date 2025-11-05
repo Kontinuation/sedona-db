@@ -20,7 +20,7 @@ use crate::{
 };
 
 /// Metrics for the build phase of the spatial join.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct SpatialJoinBuildMetrics {
     /// Total time for collecting build-side of join
     pub(crate) build_time: metrics::Time,

@@ -30,7 +30,7 @@ use wkb::reader::Wkb;
 
 use crate::{
     sindex::IndexQueryResult,
-    init_once_array::InitOnceArray,
+    utils::init_once_array::InitOnceArray,
     refine::{
         exec_mode_selector::{get_or_update_execution_mode, ExecModeSelector, SelectOptimalMode},
         IndexQueryResultRefiner,

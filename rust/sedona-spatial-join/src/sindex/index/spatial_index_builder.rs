@@ -18,11 +18,11 @@ use crate::{
         collect::BuildPartition,
         index::{spatial_index::SpatialIndex, RTreeBuildResult, RTREE_MEMORY_ESTIMATE_PER_RECT},
         index_builder::SpatialJoinBuildMetrics,
-        knn_adapter::KnnComponents,
+        index::knn_adapter::KnnComponents,
         BuildSideBatch,
     },
     spatial_predicate::SpatialPredicate,
-    utils::need_produce_result_in_final,
+    utils::join_utils::need_produce_result_in_final,
 };
 
 /// Builder for constructing a SpatialIndex from geometry batches.

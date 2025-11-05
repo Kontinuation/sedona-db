@@ -35,7 +35,7 @@ use datafusion_physical_plan::{
 use parking_lot::Mutex;
 
 use crate::{
-    SedonaOptions, once_fut::OnceAsync, sindex::{SpatialIndex, build_spatial_index}, spatial_predicate::{KNNPredicate, SpatialPredicate}, stream::{SpatialJoinProbeMetrics, SpatialJoinStream}, utils::{asymmetric_join_output_partitioning, boundedness_from_children}
+    SedonaOptions, utils::once_fut::OnceAsync, sindex::{SpatialIndex, build_spatial_index}, spatial_predicate::{KNNPredicate, SpatialPredicate}, stream::{SpatialJoinProbeMetrics, SpatialJoinStream}, utils::join_utils::{asymmetric_join_output_partitioning, boundedness_from_children}
 };
 
 /// Type alias for build and probe execution plans
