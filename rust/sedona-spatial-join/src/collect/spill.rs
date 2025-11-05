@@ -9,34 +9,7 @@ use geo::coord;
 use geo_types::Rect;
 use sedona_schema::datatypes::SedonaType;
 
-use crate::{
-    operand_evaluator::EvaluatedGeometryArray, sindex::collect::build_side_batch::BuildSideBatch,
-};
-
-fn schema_of_spilled_build_side_batch(
-    orig_schema: &Schema,
-    sedona_type: &SedonaType,
-) -> Result<Schema> {
-    let data_field = Field::new(
-        "data",
-        DataType::Struct(orig_schema.fields().clone()),
-        false,
-    );
-    let geom_field = sedona_type.to_storage_field("geom", true)?;
-    let rect_field = Field::new(
-        "rect",
-        DataType::Struct(Fields::from(vec![
-            Field::new("min_x", DataType::Float32, false),
-            Field::new("min_y", DataType::Float32, false),
-            Field::new("max_x", DataType::Float32, false),
-            Field::new("max_y", DataType::Float32, false),
-        ])),
-        true,
-    );
-    let dist_field = Field::new("dist", DataType::Float64, true);
-    let schema = Schema::new(vec![data_field, geom_field, rect_field, dist_field]);
-    Ok(schema)
-}
+use crate::{collect::build_side_batch::BuildSideBatch, operand_evaluator::EvaluatedGeometryArray};
 
 pub(crate) fn build_side_batch_to_spilled_batch(
     build_side_batch: &BuildSideBatch,
@@ -146,6 +119,7 @@ pub(crate) fn build_side_batch_to_spilled_batch(
     Ok(record_batch)
 }
 
+#[allow(dead_code)]
 pub(crate) fn spilled_batch_to_build_side_batch(
     record_batch: RecordBatch,
 ) -> Result<BuildSideBatch> {

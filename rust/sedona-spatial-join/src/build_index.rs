@@ -2,42 +2,19 @@ use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use datafusion_common::{DataFusionError, Result};
-use datafusion_execution::{
-    memory_pool::MemoryConsumer,
-    SendableRecordBatchStream, TaskContext,
-};
+use datafusion_execution::{memory_pool::MemoryConsumer, SendableRecordBatchStream, TaskContext};
 use datafusion_expr::JoinType;
-use datafusion_physical_plan::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder};
+use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use sedona_common::SedonaOptions;
 
 use crate::{
+    collect::{BuildSideBatchesCollector, CollectBuildSideMetrics},
+    index::{SpatialIndex, SpatialIndexBuilder, SpatialJoinBuildMetrics},
     operand_evaluator::create_operand_evaluator,
-    sindex::{
-        collect::{BuildSideBatchesCollector, CollectBuildSideMetrics},
-        index::{SpatialIndex, SpatialIndexBuilder},
-    },
     spatial_predicate::SpatialPredicate,
 };
 
-/// Metrics for the build phase of the spatial join.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct SpatialJoinBuildMetrics {
-    /// Total time for collecting build-side of join
-    pub(crate) build_time: metrics::Time,
-    /// Memory used by the spatial-index in bytes
-    pub(crate) build_mem_used: metrics::Gauge,
-}
-
-impl SpatialJoinBuildMetrics {
-    pub fn new(partition: usize, metrics: &ExecutionPlanMetricsSet) -> Self {
-        Self {
-            build_time: MetricBuilder::new(metrics).subset_time("build_time", partition),
-            build_mem_used: MetricBuilder::new(metrics).gauge("build_mem_used", partition),
-        }
-    }
-}
-
-pub(crate) async fn build_spatial_index(
+pub(crate) async fn build_index(
     context: Arc<TaskContext>,
     build_schema: SchemaRef,
     build_streams: Vec<SendableRecordBatchStream>,

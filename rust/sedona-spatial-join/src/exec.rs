@@ -35,7 +35,13 @@ use datafusion_physical_plan::{
 use parking_lot::Mutex;
 
 use crate::{
-    SedonaOptions, utils::once_fut::OnceAsync, sindex::{SpatialIndex, build_spatial_index}, spatial_predicate::{KNNPredicate, SpatialPredicate}, stream::{SpatialJoinProbeMetrics, SpatialJoinStream}, utils::join_utils::{asymmetric_join_output_partitioning, boundedness_from_children}
+    build_index::build_index,
+    index::SpatialIndex,
+    spatial_predicate::{KNNPredicate, SpatialPredicate},
+    stream::{SpatialJoinProbeMetrics, SpatialJoinStream},
+    utils::join_utils::{asymmetric_join_output_partitioning, boundedness_from_children},
+    utils::once_fut::OnceAsync,
+    SedonaOptions,
 };
 
 /// Type alias for build and probe execution plans
@@ -451,14 +457,15 @@ impl ExecutionPlan for SpatialJoinExec {
                             let probe_thread_count =
                                 self.right.output_partitioning().partition_count();
 
-                            Ok(build_spatial_index(
+                            Ok(build_index(
                                 Arc::clone(&context),
                                 build_side.schema(),
                                 build_streams,
                                 self.on.clone(),
                                 self.join_type,
                                 probe_thread_count,
-                                self.metrics.clone()))
+                                self.metrics.clone(),
+                            ))
                         })?
                 };
 
@@ -543,14 +550,15 @@ impl SpatialJoinExec {
 
                     let probe_thread_count = self.right.output_partitioning().partition_count();
 
-                    Ok(build_spatial_index(
+                    Ok(build_index(
                         Arc::clone(&context),
                         build_side.schema(),
                         build_streams,
                         self.on.clone(),
                         self.join_type,
                         probe_thread_count,
-                        self.metrics.clone()))
+                        self.metrics.clone(),
+                    ))
                 })?
         };
 

@@ -18,11 +18,11 @@ use sedona_geo_generic_alg::algorithm::Centroid;
 use wkb::reader::Wkb;
 
 use crate::{
-    operand_evaluator::{OperandEvaluator, create_operand_evaluator},
-    refine::{IndexQueryResultRefiner, create_refiner},
-    sindex::{
-        BuildSideBatch, index::{IndexQueryResult, QueryResultMetrics}, index::knn_adapter::{KnnComponents, SedonaKnnAdapter}
-    },
+    collect::BuildSideBatch,
+    index::knn_adapter::{KnnComponents, SedonaKnnAdapter},
+    index::{IndexQueryResult, QueryResultMetrics},
+    operand_evaluator::{create_operand_evaluator, OperandEvaluator},
+    refine::{create_refiner, IndexQueryResultRefiner},
     spatial_predicate::SpatialPredicate,
 };
 use arrow::array::BooleanBufferBuilder;
@@ -483,9 +483,9 @@ impl SpatialIndex {
 #[cfg(test)]
 mod tests {
     use crate::{
+        index::{SpatialIndexBuilder, SpatialJoinBuildMetrics},
         operand_evaluator::EvaluatedGeometryArray,
-        sindex::{index::SpatialIndexBuilder, index_builder::SpatialJoinBuildMetrics}, 
-        spatial_predicate::{RelationPredicate, SpatialRelationType}
+        spatial_predicate::{RelationPredicate, SpatialRelationType},
     };
 
     use super::*;

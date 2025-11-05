@@ -29,13 +29,13 @@ use sedona_tg::tg::{self, BinaryPredicate};
 use wkb::reader::Wkb;
 
 use crate::{
-    sindex::IndexQueryResult,
-    utils::init_once_array::InitOnceArray,
+    index::IndexQueryResult,
     refine::{
         exec_mode_selector::{get_or_update_execution_mode, ExecModeSelector, SelectOptimalMode},
         IndexQueryResultRefiner,
     },
     spatial_predicate::{RelationPredicate, SpatialPredicate, SpatialRelationType},
+    utils::init_once_array::InitOnceArray,
 };
 
 /// TG-specific optimal mode selector that chooses the best execution mode

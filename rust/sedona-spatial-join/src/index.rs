@@ -1,11 +1,11 @@
 use geo_index::rtree::RTree;
 
+mod knn_adapter;
 pub(crate) mod spatial_index;
 pub(crate) mod spatial_index_builder;
-mod knn_adapter;
 
 pub(crate) use spatial_index::SpatialIndex;
-pub(crate) use spatial_index_builder::SpatialIndexBuilder;
+pub(crate) use spatial_index_builder::{SpatialIndexBuilder, SpatialJoinBuildMetrics};
 use wkb::reader::Wkb;
 
 // Type aliases for better readability

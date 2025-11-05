@@ -33,16 +33,16 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::utils::once_fut::{OnceAsync, OnceFut};
+use crate::index::SpatialIndex;
 use crate::operand_evaluator::{
     create_operand_evaluator, distance_value_at, EvaluatedGeometryArray, OperandEvaluator,
 };
-use crate::sindex::SpatialIndex;
 use crate::spatial_predicate::SpatialPredicate;
 use crate::utils::join_utils::{
     adjust_indices_by_join_type, apply_join_filter_to_indices, build_batch_from_indices,
     get_final_indices_from_bit_map, need_produce_result_in_final,
 };
+use crate::utils::once_fut::{OnceAsync, OnceFut};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
 use sedona_common::option::SpatialJoinOptions;

@@ -1,5 +1,6 @@
 use arrow::array::BooleanBufferBuilder;
 use arrow_schema::SchemaRef;
+use datafusion_physical_plan::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder};
 use sedona_common::SpatialJoinOptions;
 use sedona_expr::statistics::GeoStatistics;
 
@@ -12,15 +13,12 @@ use parking_lot::Mutex;
 use std::sync::{atomic::AtomicUsize, Arc};
 
 use crate::{
+    collect::BuildPartition,
+    collect::BuildSideBatch,
+    index::knn_adapter::KnnComponents,
+    index::{spatial_index::SpatialIndex, RTreeBuildResult, RTREE_MEMORY_ESTIMATE_PER_RECT},
     operand_evaluator::create_operand_evaluator,
     refine::create_refiner,
-    sindex::{
-        collect::BuildPartition,
-        index::{spatial_index::SpatialIndex, RTreeBuildResult, RTREE_MEMORY_ESTIMATE_PER_RECT},
-        index_builder::SpatialJoinBuildMetrics,
-        index::knn_adapter::KnnComponents,
-        BuildSideBatch,
-    },
     spatial_predicate::SpatialPredicate,
     utils::join_utils::need_produce_result_in_final,
 };
@@ -50,6 +48,24 @@ pub(crate) struct SpatialIndexBuilder {
 
     /// Memory pool for managing the memory usage of the spatial index
     memory_pool: Arc<dyn MemoryPool>,
+}
+
+/// Metrics for the build phase of the spatial join.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpatialJoinBuildMetrics {
+    /// Total time for collecting build-side of join
+    pub(crate) build_time: metrics::Time,
+    /// Memory used by the spatial-index in bytes
+    pub(crate) build_mem_used: metrics::Gauge,
+}
+
+impl SpatialJoinBuildMetrics {
+    pub fn new(partition: usize, metrics: &ExecutionPlanMetricsSet) -> Self {
+        Self {
+            build_time: MetricBuilder::new(metrics).subset_time("build_time", partition),
+            build_mem_used: MetricBuilder::new(metrics).gauge("build_mem_used", partition),
+        }
+    }
 }
 
 impl SpatialIndexBuilder {

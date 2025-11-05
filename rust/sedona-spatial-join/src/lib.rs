@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod build_index;
+mod collect;
 pub mod exec;
+mod index;
 pub mod operand_evaluator;
 pub mod optimizer;
 pub mod refine;
 pub mod spatial_predicate;
-pub mod stream;
+mod stream;
 pub mod utils;
 
 pub use exec::SpatialJoinExec;
@@ -28,6 +31,3 @@ pub use optimizer::register_spatial_join_optimizer;
 
 // Re-export option types from sedona-common for convenience
 pub use sedona_common::option::*;
-
-// TODO: WIP restored spatial index to support both in-memory and out-of-core spatial join
-mod sindex;

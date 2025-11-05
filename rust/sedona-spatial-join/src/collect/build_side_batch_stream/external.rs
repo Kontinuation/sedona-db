@@ -7,7 +7,7 @@ use datafusion_common::Result;
 use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_physical_plan::SpillManager;
 
-use crate::sindex::collect::{
+use crate::collect::{
     build_side_batch::BuildSideBatch, build_side_batch_stream::BuildSideBatchStream,
 };
 

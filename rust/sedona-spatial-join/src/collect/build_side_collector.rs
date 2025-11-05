@@ -16,8 +16,7 @@ use sedona_functions::st_analyze_aggr::AnalyzeAccumulator;
 use sedona_schema::datatypes::WKB_GEOMETRY;
 
 use crate::{
-    operand_evaluator::OperandEvaluator,
-    sindex::collect::{
+    collect::{
         build_side_batch::BuildSideBatch,
         build_side_batch_stream::{
             external::ExternalBuildSideBatchStream, in_mem::InMemoryBuildSideBatchStream,
@@ -26,6 +25,7 @@ use crate::{
         spill::build_side_batch_to_spilled_batch,
         BuildPartition,
     },
+    operand_evaluator::OperandEvaluator,
 };
 
 /// A collector for evaluating the spatial expression on build side batches and collect
@@ -126,7 +126,8 @@ impl BuildSideBatchesCollector {
                         Arc::clone(&self.runtime_env),
                         metrics.spill_metrics.clone(),
                         schema,
-                    ).with_compression_type(self.spill_compression);
+                    )
+                    .with_compression_type(self.spill_compression);
                     let mut in_progress_file =
                         spill_manager.create_in_progress_file("collect_build_partition")?;
                     for in_mem_batch in &in_mem_batches {
@@ -169,9 +170,7 @@ impl BuildSideBatchesCollector {
                     None => Box::pin(InMemoryBuildSideBatchStream::new(vec![])),
                 }
             }
-            None => Box::pin(InMemoryBuildSideBatchStream::new(
-                in_mem_batches,
-            )),
+            None => Box::pin(InMemoryBuildSideBatchStream::new(in_mem_batches)),
         };
 
         Ok(BuildPartition {

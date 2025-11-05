@@ -6,7 +6,7 @@ use std::{
 
 use datafusion_common::Result;
 
-use crate::sindex::collect::{
+use crate::collect::{
     build_side_batch::BuildSideBatch, build_side_batch_stream::BuildSideBatchStream,
 };
 

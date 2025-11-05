@@ -2,7 +2,7 @@ use std::pin::Pin;
 
 use futures::Stream;
 
-use crate::sindex::collect::build_side_batch::BuildSideBatch;
+use crate::collect::build_side_batch::BuildSideBatch;
 use datafusion_common::Result;
 
 /// A stream that produces BuildSideBatch items. This stream may have purely in-memory or
