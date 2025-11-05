@@ -6,7 +6,7 @@ use geo_index::rtree::{distance::GeometryAccessor, EuclideanDistance, HaversineD
 use geo_types::{Geometry, Point, Rect};
 use sedona_geo::to_geo::item_to_geometry;
 
-use crate::sindex::build_side_batch::BuildSideBatch;
+use crate::sindex::BuildSideBatch;
 
 /// Shared KNN components that can be reused across queries
 pub(crate) struct KnnComponents {

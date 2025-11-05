@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
-use datafusion_common::Result;
+use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::{
     memory_pool::{MemoryConsumer, MemoryPool},
     SendableRecordBatchStream, TaskContext,
@@ -9,26 +9,15 @@ use datafusion_execution::{
 use datafusion_expr::JoinType;
 use datafusion_physical_plan::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder};
 use sedona_common::{SedonaOptions, SpatialJoinOptions};
-use sedona_expr::statistics::GeoStatistics;
 
 use crate::{
     operand_evaluator::create_operand_evaluator,
     sindex::{
-        build_side_batch::{BuildSideBatch, SendableBuildSideBatchStream},
         collect::{BuildPartition, BuildSideBatchesCollector, CollectBuildSideMetrics},
-        index::SpatialIndex,
-        inmem::index_builder::InMemorySpatialIndexBuilder,
+        index::{spatial_index::SpatialIndex, spatial_index_builder::SpatialIndexBuilder},
     },
     spatial_predicate::SpatialPredicate,
 };
-
-pub(crate) trait SpatialIndexBuilder {
-    async fn add_partitions(&mut self, partitions: Vec<BuildPartition>) -> Result<()>;
-
-    fn with_stats(&mut self, stats: GeoStatistics) -> Result<()>;
-
-    fn build(self) -> Result<Arc<dyn SpatialIndex>>;
-}
 
 /// Metrics for the build phase of the spatial join.
 #[derive(Clone, Debug)]
@@ -49,41 +38,6 @@ impl SpatialJoinBuildMetrics {
 }
 
 pub(crate) async fn build_spatial_index(
-    schema: SchemaRef,
-    spatial_predicate: SpatialPredicate,
-    options: SpatialJoinOptions,
-    join_type: JoinType,
-    probe_threads_count: usize,
-    memory_pool: Arc<dyn MemoryPool>,
-    metrics: SpatialJoinBuildMetrics,
-    build_partitions: Vec<BuildPartition>,
-) -> Result<Arc<dyn SpatialIndex>> {
-    let contains_external_stream = build_partitions
-        .iter()
-        .any(|partition| partition.build_side_batch_stream.is_external());
-    if !contains_external_stream {
-        let mut index_builder = InMemorySpatialIndexBuilder::new(
-            schema,
-            spatial_predicate,
-            options,
-            join_type,
-            probe_threads_count,
-            memory_pool,
-            metrics,
-        )?;
-        index_builder.add_partitions(build_partitions).await?;
-        index_builder.build()
-    } else {
-        // Box::new(ExternalSpatialIndexBuilder::new())
-        todo!()
-    }
-}
-
-/// The prealloc size for the refiner reservation. This is used to reduce the frequency of growing
-/// the reservation when updating the refiner memory reservation.
-const REFINER_RESERVATION_PREALLOC_SIZE: usize = 10 * 1024 * 1024; // 10MB
-
-pub(crate) async fn build_index(
     context: Arc<TaskContext>,
     build_schema: SchemaRef,
     build_streams: Vec<SendableRecordBatchStream>,
@@ -91,7 +45,7 @@ pub(crate) async fn build_index(
     join_type: JoinType,
     probe_threads_count: usize,
     metrics: &ExecutionPlanMetricsSet,
-) -> Result<Arc<dyn SpatialIndex>> {
+) -> Result<SpatialIndex> {
     let session_config = context.session_config();
     let sedona_options = session_config
         .options()
@@ -120,15 +74,22 @@ pub(crate) async fn build_index(
         .collect_all(build_streams, reservations, build_metrics)
         .await?;
 
-    build_spatial_index(
-        build_schema,
-        spatial_predicate,
-        sedona_options.spatial_join,
-        join_type,
-        probe_threads_count,
-        Arc::clone(memory_pool),
-        SpatialJoinBuildMetrics::new(0, metrics),
-        build_partitions,
-    )
-    .await
+    let contains_external_stream = build_partitions
+        .iter()
+        .any(|partition| partition.build_side_batch_stream.is_external());
+    if !contains_external_stream {
+        let mut index_builder = SpatialIndexBuilder::new(
+            build_schema,
+            spatial_predicate,
+            sedona_options.spatial_join,
+            join_type,
+            probe_threads_count,
+            Arc::clone(memory_pool),
+            SpatialJoinBuildMetrics::new(0, metrics),
+        )?;
+        index_builder.add_partitions(build_partitions).await?;
+        index_builder.finish()
+    } else {
+        Err(DataFusionError::ResourcesExhausted("Memory limit exceeded while collecting indexed data. External spatial index builder is not yet implemented.".to_string()))
+    }
 }

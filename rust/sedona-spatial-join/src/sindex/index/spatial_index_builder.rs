@@ -3,33 +3,23 @@ use arrow_schema::SchemaRef;
 use sedona_common::SpatialJoinOptions;
 use sedona_expr::statistics::GeoStatistics;
 
-use once_cell::sync::OnceCell;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
-
-use arrow_array::RecordBatch;
 use datafusion_common::{utils::proxy::VecAllocExt, Result};
-use datafusion_execution::{
-    memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
-    SendableRecordBatchStream,
-};
-use datafusion_expr::{ColumnarValue, JoinType};
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use datafusion_expr::JoinType;
 use futures::StreamExt;
-use geo_index::rtree::{sort::HilbertSort, RTree, RTreeBuilder};
+use geo_index::rtree::{sort::HilbertSort, RTreeBuilder};
 use parking_lot::Mutex;
+use std::sync::{atomic::AtomicUsize, Arc};
 
 use crate::{
     operand_evaluator::create_operand_evaluator,
     refine::create_refiner,
     sindex::{
-        build_side_batch::{BuildSideBatch, SendableBuildSideBatchStream},
         collect::BuildPartition,
-        index::SpatialIndex,
-        index_builder::{SpatialIndexBuilder, SpatialJoinBuildMetrics},
-        inmem::{index::InMemorySpatialIndex, RTreeBuildResult, RTREE_MEMORY_ESTIMATE_PER_RECT},
-        utils::KnnComponents,
+        index::{spatial_index::SpatialIndex, RTreeBuildResult, RTREE_MEMORY_ESTIMATE_PER_RECT},
+        index_builder::SpatialJoinBuildMetrics,
+        knn_adapter::KnnComponents,
+        BuildSideBatch,
     },
     spatial_predicate::SpatialPredicate,
     utils::need_produce_result_in_final,
@@ -42,7 +32,7 @@ use crate::{
 /// 2. Building the spatial R-tree index
 /// 3. Setting up memory tracking and visited bitmaps
 /// 4. Configuring prepared geometries based on execution mode
-pub(crate) struct InMemorySpatialIndexBuilder {
+pub(crate) struct SpatialIndexBuilder {
     schema: SchemaRef,
     spatial_predicate: SpatialPredicate,
     options: SpatialJoinOptions,
@@ -62,7 +52,7 @@ pub(crate) struct InMemorySpatialIndexBuilder {
     memory_pool: Arc<dyn MemoryPool>,
 }
 
-impl InMemorySpatialIndexBuilder {
+impl SpatialIndexBuilder {
     /// Create a new builder with the given configuration.
     pub fn new(
         schema: SchemaRef,
@@ -192,9 +182,9 @@ impl InMemorySpatialIndexBuilder {
     }
 
     /// Finish building and return the completed SpatialIndex.
-    pub fn finish(mut self) -> Result<InMemorySpatialIndex> {
+    pub fn finish(mut self) -> Result<SpatialIndex> {
         if self.indexed_batches.is_empty() {
-            return Ok(InMemorySpatialIndex::empty(
+            return Ok(SpatialIndex::empty(
                 self.spatial_predicate,
                 self.schema,
                 self.options,
@@ -227,7 +217,7 @@ impl InMemorySpatialIndexBuilder {
         let knn_components =
             KnnComponents::new(cache_size, &self.indexed_batches, self.memory_pool.clone())?;
 
-        Ok(InMemorySpatialIndex::new(
+        Ok(SpatialIndex::new(
             self.schema,
             evaluator,
             refiner,
@@ -241,10 +231,8 @@ impl InMemorySpatialIndexBuilder {
             self.reservation,
         ))
     }
-}
 
-impl SpatialIndexBuilder for InMemorySpatialIndexBuilder {
-    async fn add_partitions(&mut self, partitions: Vec<BuildPartition>) -> Result<()> {
+    pub async fn add_partitions(&mut self, partitions: Vec<BuildPartition>) -> Result<()> {
         for partition in partitions {
             let mut stream = partition.build_side_batch_stream;
             while let Some(batch) = stream.next().await {
@@ -254,15 +242,5 @@ impl SpatialIndexBuilder for InMemorySpatialIndexBuilder {
             self.with_stats(partition.geo_statistics);
         }
         Ok(())
-    }
-
-    fn with_stats(&mut self, stats: GeoStatistics) -> Result<()> {
-        self.with_stats(stats);
-        Ok(())
-    }
-
-    fn build(self) -> Result<Arc<dyn SpatialIndex>> {
-        self.finish()
-            .map(|index| Arc::new(index) as Arc<dyn SpatialIndex>)
     }
 }

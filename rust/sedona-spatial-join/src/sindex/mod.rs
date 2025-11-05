@@ -1,7 +1,7 @@
-mod build_side_batch;
 mod collect;
-mod external;
 mod index;
 mod index_builder;
-mod inmem;
-mod utils;
+mod knn_adapter;
+mod partition;
+
+pub(crate) use collect::{BuildSideBatch, SendableBuildSideBatchStream};

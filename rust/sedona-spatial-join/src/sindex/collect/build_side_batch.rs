@@ -1,14 +1,9 @@
-use std::pin::Pin;
-
 use arrow_array::RecordBatch;
-use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::ColumnarValue;
-use futures::Stream;
 use geo::Rect;
 use wkb::reader::Wkb;
 
 use crate::operand_evaluator::EvaluatedGeometryArray;
-use datafusion_common::Result;
 
 /// BuildSide batch containing the original record batch from the build side and the evaluated
 /// geometry array.
@@ -47,18 +42,3 @@ impl BuildSideBatch {
         &self.geom_array.distance
     }
 }
-
-/// A stream that produces BuildSideBatch items. This stream may have purely in-memory or
-/// out-of-core implementations. The type of the stream could be queried calling `is_external()`.
-pub(crate) trait BuildSideBatchStream: Stream<Item = Result<BuildSideBatch>> {
-    /// Returns true if this stream is an external stream, where batch data were spilled to disk.
-    fn is_external(&self) -> bool;
-
-    /// Memory reserved by the stream
-    fn reservation(&self) -> &MemoryReservation;
-
-    /// Take the the memory reservation owned by the stream
-    fn take_reservation(self) -> MemoryReservation;
-}
-
-pub(crate) type SendableBuildSideBatchStream = Pin<Box<dyn BuildSideBatchStream + Send>>;

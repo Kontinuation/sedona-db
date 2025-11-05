@@ -1,4 +1,3 @@
-use once_cell::sync::OnceCell;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -6,45 +5,33 @@ use std::sync::{
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use datafusion_common::{utils::proxy::VecAllocExt, DataFusionError, Result};
-use datafusion_common_runtime::JoinSet;
-use datafusion_execution::{
-    memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
-    SendableRecordBatchStream,
-};
-use datafusion_expr::{ColumnarValue, JoinType};
-use datafusion_physical_plan::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder};
-use futures::StreamExt;
-use geo_index::rtree::distance::{
-    DistanceMetric, EuclideanDistance, GeometryAccessor, HaversineDistance,
-};
+use datafusion_common::Result;
+use datafusion_execution::memory_pool::{MemoryPool, MemoryReservation};
+use geo_index::rtree::distance::{DistanceMetric, GeometryAccessor};
 use geo_index::rtree::{sort::HilbertSort, RTree, RTreeBuilder, RTreeIndex};
 use geo_index::IndexableNum;
-use geo_types::{Geometry, Point, Rect};
+use geo_types::{Point, Rect};
 use parking_lot::Mutex;
 use sedona_expr::statistics::GeoStatistics;
-use sedona_functions::st_analyze_aggr::AnalyzeAccumulator;
 use sedona_geo::to_geo::item_to_geometry;
 use sedona_geo_generic_alg::algorithm::Centroid;
-use sedona_schema::datatypes::WKB_GEOMETRY;
 use wkb::reader::Wkb;
 
 use crate::{
     index::IndexQueryResult,
-    operand_evaluator::{create_operand_evaluator, EvaluatedGeometryArray, OperandEvaluator},
+    operand_evaluator::{create_operand_evaluator, OperandEvaluator},
     refine::{create_refiner, IndexQueryResultRefiner},
     sindex::{
-        build_side_batch::BuildSideBatch,
-        index::{JoinResultMetrics, SpatialIndex},
-        utils::{KnnComponents, SedonaKnnAdapter},
+        index::JoinResultMetrics,
+        knn_adapter::{KnnComponents, SedonaKnnAdapter},
+        BuildSideBatch,
     },
     spatial_predicate::SpatialPredicate,
-    utils::need_produce_result_in_final,
 };
 use arrow::array::BooleanBufferBuilder;
 use sedona_common::{option::SpatialJoinOptions, ExecutionMode};
 
-pub(crate) struct InMemorySpatialIndex {
+pub(crate) struct SpatialIndex {
     schema: SchemaRef,
 
     /// The spatial predicate evaluator for the spatial predicate.
@@ -85,12 +72,12 @@ pub(crate) struct InMemorySpatialIndex {
     knn_components: KnnComponents,
 
     /// Memory reservation for tracking the memory usage of the spatial index
-    /// Cleared on `InMemorySpatialIndex` drop
+    /// Cleared on `SpatialIndex` drop
     #[expect(dead_code)]
     reservation: MemoryReservation,
 }
 
-impl InMemorySpatialIndex {
+impl SpatialIndex {
     pub fn empty(
         spatial_predicate: SpatialPredicate,
         schema: SchemaRef,
@@ -493,38 +480,5 @@ impl InMemorySpatialIndex {
     /// Get the actual execution mode used by the refiner
     pub(crate) fn get_actual_execution_mode(&self) -> ExecutionMode {
         self.refiner.actual_execution_mode()
-    }
-}
-
-impl SpatialIndex for InMemorySpatialIndex {
-    fn get_indexed_batch(&self, batch_idx: usize) -> &RecordBatch {
-        self.get_indexed_batch(batch_idx)
-    }
-
-    fn query(
-        &self,
-        probe_wkb: &Wkb,
-        probe_rect: &Rect<f32>,
-        distance: &Option<f64>,
-        build_batch_positions: &mut Vec<(i32, i32)>,
-    ) -> Result<JoinResultMetrics> {
-        self.query(probe_wkb, probe_rect, distance, build_batch_positions)
-    }
-
-    fn query_knn(
-        &self,
-        probe_wkb: &Wkb,
-        k: u32,
-        use_spheroid: bool,
-        include_tie_breakers: bool,
-        build_batch_positions: &mut Vec<(i32, i32)>,
-    ) -> Result<JoinResultMetrics> {
-        self.query_knn(
-            probe_wkb,
-            k,
-            use_spheroid,
-            include_tie_breakers,
-            build_batch_positions,
-        )
     }
 }
