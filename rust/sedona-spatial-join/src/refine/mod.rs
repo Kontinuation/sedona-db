@@ -21,7 +21,7 @@ use sedona_common::{ExecutionMode, SpatialJoinOptions, SpatialLibrary};
 use sedona_expr::statistics::GeoStatistics;
 use wkb::reader::Wkb;
 
-use crate::{index::IndexQueryResult, spatial_predicate::SpatialPredicate};
+use crate::{sindex::IndexQueryResult, spatial_predicate::SpatialPredicate};
 
 /// Trait for refining spatial index query results by evaluating exact geometric predicates.
 ///

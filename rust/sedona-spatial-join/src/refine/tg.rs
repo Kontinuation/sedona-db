@@ -29,7 +29,7 @@ use sedona_tg::tg::{self, BinaryPredicate};
 use wkb::reader::Wkb;
 
 use crate::{
-    index::IndexQueryResult,
+    sindex::IndexQueryResult,
     init_once_array::InitOnceArray,
     refine::{
         exec_mode_selector::{get_or_update_execution_mode, ExecModeSelector, SelectOptimalMode},

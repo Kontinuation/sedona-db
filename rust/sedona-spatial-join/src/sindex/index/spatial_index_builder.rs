@@ -91,7 +91,7 @@ impl SpatialIndexBuilder {
         self.metrics.build_mem_used.add(in_mem_size);
     }
 
-    pub fn with_stats(&mut self, stats: GeoStatistics) -> &mut Self {
+    pub fn merge_stats(&mut self, stats: GeoStatistics) -> &mut Self {
         self.stats.merge(&stats);
         self
     }
@@ -234,13 +234,20 @@ impl SpatialIndexBuilder {
 
     pub async fn add_partitions(&mut self, partitions: Vec<BuildPartition>) -> Result<()> {
         for partition in partitions {
-            let mut stream = partition.build_side_batch_stream;
-            while let Some(batch) = stream.next().await {
-                let indexed_batch = batch?;
-                self.add_batch(indexed_batch);
-            }
-            self.with_stats(partition.geo_statistics);
+            self.add_partition(partition).await?;
         }
+        Ok(())
+    }
+
+    pub async fn add_partition(&mut self, mut partition: BuildPartition) -> Result<()> {
+        let mut stream = partition.build_side_batch_stream;
+        while let Some(batch) = stream.next().await {
+            let indexed_batch = batch?;
+            self.add_batch(indexed_batch);
+        }
+        self.merge_stats(partition.geo_statistics);
+        let mem_bytes = partition.reservation.free();
+        self.reservation.try_grow(mem_bytes)?;
         Ok(())
     }
 }

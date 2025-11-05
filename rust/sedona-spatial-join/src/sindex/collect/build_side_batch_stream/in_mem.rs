@@ -5,7 +5,6 @@ use std::{
 };
 
 use datafusion_common::Result;
-use datafusion_execution::memory_pool::MemoryReservation;
 
 use crate::sindex::collect::{
     build_side_batch::BuildSideBatch, build_side_batch_stream::BuildSideBatchStream,
@@ -13,14 +12,12 @@ use crate::sindex::collect::{
 
 pub(crate) struct InMemoryBuildSideBatchStream {
     batches: VecDeque<BuildSideBatch>,
-    reservation: MemoryReservation,
 }
 
 impl InMemoryBuildSideBatchStream {
-    pub fn new(batches: Vec<BuildSideBatch>, reservation: MemoryReservation) -> Self {
+    pub fn new(batches: Vec<BuildSideBatch>) -> Self {
         InMemoryBuildSideBatchStream {
             batches: VecDeque::from(batches),
-            reservation,
         }
     }
 }
@@ -28,14 +25,6 @@ impl InMemoryBuildSideBatchStream {
 impl BuildSideBatchStream for InMemoryBuildSideBatchStream {
     fn is_external(&self) -> bool {
         false
-    }
-
-    fn reservation(&self) -> &MemoryReservation {
-        &self.reservation
-    }
-
-    fn take_reservation(self) -> MemoryReservation {
-        self.reservation
     }
 }
 

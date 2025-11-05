@@ -126,7 +126,7 @@ impl BuildSideBatchesCollector {
                         Arc::clone(&self.runtime_env),
                         metrics.spill_metrics.clone(),
                         schema,
-                    );
+                    ).with_compression_type(self.spill_compression);
                     let mut in_progress_file =
                         spill_manager.create_in_progress_file("collect_build_partition")?;
                     for in_mem_batch in &in_mem_batches {
@@ -166,18 +166,18 @@ impl BuildSideBatchesCollector {
                             temp_file,
                         )?)
                     }
-                    None => Box::pin(InMemoryBuildSideBatchStream::new(vec![], reservation)),
+                    None => Box::pin(InMemoryBuildSideBatchStream::new(vec![])),
                 }
             }
             None => Box::pin(InMemoryBuildSideBatchStream::new(
                 in_mem_batches,
-                reservation,
             )),
         };
 
         Ok(BuildPartition {
             build_side_batch_stream,
             geo_statistics: analyzer.finish(),
+            reservation,
         })
     }
 

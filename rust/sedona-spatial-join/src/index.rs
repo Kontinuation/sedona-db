@@ -46,11 +46,7 @@ use sedona_schema::datatypes::WKB_GEOMETRY;
 use wkb::reader::Wkb;
 
 use crate::{
-    concurrent_reservation::ConcurrentReservation,
-    operand_evaluator::{create_operand_evaluator, EvaluatedGeometryArray, OperandEvaluator},
-    refine::{create_refiner, IndexQueryResultRefiner},
-    spatial_predicate::SpatialPredicate,
-    utils::need_produce_result_in_final,
+    concurrent_reservation::ConcurrentReservation, operand_evaluator::{EvaluatedGeometryArray, OperandEvaluator, create_operand_evaluator}, refine::{IndexQueryResultRefiner, create_refiner}, sindex::IndexQueryResult, spatial_predicate::SpatialPredicate, utils::need_produce_result_in_final
 };
 use arrow::array::BooleanBufferBuilder;
 use sedona_common::{option::SpatialJoinOptions, ExecutionMode};
@@ -760,13 +756,6 @@ impl SpatialIndex {
     pub(crate) fn get_actual_execution_mode(&self) -> ExecutionMode {
         self.refiner.actual_execution_mode()
     }
-}
-
-pub struct IndexQueryResult<'a, 'b> {
-    pub wkb: &'b Wkb<'a>,
-    pub distance: Option<f64>,
-    pub geom_idx: usize,
-    pub position: (i32, i32),
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -35,13 +35,7 @@ use datafusion_physical_plan::{
 use parking_lot::Mutex;
 
 use crate::{
-    index::{build_index, SpatialIndex, SpatialJoinBuildMetrics},
-    once_fut::OnceAsync,
-    spatial_predicate::{KNNPredicate, SpatialPredicate},
-    stream::{SpatialJoinProbeMetrics, SpatialJoinStream},
-    utils::{asymmetric_join_output_partitioning, boundedness_from_children},
-    // Re-export from sedona-common
-    SedonaOptions,
+    SedonaOptions, once_fut::OnceAsync, sindex::{SpatialIndex, build_spatial_index}, spatial_predicate::{KNNPredicate, SpatialPredicate}, stream::{SpatialJoinProbeMetrics, SpatialJoinStream}, utils::{asymmetric_join_output_partitioning, boundedness_from_children}
 };
 
 /// Type alias for build and probe execution plans
@@ -449,26 +443,22 @@ impl ExecutionPlan for SpatialJoinExec {
 
                             let num_partitions = build_side.output_partitioning().partition_count();
                             let mut build_streams = Vec::with_capacity(num_partitions);
-                            let mut build_metrics = Vec::with_capacity(num_partitions);
                             for k in 0..num_partitions {
                                 let stream = build_side.execute(k, Arc::clone(&context))?;
                                 build_streams.push(stream);
-                                build_metrics.push(SpatialJoinBuildMetrics::new(k, &self.metrics));
                             }
 
                             let probe_thread_count =
                                 self.right.output_partitioning().partition_count();
 
-                            Ok(build_index(
+                            Ok(build_spatial_index(
+                                Arc::clone(&context),
                                 build_side.schema(),
                                 build_streams,
                                 self.on.clone(),
-                                sedona_options.spatial_join.clone(),
-                                build_metrics,
-                                Arc::clone(context.memory_pool()),
                                 self.join_type,
                                 probe_thread_count,
-                            ))
+                                self.metrics.clone()))
                         })?
                 };
 
@@ -546,25 +536,21 @@ impl SpatialJoinExec {
 
                     let num_partitions = build_side.output_partitioning().partition_count();
                     let mut build_streams = Vec::with_capacity(num_partitions);
-                    let mut build_metrics = Vec::with_capacity(num_partitions);
                     for k in 0..num_partitions {
                         let stream = build_side.execute(k, Arc::clone(&context))?;
                         build_streams.push(stream);
-                        build_metrics.push(SpatialJoinBuildMetrics::new(k, &self.metrics));
                     }
 
                     let probe_thread_count = self.right.output_partitioning().partition_count();
 
-                    Ok(build_index(
+                    Ok(build_spatial_index(
+                        Arc::clone(&context),
                         build_side.schema(),
                         build_streams,
                         self.on.clone(),
-                        sedona_options.spatial_join.clone(),
-                        build_metrics,
-                        Arc::clone(context.memory_pool()),
                         self.join_type,
                         probe_thread_count,
-                    ))
+                        self.metrics.clone()))
                 })?
         };
 

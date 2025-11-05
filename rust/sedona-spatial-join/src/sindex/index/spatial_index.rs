@@ -18,13 +18,10 @@ use sedona_geo_generic_alg::algorithm::Centroid;
 use wkb::reader::Wkb;
 
 use crate::{
-    index::IndexQueryResult,
-    operand_evaluator::{create_operand_evaluator, OperandEvaluator},
-    refine::{create_refiner, IndexQueryResultRefiner},
+    operand_evaluator::{OperandEvaluator, create_operand_evaluator},
+    refine::{IndexQueryResultRefiner, create_refiner},
     sindex::{
-        index::JoinResultMetrics,
-        knn_adapter::{KnnComponents, SedonaKnnAdapter},
-        BuildSideBatch,
+        BuildSideBatch, index::{IndexQueryResult, QueryResultMetrics}, knn_adapter::{KnnComponents, SedonaKnnAdapter}
     },
     spatial_predicate::SpatialPredicate,
 };
@@ -180,12 +177,12 @@ impl SpatialIndex {
         probe_rect: &Rect<f32>,
         distance: &Option<f64>,
         build_batch_positions: &mut Vec<(i32, i32)>,
-    ) -> Result<JoinResultMetrics> {
+    ) -> Result<QueryResultMetrics> {
         let min = probe_rect.min();
         let max = probe_rect.max();
         let mut candidates = self.rtree.search(min.x, min.y, max.x, max.y);
         if candidates.is_empty() {
-            return Ok(JoinResultMetrics {
+            return Ok(QueryResultMetrics {
                 count: 0,
                 candidate_count: 0,
             });
@@ -225,9 +222,9 @@ impl SpatialIndex {
         use_spheroid: bool,
         include_tie_breakers: bool,
         build_batch_positions: &mut Vec<(i32, i32)>,
-    ) -> Result<JoinResultMetrics> {
+    ) -> Result<QueryResultMetrics> {
         if k == 0 {
-            return Ok(JoinResultMetrics {
+            return Ok(QueryResultMetrics {
                 count: 0,
                 candidate_count: 0,
             });
@@ -235,7 +232,7 @@ impl SpatialIndex {
 
         // Check if index is empty
         if self.indexed_batches.is_empty() || self.data_id_to_batch_pos.is_empty() {
-            return Ok(JoinResultMetrics {
+            return Ok(QueryResultMetrics {
                 count: 0,
                 candidate_count: 0,
             });
@@ -246,7 +243,7 @@ impl SpatialIndex {
             Ok(geom) => geom,
             Err(_) => {
                 // Empty or unsupported geometries (e.g., POINT EMPTY) return empty results
-                return Ok(JoinResultMetrics {
+                return Ok(QueryResultMetrics {
                     count: 0,
                     candidate_count: 0,
                 });
@@ -273,7 +270,7 @@ impl SpatialIndex {
         );
 
         if initial_results.is_empty() {
-            return Ok(JoinResultMetrics {
+            return Ok(QueryResultMetrics {
                 count: 0,
                 candidate_count: 0,
             });
@@ -318,7 +315,7 @@ impl SpatialIndex {
                     Some(val) => val,
                     None => {
                         // If conversion fails, return empty results for this probe
-                        return Ok(JoinResultMetrics {
+                        return Ok(QueryResultMetrics {
                             count: 0,
                             candidate_count: 0,
                         });
@@ -389,7 +386,7 @@ impl SpatialIndex {
             }
         }
 
-        Ok(JoinResultMetrics {
+        Ok(QueryResultMetrics {
             count: final_results.len(),
             candidate_count,
         })
@@ -401,7 +398,7 @@ impl SpatialIndex {
         candidates: &[u32],
         distance: &Option<f64>,
         build_batch_positions: &mut Vec<(i32, i32)>,
-    ) -> Result<JoinResultMetrics> {
+    ) -> Result<QueryResultMetrics> {
         let candidate_count = candidates.len();
 
         let mut index_query_results = Vec::with_capacity(candidate_count);
@@ -428,7 +425,7 @@ impl SpatialIndex {
         }
 
         if index_query_results.is_empty() {
-            return Ok(JoinResultMetrics {
+            return Ok(QueryResultMetrics {
                 count: 0,
                 candidate_count,
             });
@@ -438,7 +435,7 @@ impl SpatialIndex {
         let num_results = results.len();
         build_batch_positions.extend(results);
 
-        Ok(JoinResultMetrics {
+        Ok(QueryResultMetrics {
             count: num_results,
             candidate_count,
         })

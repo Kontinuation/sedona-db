@@ -33,11 +33,11 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::index::SpatialIndex;
 use crate::once_fut::{OnceAsync, OnceFut};
 use crate::operand_evaluator::{
     create_operand_evaluator, distance_value_at, EvaluatedGeometryArray, OperandEvaluator,
 };
+use crate::sindex::SpatialIndex;
 use crate::spatial_predicate::SpatialPredicate;
 use crate::utils::{
     adjust_indices_by_join_type, apply_join_filter_to_indices, build_batch_from_indices,

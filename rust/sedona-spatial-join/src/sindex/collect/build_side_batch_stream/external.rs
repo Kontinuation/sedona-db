@@ -4,7 +4,7 @@ use std::{
 };
 
 use datafusion_common::Result;
-use datafusion_execution::{disk_manager::RefCountedTempFile, memory_pool::MemoryReservation};
+use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_physical_plan::SpillManager;
 
 use crate::sindex::collect::{
@@ -25,14 +25,6 @@ impl ExternalBuildSideBatchStream {
 impl BuildSideBatchStream for ExternalBuildSideBatchStream {
     fn is_external(&self) -> bool {
         true
-    }
-
-    fn reservation(&self) -> &MemoryReservation {
-        todo!()
-    }
-
-    fn take_reservation(self) -> MemoryReservation {
-        todo!()
     }
 }
 

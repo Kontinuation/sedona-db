@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use geo_index::rtree::{distance::GeometryAccessor, EuclideanDistance, HaversineDistance};
-use geo_types::{Geometry, Point, Rect};
+use geo_types::Geometry;
 use sedona_geo::to_geo::item_to_geometry;
 
 use crate::sindex::BuildSideBatch;

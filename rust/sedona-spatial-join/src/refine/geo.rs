@@ -25,7 +25,7 @@ use sedona_geo_generic_alg::{line_measures::DistanceExt, Intersects};
 use wkb::reader::Wkb;
 
 use crate::{
-    index::IndexQueryResult,
+    sindex::IndexQueryResult,
     refine::{
         exec_mode_selector::{get_or_update_execution_mode, ExecModeSelector, SelectOptimalMode},
         IndexQueryResultRefiner,

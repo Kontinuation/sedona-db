@@ -1,6 +1,5 @@
 use std::pin::Pin;
 
-use datafusion_execution::memory_pool::MemoryReservation;
 use futures::Stream;
 
 use crate::sindex::collect::build_side_batch::BuildSideBatch;
@@ -11,12 +10,6 @@ use datafusion_common::Result;
 pub(crate) trait BuildSideBatchStream: Stream<Item = Result<BuildSideBatch>> {
     /// Returns true if this stream is an external stream, where batch data were spilled to disk.
     fn is_external(&self) -> bool;
-
-    /// Memory reserved by the stream
-    fn reservation(&self) -> &MemoryReservation;
-
-    /// Take the the memory reservation owned by the stream
-    fn take_reservation(self) -> MemoryReservation;
 }
 
 pub(crate) type SendableBuildSideBatchStream = Pin<Box<dyn BuildSideBatchStream + Send>>;
