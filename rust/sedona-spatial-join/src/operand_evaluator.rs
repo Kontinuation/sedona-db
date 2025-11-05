@@ -90,8 +90,6 @@ pub(crate) fn create_operand_evaluator(
 
 /// Result of evaluating a geometry batch.
 pub(crate) struct EvaluatedGeometryArray {
-    /// Type of geometry_array
-    pub sedona_type: SedonaType,
     /// The array of geometries produced by evaluating the geometry expression.
     pub geometry_array: ArrayRef,
     /// The rects of the geometries in the geometry array. The length of this array is equal to the number of geometries.
@@ -140,7 +138,6 @@ impl EvaluatedGeometryArray {
             .map(|wkb| wkb.map(|wkb| unsafe { transmute(wkb) }))
             .collect();
         Ok(Self {
-            sedona_type: sedona_type.clone(),
             geometry_array,
             rects: rect_vec,
             distance: None,

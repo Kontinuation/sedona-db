@@ -31,11 +31,9 @@ pub(crate) async fn build_index(
         .cloned()
         .unwrap_or_default();
     let memory_pool = context.memory_pool();
-    let runtime_env = context.runtime_env();
-    let spill_compression = session_config.spill_compression();
     let evaluator =
         create_operand_evaluator(&spatial_predicate, sedona_options.spatial_join.clone());
-    let collector = BuildSideBatchesCollector::new(evaluator, runtime_env, spill_compression);
+    let collector = BuildSideBatchesCollector::new(evaluator);
     let num_partitions = build_streams.len();
     let mut collect_metrics_vec = Vec::with_capacity(num_partitions);
     let mut reservations = Vec::with_capacity(num_partitions);

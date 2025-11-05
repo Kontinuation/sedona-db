@@ -10,6 +10,7 @@ use crate::collect::{
     build_side_batch::BuildSideBatch, build_side_batch_stream::BuildSideBatchStream,
 };
 
+/// A build side batch stream that holds all batches in memory.
 pub(crate) struct InMemoryBuildSideBatchStream {
     batches: VecDeque<BuildSideBatch>,
 }

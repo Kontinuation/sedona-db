@@ -14,5 +14,4 @@ pub(crate) trait BuildSideBatchStream: Stream<Item = Result<BuildSideBatch>> {
 
 pub(crate) type SendableBuildSideBatchStream = Pin<Box<dyn BuildSideBatchStream + Send>>;
 
-pub(crate) mod external;
 pub(crate) mod in_mem;

@@ -1,29 +1,17 @@
 use std::sync::Arc;
 
-use datafusion::config::SpillCompression;
 use datafusion_common::Result;
 use datafusion_common_runtime::JoinSet;
-use datafusion_execution::{
-    memory_pool::MemoryReservation, runtime_env::RuntimeEnv, SendableRecordBatchStream,
-};
-use datafusion_physical_plan::{
-    metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, SpillMetrics},
-    SpillManager,
-};
+use datafusion_execution::{memory_pool::MemoryReservation, SendableRecordBatchStream};
+use datafusion_physical_plan::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder};
 use futures::StreamExt;
-use sedona_common::sedona_internal_err;
 use sedona_functions::st_analyze_aggr::AnalyzeAccumulator;
 use sedona_schema::datatypes::WKB_GEOMETRY;
 
 use crate::{
     collect::{
         build_side_batch::BuildSideBatch,
-        build_side_batch_stream::{
-            external::ExternalBuildSideBatchStream, in_mem::InMemoryBuildSideBatchStream,
-            SendableBuildSideBatchStream,
-        },
-        spill::build_side_batch_to_spilled_batch,
-        BuildPartition,
+        build_side_batch_stream::in_mem::InMemoryBuildSideBatchStream, BuildPartition,
     },
     operand_evaluator::OperandEvaluator,
 };
@@ -35,8 +23,6 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct BuildSideBatchesCollector {
     evaluator: Arc<dyn OperandEvaluator>,
-    runtime_env: Arc<RuntimeEnv>,
-    spill_compression: SpillCompression,
 }
 
 pub(crate) struct CollectBuildSideMetrics {
@@ -51,8 +37,6 @@ pub(crate) struct CollectBuildSideMetrics {
     /// Total time taken to collect and process the build side batches. This does not include the time awaiting
     /// for batches from the input stream.
     time_taken: metrics::Time,
-    /// Spill metrics of build partitions collecting phase
-    spill_metrics: SpillMetrics,
 }
 
 impl CollectBuildSideMetrics {
@@ -64,22 +48,13 @@ impl CollectBuildSideMetrics {
                 .gauge("build_input_total_size_bytes", partition),
             time_taken: MetricBuilder::new(metrics)
                 .subset_time("build_input_collection_time", partition),
-            spill_metrics: SpillMetrics::new(metrics, partition),
         }
     }
 }
 
 impl BuildSideBatchesCollector {
-    pub fn new(
-        evaluator: Arc<dyn OperandEvaluator>,
-        runtime_env: Arc<RuntimeEnv>,
-        spill_compression: SpillCompression,
-    ) -> Self {
-        BuildSideBatchesCollector {
-            evaluator,
-            runtime_env,
-            spill_compression,
-        }
+    pub fn new(evaluator: Arc<dyn OperandEvaluator>) -> Self {
+        BuildSideBatchesCollector { evaluator }
     }
 
     pub async fn collect(
@@ -89,8 +64,6 @@ impl BuildSideBatchesCollector {
         metrics: &CollectBuildSideMetrics,
     ) -> Result<BuildPartition> {
         let evaluator = self.evaluator.as_ref();
-        let mut spill_file_opt = None;
-        let mut spill_manager_opt: Option<SpillManager> = None;
         let mut in_mem_batches: Vec<BuildSideBatch> = Vec::new();
         let mut analyzer = AnalyzeAccumulator::new(WKB_GEOMETRY, WKB_GEOMETRY);
 
@@ -115,66 +88,12 @@ impl BuildSideBatchesCollector {
             metrics.num_rows.add(build_side_batch.num_rows());
             metrics.total_size_bytes.add(in_mem_size);
 
-            if spill_file_opt.is_none() {
-                // Collected batches are in memory, no spilling happened for this patition before. We'll try
-                // storing this batch in memory first, and switch to writing everything to disk if we fail
-                // to grow the reservation.
-                if reservation.try_grow(in_mem_size).is_err() {
-                    // Spill all in memory batches, and write future batches to spill file
-                    let schema = build_side_batch.batch.schema();
-                    let spill_manager = SpillManager::new(
-                        Arc::clone(&self.runtime_env),
-                        metrics.spill_metrics.clone(),
-                        schema,
-                    )
-                    .with_compression_type(self.spill_compression);
-                    let mut in_progress_file =
-                        spill_manager.create_in_progress_file("collect_build_partition")?;
-                    for in_mem_batch in &in_mem_batches {
-                        let spilled_batch = build_side_batch_to_spilled_batch(in_mem_batch)?;
-                        in_progress_file.append_batch(&spilled_batch)?;
-                    }
-                    in_mem_batches.clear();
-                    reservation.free();
-                    spill_manager_opt = Some(spill_manager);
-                    spill_file_opt = Some(in_progress_file);
-                }
-            }
-
-            match &mut spill_file_opt {
-                None => {
-                    in_mem_batches.push(build_side_batch);
-                }
-                Some(spill_file) => {
-                    let spilled_batch = build_side_batch_to_spilled_batch(&build_side_batch)?;
-                    spill_file.append_batch(&spilled_batch)?;
-                }
-            }
+            reservation.try_grow(in_mem_size)?;
+            in_mem_batches.push(build_side_batch);
         }
 
-        let build_side_batch_stream: SendableBuildSideBatchStream = match spill_file_opt {
-            Some(mut spill_file) => {
-                let finished = spill_file.finish()?;
-                match finished {
-                    Some(temp_file) => {
-                        if !in_mem_batches.is_empty() {
-                            return sedona_internal_err!(
-                                "In-memory batches should have been spilled when spill file exists"
-                            );
-                        }
-                        Box::pin(ExternalBuildSideBatchStream::try_new(
-                            spill_manager_opt.unwrap(),
-                            temp_file,
-                        )?)
-                    }
-                    None => Box::pin(InMemoryBuildSideBatchStream::new(vec![])),
-                }
-            }
-            None => Box::pin(InMemoryBuildSideBatchStream::new(in_mem_batches)),
-        };
-
         Ok(BuildPartition {
-            build_side_batch_stream,
+            build_side_batch_stream: Box::pin(InMemoryBuildSideBatchStream::new(in_mem_batches)),
             geo_statistics: analyzer.finish(),
             reservation,
         })
