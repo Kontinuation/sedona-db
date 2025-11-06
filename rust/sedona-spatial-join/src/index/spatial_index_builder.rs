@@ -1,3 +1,20 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 use arrow::array::BooleanBufferBuilder;
 use arrow_schema::SchemaRef;
 use datafusion_physical_plan::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder};
@@ -8,20 +25,24 @@ use datafusion_common::{utils::proxy::VecAllocExt, Result};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_expr::JoinType;
 use futures::StreamExt;
-use geo_index::rtree::{sort::HilbertSort, RTreeBuilder};
+use geo_index::rtree::{sort::HilbertSort, RTree, RTreeBuilder};
 use parking_lot::Mutex;
 use std::sync::{atomic::AtomicUsize, Arc};
 
 use crate::{
-    collect::BuildPartition,
-    collect::BuildSideBatch,
-    index::knn_adapter::KnnComponents,
-    index::{spatial_index::SpatialIndex, RTreeBuildResult, RTREE_MEMORY_ESTIMATE_PER_RECT},
-    operand_evaluator::create_operand_evaluator,
-    refine::create_refiner,
-    spatial_predicate::SpatialPredicate,
+    collect::BuildPartition, collect::BuildSideBatch, index::knn_adapter::KnnComponents,
+    index::spatial_index::SpatialIndex, operand_evaluator::create_operand_evaluator,
+    refine::create_refiner, spatial_predicate::SpatialPredicate,
     utils::join_utils::need_produce_result_in_final,
 };
+
+// Type aliases for better readability
+type SpatialRTree = RTree<f32>;
+type DataIdToBatchPos = Vec<(i32, i32)>;
+type RTreeBuildResult = (SpatialRTree, DataIdToBatchPos);
+
+/// Rough estimate for in-memory size of the rtree per rect in bytes
+const RTREE_MEMORY_ESTIMATE_PER_RECT: usize = 60;
 
 /// Builder for constructing a SpatialIndex from geometry batches.
 ///
