@@ -142,7 +142,7 @@ impl SpillWriter {
         let mut min_y_builder = Float32Builder::with_capacity(num_rows);
         let mut max_x_builder = Float32Builder::with_capacity(num_rows);
         let mut max_y_builder = Float32Builder::with_capacity(num_rows);
-        let mut null_buffer_builder = NullBufferBuilder::new_with_len(num_rows);
+        let mut null_buffer_builder = NullBufferBuilder::new(num_rows);
         for rect_opt in evaluated_batch.rects() {
             if let Some(rect) = rect_opt {
                 min_x_builder.append_value(rect.min().x);
@@ -370,4 +370,463 @@ fn spilled_batch_to_build_side_batch(record_batch: RecordBatch) -> Result<Evalua
     geom_array.rects = rects;
 
     Ok(EvaluatedBatch { batch, geom_array })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{ArrayRef, BinaryArray, Int32Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion_common::Result;
+    use datafusion_execution::runtime_env::RuntimeEnv;
+    use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+    use sedona_schema::datatypes::WKB_GEOMETRY;
+    use std::sync::Arc;
+
+    fn create_test_runtime_env() -> Result<Arc<RuntimeEnv>> {
+        Ok(Arc::new(RuntimeEnv::default()))
+    }
+
+    fn create_test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    fn create_test_record_batch() -> Result<RecordBatch> {
+        let schema = create_test_schema();
+        let id_array = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let name_array = Arc::new(StringArray::from(vec![Some("Alice"), Some("Bob"), None]));
+        RecordBatch::try_new(schema, vec![id_array, name_array]).map_err(|e| e.into())
+    }
+
+    fn create_test_geometry_array() -> Result<(ArrayRef, SedonaType)> {
+        // Create WKB encoded points (simple binary data for testing)
+        // WKB for POINT (1 2): 01 01000000 0000000000000000F03F 0000000000000040
+        let point1_wkb: Vec<u8> = vec![
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64,
+        ];
+        let point2_wkb: Vec<u8> = vec![
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 64, 0, 0, 0, 0, 0, 0, 16, 64,
+        ];
+        let point3_wkb: Vec<u8> = vec![
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 64, 0, 0, 0, 0, 0, 0, 24, 64,
+        ];
+
+        let sedona_type = WKB_GEOMETRY;
+        let geom_array: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(point1_wkb.as_slice()),
+            Some(point2_wkb.as_slice()),
+            Some(point3_wkb.as_slice()),
+        ]));
+
+        Ok((geom_array, sedona_type))
+    }
+
+    fn create_test_evaluated_batch() -> Result<EvaluatedBatch> {
+        let batch = create_test_record_batch()?;
+        let (geom_array, sedona_type) = create_test_geometry_array()?;
+        let mut geom_array = EvaluatedGeometryArray::try_new(geom_array, &sedona_type)?;
+
+        // Add distance as a scalar value
+        geom_array.distance = Some(ColumnarValue::Scalar(ScalarValue::Float64(Some(10.0))));
+
+        Ok(EvaluatedBatch { batch, geom_array })
+    }
+
+    fn create_test_evaluated_batch_with_array_distance() -> Result<EvaluatedBatch> {
+        let batch = create_test_record_batch()?;
+        let (geom_array, sedona_type) = create_test_geometry_array()?;
+        let mut geom_array = EvaluatedGeometryArray::try_new(geom_array, &sedona_type)?;
+
+        // Add distance as an array value
+        let dist_array = Arc::new(Float64Array::from(vec![Some(1.0), Some(2.0), Some(3.0)]));
+        geom_array.distance = Some(ColumnarValue::Array(dist_array));
+
+        Ok(EvaluatedBatch { batch, geom_array })
+    }
+
+    fn create_test_evaluated_batch_with_nulls() -> Result<EvaluatedBatch> {
+        let schema = create_test_schema();
+        let id_array = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let name_array = Arc::new(StringArray::from(vec![
+            Some("Alice"),
+            None,
+            Some("Charlie"),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![id_array, name_array])
+            .map_err(|e| DataFusionError::from(e))?;
+
+        // Create geometry array with null in the middle
+        let point1_wkb: Vec<u8> = vec![
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64,
+        ];
+        let point3_wkb: Vec<u8> = vec![
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 64, 0, 0, 0, 0, 0, 0, 24, 64,
+        ];
+
+        let sedona_type = WKB_GEOMETRY;
+        let geom_array: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(point1_wkb.as_slice()),
+            None,
+            Some(point3_wkb.as_slice()),
+        ]));
+
+        let mut geom_array = EvaluatedGeometryArray::try_new(geom_array, &sedona_type)?;
+
+        // Add distance with nulls
+        let dist_array = Arc::new(Float64Array::from(vec![Some(1.0), None, Some(3.0)]));
+        geom_array.distance = Some(ColumnarValue::Array(dist_array));
+
+        Ok(EvaluatedBatch { batch, geom_array })
+    }
+
+    #[test]
+    fn test_spill_writer_creation() -> Result<()> {
+        let env = create_test_runtime_env()?;
+        let schema = create_test_schema();
+        let sedona_type = WKB_GEOMETRY;
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = SpillMetrics::new(&metrics_set, 0);
+
+        let writer = SpillWriter::try_new(
+            env,
+            schema,
+            &sedona_type,
+            "test_spill",
+            SpillCompression::Uncompressed,
+            metrics,
+        )?;
+
+        // Verify the spill schema has the expected structure
+        assert_eq!(writer.spill_schema.fields().len(), 4);
+        assert_eq!(writer.spill_schema.field(0).name(), "data");
+        assert_eq!(writer.spill_schema.field(1).name(), "geom");
+        assert_eq!(writer.spill_schema.field(2).name(), "rect");
+        assert_eq!(writer.spill_schema.field(3).name(), "dist");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_spill_write_and_read_basic() -> Result<()> {
+        let env = create_test_runtime_env()?;
+        let schema = create_test_schema();
+        let sedona_type = WKB_GEOMETRY;
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = SpillMetrics::new(&metrics_set, 0);
+
+        let mut writer = SpillWriter::try_new(
+            env,
+            schema,
+            &sedona_type,
+            "test_spill",
+            SpillCompression::Uncompressed,
+            metrics,
+        )?;
+
+        let evaluated_batch = create_test_evaluated_batch()?;
+        let original_num_rows = evaluated_batch.num_rows();
+
+        writer.append(&evaluated_batch)?;
+        let temp_file = writer.finish()?;
+
+        // Read back the spilled data
+        let mut reader = SpillReader::try_new(&temp_file)?;
+        let read_batch_result = reader.next_batch();
+
+        assert!(read_batch_result.is_some());
+        let read_batch = read_batch_result.unwrap()?;
+
+        // Verify the data
+        assert_eq!(read_batch.num_rows(), original_num_rows);
+        assert_eq!(read_batch.batch.num_columns(), 2); // id and name columns
+
+        // Verify that there are no more batches
+        assert!(reader.next_batch().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_spill_write_and_read_with_array_distance() -> Result<()> {
+        let env = create_test_runtime_env()?;
+        let schema = create_test_schema();
+        let sedona_type = WKB_GEOMETRY;
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = SpillMetrics::new(&metrics_set, 0);
+
+        let mut writer = SpillWriter::try_new(
+            env,
+            schema,
+            &sedona_type,
+            "test_spill",
+            SpillCompression::Uncompressed,
+            metrics,
+        )?;
+
+        let evaluated_batch = create_test_evaluated_batch_with_array_distance()?;
+        writer.append(&evaluated_batch)?;
+        let temp_file = writer.finish()?;
+
+        // Read back the spilled data
+        let mut reader = SpillReader::try_new(&temp_file)?;
+        let read_batch = reader.next_batch().unwrap()?;
+
+        // Verify distance is read back as array
+        match &read_batch.geom_array.distance {
+            Some(ColumnarValue::Array(array)) => {
+                let float_array = array.as_any().downcast_ref::<Float64Array>().unwrap();
+                assert_eq!(float_array.len(), 3);
+                assert_eq!(float_array.value(0), 1.0);
+                assert_eq!(float_array.value(1), 2.0);
+                assert_eq!(float_array.value(2), 3.0);
+            }
+            _ => panic!("Expected distance to be an array"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_spill_write_and_read_with_nulls() -> Result<()> {
+        let env = create_test_runtime_env()?;
+        let schema = create_test_schema();
+        let sedona_type = WKB_GEOMETRY;
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = SpillMetrics::new(&metrics_set, 0);
+
+        let mut writer = SpillWriter::try_new(
+            env,
+            schema,
+            &sedona_type,
+            "test_spill",
+            SpillCompression::Uncompressed,
+            metrics,
+        )?;
+
+        let evaluated_batch = create_test_evaluated_batch_with_nulls()?;
+        writer.append(&evaluated_batch)?;
+        let temp_file = writer.finish()?;
+
+        // Read back the spilled data
+        let mut reader = SpillReader::try_new(&temp_file)?;
+        let read_batch = reader.next_batch().unwrap()?;
+
+        // Verify nulls are preserved
+        assert_eq!(read_batch.num_rows(), 3);
+        assert!(read_batch.geom_array.rects[1].is_none()); // Null geometry
+
+        // Verify distance nulls
+        match &read_batch.geom_array.distance {
+            Some(ColumnarValue::Array(array)) => {
+                let float_array = array.as_any().downcast_ref::<Float64Array>().unwrap();
+                assert!(float_array.is_valid(0));
+                assert!(float_array.is_null(1));
+                assert!(float_array.is_valid(2));
+            }
+            _ => panic!("Expected distance to be an array"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_spill_multiple_batches() -> Result<()> {
+        let env = create_test_runtime_env()?;
+        let schema = create_test_schema();
+        let sedona_type = WKB_GEOMETRY;
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = SpillMetrics::new(&metrics_set, 0);
+
+        let mut writer = SpillWriter::try_new(
+            env,
+            schema,
+            &sedona_type,
+            "test_spill",
+            SpillCompression::Uncompressed,
+            metrics,
+        )?;
+
+        // Write multiple batches
+        let batch1 = create_test_evaluated_batch()?;
+        let batch2 = create_test_evaluated_batch_with_array_distance()?;
+        let batch3 = create_test_evaluated_batch_with_nulls()?;
+
+        writer.append(&batch1)?;
+        writer.append(&batch2)?;
+        writer.append(&batch3)?;
+        let temp_file = writer.finish()?;
+
+        // Read back all batches
+        let mut reader = SpillReader::try_new(&temp_file)?;
+
+        let read_batch1 = reader.next_batch().unwrap()?;
+        assert_eq!(read_batch1.num_rows(), 3);
+
+        let read_batch2 = reader.next_batch().unwrap()?;
+        assert_eq!(read_batch2.num_rows(), 3);
+
+        let read_batch3 = reader.next_batch().unwrap()?;
+        assert_eq!(read_batch3.num_rows(), 3);
+
+        // Verify no more batches
+        assert!(reader.next_batch().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_spill_metrics_updated() -> Result<()> {
+        let env = create_test_runtime_env()?;
+        let schema = create_test_schema();
+        let sedona_type = WKB_GEOMETRY;
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = SpillMetrics::new(&metrics_set, 0);
+
+        let mut writer = SpillWriter::try_new(
+            env,
+            schema,
+            &sedona_type,
+            "test_spill",
+            SpillCompression::Uncompressed,
+            metrics.clone(),
+        )?;
+
+        let evaluated_batch = create_test_evaluated_batch()?;
+        writer.append(&evaluated_batch)?;
+
+        // Verify spill metrics were updated
+        assert!(metrics.spilled_rows.value() > 0);
+        assert!(metrics.spilled_bytes.value() > 0);
+
+        writer.finish()?;
+
+        // Verify spill file count was updated
+        assert_eq!(metrics.spill_file_count.value(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_spill_rect_preservation() -> Result<()> {
+        let env = create_test_runtime_env()?;
+        let schema = create_test_schema();
+        let sedona_type = WKB_GEOMETRY;
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = SpillMetrics::new(&metrics_set, 0);
+
+        let mut writer = SpillWriter::try_new(
+            env,
+            schema,
+            &sedona_type,
+            "test_spill",
+            SpillCompression::Uncompressed,
+            metrics,
+        )?;
+
+        let evaluated_batch = create_test_evaluated_batch()?;
+        let original_rects = evaluated_batch.rects().clone();
+
+        writer.append(&evaluated_batch)?;
+        let temp_file = writer.finish()?;
+
+        // Read back and verify rects
+        let mut reader = SpillReader::try_new(&temp_file)?;
+        let read_batch = reader.next_batch().unwrap()?;
+
+        assert_eq!(read_batch.rects().len(), original_rects.len());
+        for (original, read) in original_rects.iter().zip(read_batch.rects().iter()) {
+            match (original, read) {
+                (Some(orig_rect), Some(read_rect)) => {
+                    assert_eq!(orig_rect.min().x, read_rect.min().x);
+                    assert_eq!(orig_rect.min().y, read_rect.min().y);
+                    assert_eq!(orig_rect.max().x, read_rect.max().x);
+                    assert_eq!(orig_rect.max().y, read_rect.max().y);
+                }
+                (None, None) => {}
+                _ => panic!("Rect mismatch between original and read"),
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_spill_scalar_distance_preserved() -> Result<()> {
+        let env = create_test_runtime_env()?;
+        let schema = create_test_schema();
+        let sedona_type = WKB_GEOMETRY;
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = SpillMetrics::new(&metrics_set, 0);
+
+        let mut writer = SpillWriter::try_new(
+            env,
+            schema,
+            &sedona_type,
+            "test_spill",
+            SpillCompression::Uncompressed,
+            metrics,
+        )?;
+
+        let evaluated_batch = create_test_evaluated_batch()?;
+        writer.append(&evaluated_batch)?;
+        let temp_file = writer.finish()?;
+
+        // Read back and verify scalar distance is preserved
+        let mut reader = SpillReader::try_new(&temp_file)?;
+        let read_batch = reader.next_batch().unwrap()?;
+
+        match &read_batch.geom_array.distance {
+            Some(ColumnarValue::Scalar(ScalarValue::Float64(Some(val)))) => {
+                assert_eq!(*val, 10.0);
+            }
+            _ => panic!("Expected scalar distance value"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_spill_empty_batch() -> Result<()> {
+        let env = create_test_runtime_env()?;
+        let schema = create_test_schema();
+        let sedona_type = WKB_GEOMETRY;
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = SpillMetrics::new(&metrics_set, 0);
+
+        let mut writer = SpillWriter::try_new(
+            env,
+            schema.clone(),
+            &sedona_type,
+            "test_spill",
+            SpillCompression::Uncompressed,
+            metrics,
+        )?;
+
+        // Create an empty batch
+        let id_array = Arc::new(Int32Array::from(Vec::<i32>::new()));
+        let name_array = Arc::new(StringArray::from(Vec::<Option<&str>>::new()));
+        let empty_batch = RecordBatch::try_new(schema, vec![id_array, name_array])
+            .map_err(|e| DataFusionError::from(e))?;
+
+        let geom_array: ArrayRef = Arc::new(BinaryArray::from(Vec::<Option<&[u8]>>::new()));
+        let geom_array = EvaluatedGeometryArray::try_new(geom_array, &sedona_type)?;
+
+        let evaluated_batch = EvaluatedBatch {
+            batch: empty_batch,
+            geom_array,
+        };
+
+        writer.append(&evaluated_batch)?;
+        let temp_file = writer.finish()?;
+
+        // Read back and verify
+        let mut reader = SpillReader::try_new(&temp_file)?;
+        let read_batch = reader.next_batch().unwrap()?;
+        assert_eq!(read_batch.num_rows(), 0);
+
+        Ok(())
+    }
 }
