@@ -258,19 +258,19 @@ impl SpatialIndexBuilder {
         let knn_components =
             KnnComponents::new(cache_size, &self.indexed_batches, self.memory_pool.clone())?;
 
-        Ok(SpatialIndex::new(
-            self.schema,
+        Ok(SpatialIndex {
+            schema: self.schema,
             evaluator,
             refiner,
             rtree,
-            batch_pos_vec,
-            self.indexed_batches,
+            data_id_to_batch_pos: batch_pos_vec,
+            indexed_batches: self.indexed_batches,
             geom_idx_vec,
             visited_left_side,
-            AtomicUsize::new(self.probe_threads_count),
+            probe_threads_counter: AtomicUsize::new(self.probe_threads_count),
             knn_components,
-            self.reservation,
-        ))
+            reservation: self.reservation,
+        })
     }
 
     pub async fn add_partitions(&mut self, partitions: Vec<BuildPartition>) -> Result<()> {

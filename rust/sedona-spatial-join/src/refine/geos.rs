@@ -323,6 +323,7 @@ impl GeosRefiner {
 fn estimate_prep_geom_in_mem_size(wkb: &Wkb<'_>) -> usize {
     // TODO: This is a rough estimate of the memory usage of the prepared geometry and
     // may not be accurate.
+    // https://github.com/apache/sedona-db/issues/281
     wkb.buf().len() * 4
 }
 

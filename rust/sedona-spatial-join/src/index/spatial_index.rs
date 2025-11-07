@@ -46,49 +46,49 @@ use arrow::array::BooleanBufferBuilder;
 use sedona_common::{option::SpatialJoinOptions, ExecutionMode};
 
 pub(crate) struct SpatialIndex {
-    schema: SchemaRef,
+    pub(crate) schema: SchemaRef,
 
     /// The spatial predicate evaluator for the spatial predicate.
-    evaluator: Arc<dyn OperandEvaluator>,
+    pub(crate) evaluator: Arc<dyn OperandEvaluator>,
 
     /// The refiner for refining the index query results.
-    refiner: Arc<dyn IndexQueryResultRefiner>,
+    pub(crate) refiner: Arc<dyn IndexQueryResultRefiner>,
 
     /// R-tree index for the geometry batches. It takes MBRs as query windows and returns
     /// data indexes. These data indexes should be translated using `data_id_to_batch_pos` to get
     /// the original geometry batch index and row index, or translated using `prepared_geom_idx_vec`
     /// to get the prepared geometries array index.
-    rtree: RTree<f32>,
+    pub(crate) rtree: RTree<f32>,
 
     /// Indexed batches containing evaluated geometry arrays. It contains the original record
     /// batches and geometry arrays obtained by evaluating the geometry expression on the build side.
-    indexed_batches: Vec<EvaluatedBatch>,
+    pub(crate) indexed_batches: Vec<EvaluatedBatch>,
     /// An array for translating rtree data index to geometry batch index and row index
-    data_id_to_batch_pos: Vec<(i32, i32)>,
+    pub(crate) data_id_to_batch_pos: Vec<(i32, i32)>,
 
     /// An array for translating rtree data index to consecutive index. Each geometry may be indexed by
     /// multiple boxes, so there could be multiple data indexes for the same geometry. A mapping for
     /// squashing the index makes it easier for persisting per-geometry auxiliary data for evaluating
     /// the spatial predicate. This is extensively used by the spatial predicate evaluators for storing
     /// prepared geometries.
-    geom_idx_vec: Vec<usize>,
+    pub(crate) geom_idx_vec: Vec<usize>,
 
     /// Shared bitmap builders for visited left indices, one per batch
-    visited_left_side: Option<Mutex<Vec<BooleanBufferBuilder>>>,
+    pub(crate) visited_left_side: Option<Mutex<Vec<BooleanBufferBuilder>>>,
 
     /// Counter of running probe-threads, potentially able to update `bitmap`.
     /// Each time a probe thread finished probing the index, it will decrement the counter.
     /// The last finished probe thread will produce the extra output batches for unmatched
     /// build side when running left-outer joins. See also [`report_probe_completed`].
-    probe_threads_counter: AtomicUsize,
+    pub(crate) probe_threads_counter: AtomicUsize,
 
     /// Shared KNN components (distance metrics and geometry cache) for efficient KNN queries
-    knn_components: KnnComponents,
+    pub(crate) knn_components: KnnComponents,
 
     /// Memory reservation for tracking the memory usage of the spatial index
     /// Cleared on `SpatialIndex` drop
     #[expect(dead_code)]
-    reservation: MemoryReservation,
+    pub(crate) reservation: MemoryReservation,
 }
 
 impl SpatialIndex {
@@ -120,35 +120,6 @@ impl SpatialIndex {
             visited_left_side: None,
             probe_threads_counter,
             knn_components: KnnComponents::new(0, &[], memory_pool.clone()).unwrap(), // Empty index has no cache
-            reservation,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        schema: SchemaRef,
-        evaluator: Arc<dyn OperandEvaluator>,
-        refiner: Arc<dyn IndexQueryResultRefiner>,
-        rtree: RTree<f32>,
-        data_id_to_batch_pos: Vec<(i32, i32)>,
-        indexed_batches: Vec<EvaluatedBatch>,
-        geom_idx_vec: Vec<usize>,
-        visited_left_side: Option<Mutex<Vec<BooleanBufferBuilder>>>,
-        probe_threads_counter: AtomicUsize,
-        knn_components: KnnComponents,
-        reservation: MemoryReservation,
-    ) -> Self {
-        Self {
-            schema,
-            evaluator,
-            refiner,
-            rtree,
-            data_id_to_batch_pos,
-            indexed_batches,
-            geom_idx_vec,
-            visited_left_side,
-            probe_threads_counter,
-            knn_components,
             reservation,
         }
     }
