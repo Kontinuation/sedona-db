@@ -23,9 +23,8 @@ use datafusion_common_runtime::JoinSet;
 use datafusion_execution::{
     memory_pool::MemoryReservation, runtime_env::RuntimeEnv, SendableRecordBatchStream,
 };
-use datafusion_physical_plan::{
-    metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, SpillMetrics},
-    SpillManager,
+use datafusion_physical_plan::metrics::{
+    self, ExecutionPlanMetricsSet, MetricBuilder, SpillMetrics,
 };
 use futures::StreamExt;
 use sedona_common::sedona_internal_err;
@@ -39,7 +38,7 @@ use crate::{
             external::ExternalEvaluatedBatchStream, in_mem::InMemoryEvaluatedBatchStream,
             SendableEvaluatedBatchStream,
         },
-        spill::build_side_batch_to_spilled_batch,
+        spill::SpillWriter,
         EvaluatedBatch,
     },
     operand_evaluator::OperandEvaluator,
@@ -115,8 +114,7 @@ impl BuildSideBatchesCollector {
         metrics: &CollectBuildSideMetrics,
     ) -> Result<BuildPartition> {
         let evaluator = self.evaluator.as_ref();
-        let mut spill_file_opt = None;
-        let mut spill_manager_opt: Option<SpillManager> = None;
+        let mut spill_writer_opt = None;
         let mut in_mem_batches: Vec<EvaluatedBatch> = Vec::new();
         let mut analyzer = AnalyzeAccumulator::new(WKB_GEOMETRY, WKB_GEOMETRY);
 
@@ -141,60 +139,51 @@ impl BuildSideBatchesCollector {
             metrics.num_rows.add(build_side_batch.num_rows());
             metrics.total_size_bytes.add(in_mem_size);
 
-            if spill_file_opt.is_none() {
+            if spill_writer_opt.is_none() {
                 // Collected batches are in memory, no spilling happened for this patition before. We'll try
                 // storing this batch in memory first, and switch to writing everything to disk if we fail
                 // to grow the reservation.
                 if reservation.try_grow(in_mem_size).is_err() {
                     // Spill all in memory batches, and write future batches to spill file
                     let schema = build_side_batch.batch.schema();
-                    let spill_manager = SpillManager::new(
+                    let sedona_type = &build_side_batch.geom_array.sedona_type;
+                    let mut spill_writer = SpillWriter::try_new(
                         Arc::clone(&self.runtime_env),
-                        metrics.spill_metrics.clone(),
                         schema,
-                    )
-                    .with_compression_type(self.spill_compression);
-                    let mut in_progress_file =
-                        spill_manager.create_in_progress_file("collect_build_partition")?;
+                        sedona_type,
+                        "spilling build side batches",
+                        self.spill_compression,
+                        metrics.spill_metrics.clone(),
+                    )?;
+
                     for in_mem_batch in &in_mem_batches {
-                        let spilled_batch = build_side_batch_to_spilled_batch(in_mem_batch)?;
-                        in_progress_file.append_batch(&spilled_batch)?;
+                        spill_writer.append(in_mem_batch)?;
                     }
                     in_mem_batches.clear();
                     reservation.free();
-                    spill_manager_opt = Some(spill_manager);
-                    spill_file_opt = Some(in_progress_file);
+                    spill_writer_opt = Some(spill_writer);
                 }
             }
 
-            match &mut spill_file_opt {
+            match &mut spill_writer_opt {
                 None => {
                     in_mem_batches.push(build_side_batch);
                 }
-                Some(spill_file) => {
-                    let spilled_batch = build_side_batch_to_spilled_batch(&build_side_batch)?;
-                    spill_file.append_batch(&spilled_batch)?;
+                Some(spill_writer) => {
+                    spill_writer.append(&build_side_batch)?;
                 }
             }
         }
 
-        let build_side_batch_stream: SendableEvaluatedBatchStream = match spill_file_opt {
-            Some(mut spill_file) => {
-                let finished = spill_file.finish()?;
-                match finished {
-                    Some(temp_file) => {
-                        if !in_mem_batches.is_empty() {
-                            return sedona_internal_err!(
-                                "In-memory batches should have been spilled when spill file exists"
-                            );
-                        }
-                        Box::pin(ExternalEvaluatedBatchStream::try_new(
-                            spill_manager_opt.unwrap(),
-                            temp_file,
-                        )?)
-                    }
-                    None => Box::pin(InMemoryEvaluatedBatchStream::new(vec![])),
+        let build_side_batch_stream: SendableEvaluatedBatchStream = match spill_writer_opt {
+            Some(spill_writer) => {
+                let spill_file = spill_writer.finish()?;
+                if !in_mem_batches.is_empty() {
+                    return sedona_internal_err!(
+                        "In-memory batches should have been spilled when spill file exists"
+                    );
                 }
+                Box::pin(ExternalEvaluatedBatchStream::try_new(spill_file)?)
             }
             None => Box::pin(InMemoryEvaluatedBatchStream::new(in_mem_batches)),
         };

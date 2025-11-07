@@ -20,20 +20,32 @@ use std::{
     task::{Context, Poll},
 };
 
-use datafusion_common::Result;
+use datafusion_common::{DataFusionError, Result};
+use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::disk_manager::RefCountedTempFile;
-use datafusion_physical_plan::SpillManager;
+use futures::FutureExt;
 
-use crate::evaluated_batch::{evaluated_batch_stream::EvaluatedBatchStream, EvaluatedBatch};
+use crate::evaluated_batch::{
+    evaluated_batch_stream::EvaluatedBatchStream, spill::SpillReader, EvaluatedBatch,
+};
 
 pub(crate) struct ExternalEvaluatedBatchStream {
-    // TODO: implement spilled batch stream
+    state: State,
+}
+
+enum State {
+    Invalid,
+    UnInitialized(RefCountedTempFile),
+    Opening(SpawnedTask<Result<SpillReader>>),
+    Reading(SpawnedTask<(SpillReader, Option<Result<EvaluatedBatch>>)>),
+    Finished,
 }
 
 impl ExternalEvaluatedBatchStream {
-    pub fn try_new(spill_manager: SpillManager, spill_file: RefCountedTempFile) -> Result<Self> {
-        let _stream = spill_manager.read_spill_as_stream(spill_file)?;
-        todo!()
+    pub fn try_new(spill_file: RefCountedTempFile) -> Result<Self> {
+        Ok(Self {
+            state: State::UnInitialized(spill_file),
+        })
     }
 }
 
@@ -46,7 +58,72 @@ impl EvaluatedBatchStream for ExternalEvaluatedBatchStream {
 impl futures::Stream for ExternalEvaluatedBatchStream {
     type Item = Result<EvaluatedBatch>;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        todo!()
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let self_mut = self.get_mut();
+
+        loop {
+            match &mut self_mut.state {
+                State::UnInitialized(_) => {
+                    let State::UnInitialized(spill_file) =
+                        std::mem::replace(&mut self_mut.state, State::Invalid)
+                    else {
+                        unreachable!()
+                    };
+                    let task =
+                        SpawnedTask::spawn_blocking(move || SpillReader::try_new(&spill_file));
+                    self_mut.state = State::Opening(task);
+                }
+                State::Opening(task) => {
+                    let join_result = futures::ready!(task.poll_unpin(cx));
+                    match join_result {
+                        Err(e) => {
+                            self_mut.state = State::Finished;
+                            return Poll::Ready(Some(Err(DataFusionError::External(Box::new(e)))));
+                        }
+                        Ok(open_result) => match open_result {
+                            Ok(mut spill_reader) => {
+                                let task = SpawnedTask::spawn_blocking(move || {
+                                    let next_batch = spill_reader.next_batch();
+                                    (spill_reader, next_batch)
+                                });
+                                self_mut.state = State::Reading(task);
+                            }
+                            Err(e) => {
+                                self_mut.state = State::Finished;
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                        },
+                    }
+                }
+                State::Reading(task) => {
+                    let join_result = futures::ready!(task.poll_unpin(cx));
+                    match join_result {
+                        Err(e) => {
+                            self_mut.state = State::Finished;
+                            return Poll::Ready(Some(Err(DataFusionError::External(Box::new(e)))));
+                        }
+                        Ok((mut spill_reader, next_batch_result)) => match next_batch_result {
+                            None => {
+                                self_mut.state = State::Finished;
+                                return Poll::Ready(None);
+                            }
+                            Some(Err(e)) => {
+                                self_mut.state = State::Finished;
+                                return Poll::Ready(Some(Err(e)));
+                            }
+                            Some(Ok(batch)) => {
+                                let task = SpawnedTask::spawn_blocking(move || {
+                                    let next_batch = spill_reader.next_batch();
+                                    (spill_reader, next_batch)
+                                });
+                                self_mut.state = State::Reading(task);
+                                return Poll::Ready(Some(Ok(batch)));
+                            }
+                        },
+                    }
+                }
+                _ => todo!(),
+            }
+        }
     }
 }
