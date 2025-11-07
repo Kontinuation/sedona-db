@@ -28,7 +28,7 @@ use sedona_geos::wkb_to_geos::GEOSWkbFactory;
 use wkb::reader::Wkb;
 
 use crate::{
-    collect::BuildSideBatch,
+    evaluated_batch::EvaluatedBatch,
     index::IndexQueryResult,
     refine::{
         exec_mode_selector::{get_or_update_execution_mode, ExecModeSelector, SelectOptimalMode},
@@ -345,7 +345,7 @@ impl IndexQueryResultRefiner for GeosRefiner {
         }
     }
 
-    fn estimate_max_memory_usage(&self, build_batches: &[BuildSideBatch]) -> usize {
+    fn estimate_max_memory_usage(&self, build_batches: &[EvaluatedBatch]) -> usize {
         if self.exec_mode.get().unwrap_or(&ExecutionMode::PrepareBuild)
             == &ExecutionMode::PrepareBuild
         {

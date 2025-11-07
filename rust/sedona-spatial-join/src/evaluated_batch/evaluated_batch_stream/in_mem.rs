@@ -18,37 +18,39 @@
 use std::{
     pin::Pin,
     task::{Context, Poll},
+    vec::IntoIter,
 };
 
 use datafusion_common::Result;
-use datafusion_execution::disk_manager::RefCountedTempFile;
-use datafusion_physical_plan::SpillManager;
 
-use crate::collect::{
-    build_side_batch::BuildSideBatch, build_side_batch_stream::BuildSideBatchStream,
-};
+use crate::evaluated_batch::{evaluated_batch_stream::EvaluatedBatchStream, EvaluatedBatch};
 
-pub(crate) struct ExternalBuildSideBatchStream {
-    // TODO: implement spilled batch stream
+pub(crate) struct InMemoryEvaluatedBatchStream {
+    iter: IntoIter<EvaluatedBatch>,
 }
 
-impl ExternalBuildSideBatchStream {
-    pub fn try_new(spill_manager: SpillManager, spill_file: RefCountedTempFile) -> Result<Self> {
-        let _stream = spill_manager.read_spill_as_stream(spill_file)?;
-        todo!()
+impl InMemoryEvaluatedBatchStream {
+    pub fn new(batches: Vec<EvaluatedBatch>) -> Self {
+        InMemoryEvaluatedBatchStream {
+            iter: batches.into_iter(),
+        }
     }
 }
 
-impl BuildSideBatchStream for ExternalBuildSideBatchStream {
+impl EvaluatedBatchStream for InMemoryEvaluatedBatchStream {
     fn is_external(&self) -> bool {
-        true
+        false
     }
 }
 
-impl futures::Stream for ExternalBuildSideBatchStream {
-    type Item = Result<BuildSideBatch>;
+impl futures::Stream for InMemoryEvaluatedBatchStream {
+    type Item = Result<EvaluatedBatch>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        todo!()
+        self.get_mut()
+            .iter
+            .next()
+            .map(|batch| Poll::Ready(Some(Ok(batch))))
+            .unwrap_or(Poll::Ready(None))
     }
 }

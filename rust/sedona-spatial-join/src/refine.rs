@@ -22,7 +22,7 @@ use sedona_expr::statistics::GeoStatistics;
 use wkb::reader::Wkb;
 
 use crate::{
-    collect::BuildSideBatch, index::IndexQueryResult, spatial_predicate::SpatialPredicate,
+    evaluated_batch::EvaluatedBatch, index::IndexQueryResult, spatial_predicate::SpatialPredicate,
 };
 
 /// Trait for refining spatial index query results by evaluating exact geometric predicates.
@@ -73,7 +73,7 @@ pub(crate) trait IndexQueryResultRefiner: Send + Sync {
     ///
     /// # Returns
     /// * `usize` - Estimated maximum memory usage in bytes
-    fn estimate_max_memory_usage(&self, build_batches: &[BuildSideBatch]) -> usize;
+    fn estimate_max_memory_usage(&self, build_batches: &[EvaluatedBatch]) -> usize;
 
     /// Get the current memory usage of the refiner in bytes.
     ///

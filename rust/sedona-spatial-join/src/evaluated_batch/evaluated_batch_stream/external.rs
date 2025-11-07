@@ -16,43 +16,37 @@
 // under the License.
 
 use std::{
-    collections::VecDeque,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use datafusion_common::Result;
+use datafusion_execution::disk_manager::RefCountedTempFile;
+use datafusion_physical_plan::SpillManager;
 
-use crate::collect::{
-    build_side_batch::BuildSideBatch, build_side_batch_stream::BuildSideBatchStream,
-};
+use crate::evaluated_batch::{evaluated_batch_stream::EvaluatedBatchStream, EvaluatedBatch};
 
-pub(crate) struct InMemoryBuildSideBatchStream {
-    batches: VecDeque<BuildSideBatch>,
+pub(crate) struct ExternalEvaluatedBatchStream {
+    // TODO: implement spilled batch stream
 }
 
-impl InMemoryBuildSideBatchStream {
-    pub fn new(batches: Vec<BuildSideBatch>) -> Self {
-        InMemoryBuildSideBatchStream {
-            batches: VecDeque::from(batches),
-        }
+impl ExternalEvaluatedBatchStream {
+    pub fn try_new(spill_manager: SpillManager, spill_file: RefCountedTempFile) -> Result<Self> {
+        let _stream = spill_manager.read_spill_as_stream(spill_file)?;
+        todo!()
     }
 }
 
-impl BuildSideBatchStream for InMemoryBuildSideBatchStream {
+impl EvaluatedBatchStream for ExternalEvaluatedBatchStream {
     fn is_external(&self) -> bool {
-        false
+        true
     }
 }
 
-impl futures::Stream for InMemoryBuildSideBatchStream {
-    type Item = Result<BuildSideBatch>;
+impl futures::Stream for ExternalEvaluatedBatchStream {
+    type Item = Result<EvaluatedBatch>;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let front = self.get_mut().batches.pop_front();
-        match front {
-            Some(batch) => Poll::Ready(Some(Ok(batch))),
-            None => Poll::Ready(None),
-        }
+        todo!()
     }
 }

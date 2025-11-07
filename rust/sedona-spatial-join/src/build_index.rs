@@ -25,8 +25,10 @@ use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use sedona_common::SedonaOptions;
 
 use crate::{
-    collect::{BuildSideBatchesCollector, CollectBuildSideMetrics},
-    index::{SpatialIndex, SpatialIndexBuilder, SpatialJoinBuildMetrics},
+    index::{
+        BuildSideBatchesCollector, CollectBuildSideMetrics, SpatialIndex, SpatialIndexBuilder,
+        SpatialJoinBuildMetrics,
+    },
     operand_evaluator::create_operand_evaluator,
     spatial_predicate::SpatialPredicate,
 };

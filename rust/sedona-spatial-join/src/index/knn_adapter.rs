@@ -23,7 +23,7 @@ use geo_index::rtree::{distance::GeometryAccessor, EuclideanDistance, HaversineD
 use geo_types::Geometry;
 use sedona_geo::to_geo::item_to_geometry;
 
-use crate::collect::BuildSideBatch;
+use crate::evaluated_batch::EvaluatedBatch;
 
 /// Shared KNN components that can be reused across queries
 pub(crate) struct KnnComponents {
@@ -39,7 +39,7 @@ pub(crate) struct KnnComponents {
 impl KnnComponents {
     pub fn new(
         cache_size: usize,
-        indexed_batches: &[BuildSideBatch],
+        indexed_batches: &[EvaluatedBatch],
         memory_pool: Arc<dyn MemoryPool>,
     ) -> datafusion_common::Result<Self> {
         // Create memory consumer and reservation for geometry cache
@@ -62,7 +62,7 @@ impl KnnComponents {
     }
 
     /// Estimate the maximum memory usage for decoded geometries based on WKB sizes
-    pub fn estimate_max_memory_usage(indexed_batches: &[BuildSideBatch]) -> usize {
+    pub fn estimate_max_memory_usage(indexed_batches: &[EvaluatedBatch]) -> usize {
         let mut total_wkb_size = 0;
 
         for batch in indexed_batches {
@@ -78,7 +78,7 @@ impl KnnComponents {
 /// This accessor provides on-demand WKB decoding and geometry caching for efficient
 /// KNN queries with support for both Euclidean and Haversine distance metrics.
 pub(crate) struct SedonaKnnAdapter<'a> {
-    indexed_batches: &'a [BuildSideBatch],
+    indexed_batches: &'a [EvaluatedBatch],
     data_id_to_batch_pos: &'a [(i32, i32)],
     // Reference to KNN components for cache and memory tracking
     knn_components: &'a KnnComponents,
@@ -87,7 +87,7 @@ pub(crate) struct SedonaKnnAdapter<'a> {
 impl<'a> SedonaKnnAdapter<'a> {
     /// Create a new adapter
     pub fn new(
-        indexed_batches: &'a [BuildSideBatch],
+        indexed_batches: &'a [EvaluatedBatch],
         data_id_to_batch_pos: &'a [(i32, i32)],
         knn_components: &'a KnnComponents,
     ) -> Self {

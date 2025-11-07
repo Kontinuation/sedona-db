@@ -26,10 +26,10 @@ use geo::coord;
 use geo_types::Rect;
 use sedona_schema::datatypes::SedonaType;
 
-use crate::{collect::build_side_batch::BuildSideBatch, operand_evaluator::EvaluatedGeometryArray};
+use crate::{evaluated_batch::EvaluatedBatch, operand_evaluator::EvaluatedGeometryArray};
 
 pub(crate) fn build_side_batch_to_spilled_batch(
-    build_side_batch: &BuildSideBatch,
+    build_side_batch: &EvaluatedBatch,
 ) -> Result<RecordBatch> {
     let orig_schema = build_side_batch.batch.schema();
     let geom_array = &build_side_batch.geom_array;
@@ -137,7 +137,7 @@ pub(crate) fn build_side_batch_to_spilled_batch(
 #[allow(dead_code)]
 pub(crate) fn spilled_batch_to_build_side_batch(
     record_batch: RecordBatch,
-) -> Result<BuildSideBatch> {
+) -> Result<EvaluatedBatch> {
     // Extract the data struct array (column 0) and convert back to the original RecordBatch
     let data_array = record_batch
         .column(0)
@@ -264,5 +264,5 @@ pub(crate) fn spilled_batch_to_build_side_batch(
     // because the spilled batch may have been modified (e.g., filtered)
     geom_array.rects = rects;
 
-    Ok(BuildSideBatch { batch, geom_array })
+    Ok(EvaluatedBatch { batch, geom_array })
 }

@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod build_side_collector;
 mod knn_adapter;
 pub(crate) mod spatial_index;
 pub(crate) mod spatial_index_builder;
 
+pub(crate) use build_side_collector::{
+    BuildPartition, BuildSideBatchesCollector, CollectBuildSideMetrics,
+};
 pub(crate) use spatial_index::SpatialIndex;
 pub(crate) use spatial_index_builder::{SpatialIndexBuilder, SpatialJoinBuildMetrics};
 use wkb::reader::Wkb;

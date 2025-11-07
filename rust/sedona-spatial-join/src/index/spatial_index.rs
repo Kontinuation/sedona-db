@@ -35,7 +35,7 @@ use sedona_geo_generic_alg::algorithm::Centroid;
 use wkb::reader::Wkb;
 
 use crate::{
-    collect::BuildSideBatch,
+    evaluated_batch::EvaluatedBatch,
     index::knn_adapter::{KnnComponents, SedonaKnnAdapter},
     index::{IndexQueryResult, QueryResultMetrics},
     operand_evaluator::{create_operand_evaluator, OperandEvaluator},
@@ -62,7 +62,7 @@ pub(crate) struct SpatialIndex {
 
     /// Indexed batches containing evaluated geometry arrays. It contains the original record
     /// batches and geometry arrays obtained by evaluating the geometry expression on the build side.
-    indexed_batches: Vec<BuildSideBatch>,
+    indexed_batches: Vec<EvaluatedBatch>,
     /// An array for translating rtree data index to geometry batch index and row index
     data_id_to_batch_pos: Vec<(i32, i32)>,
 
@@ -131,7 +131,7 @@ impl SpatialIndex {
         refiner: Arc<dyn IndexQueryResultRefiner>,
         rtree: RTree<f32>,
         data_id_to_batch_pos: Vec<(i32, i32)>,
-        indexed_batches: Vec<BuildSideBatch>,
+        indexed_batches: Vec<EvaluatedBatch>,
         geom_idx_vec: Vec<usize>,
         visited_left_side: Option<Mutex<Vec<BooleanBufferBuilder>>>,
         probe_threads_counter: AtomicUsize,
@@ -593,7 +593,7 @@ mod tests {
             ],
             &WKB_GEOMETRY,
         );
-        let indexed_batch = BuildSideBatch {
+        let indexed_batch = EvaluatedBatch {
             batch,
             geom_array: EvaluatedGeometryArray::try_new(geom_batch, &WKB_GEOMETRY).unwrap(),
         };
@@ -654,7 +654,7 @@ mod tests {
             &WKB_GEOMETRY,
         );
 
-        let indexed_batch = BuildSideBatch {
+        let indexed_batch = EvaluatedBatch {
             batch,
             geom_array: EvaluatedGeometryArray::try_new(geom_batch, &WKB_GEOMETRY).unwrap(),
         };
@@ -753,7 +753,7 @@ mod tests {
             &WKB_GEOMETRY,
         );
 
-        let indexed_batch = BuildSideBatch {
+        let indexed_batch = EvaluatedBatch {
             batch,
             geom_array: EvaluatedGeometryArray::try_new(geom_batch, &WKB_GEOMETRY).unwrap(),
         };
@@ -837,7 +837,7 @@ mod tests {
             &WKB_GEOMETRY,
         );
 
-        let indexed_batch = BuildSideBatch {
+        let indexed_batch = EvaluatedBatch {
             batch,
             geom_array: EvaluatedGeometryArray::try_new(geom_batch, &WKB_GEOMETRY).unwrap(),
         };
@@ -931,7 +931,7 @@ mod tests {
             &WKB_GEOMETRY,
         );
 
-        let indexed_batch = BuildSideBatch {
+        let indexed_batch = EvaluatedBatch {
             batch,
             geom_array: EvaluatedGeometryArray::try_new(geom_batch, &WKB_GEOMETRY).unwrap(),
         };
@@ -1073,7 +1073,7 @@ mod tests {
             &WKB_GEOMETRY,
         );
 
-        let indexed_batch = BuildSideBatch {
+        let indexed_batch = EvaluatedBatch {
             batch,
             geom_array: EvaluatedGeometryArray::try_new(geom_batch, &WKB_GEOMETRY).unwrap(),
         };
@@ -1185,7 +1185,7 @@ mod tests {
             &WKB_GEOMETRY,
         );
 
-        let indexed_batch = BuildSideBatch {
+        let indexed_batch = EvaluatedBatch {
             batch,
             geom_array: EvaluatedGeometryArray::try_new(geom_batch, &WKB_GEOMETRY).unwrap(),
         };
@@ -1268,7 +1268,7 @@ mod tests {
             &WKB_GEOMETRY,
         );
 
-        let indexed_batch = BuildSideBatch {
+        let indexed_batch = EvaluatedBatch {
             batch,
             geom_array: EvaluatedGeometryArray::try_new(geom_batch, &WKB_GEOMETRY).unwrap(),
         };
@@ -1352,7 +1352,7 @@ mod tests {
             &WKB_GEOMETRY,
         );
 
-        let indexed_batch = BuildSideBatch {
+        let indexed_batch = EvaluatedBatch {
             batch,
             geom_array: EvaluatedGeometryArray::try_new(geom_batch, &WKB_GEOMETRY).unwrap(),
         };
@@ -1441,7 +1441,7 @@ mod tests {
             ],
             &WKB_GEOMETRY,
         );
-        let indexed_batch = BuildSideBatch {
+        let indexed_batch = EvaluatedBatch {
             batch,
             geom_array: EvaluatedGeometryArray::try_new(geom_batch, &WKB_GEOMETRY).unwrap(),
         };

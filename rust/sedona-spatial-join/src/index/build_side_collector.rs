@@ -29,21 +29,30 @@ use datafusion_physical_plan::{
 };
 use futures::StreamExt;
 use sedona_common::sedona_internal_err;
+use sedona_expr::statistics::GeoStatistics;
 use sedona_functions::st_analyze_aggr::AnalyzeAccumulator;
 use sedona_schema::datatypes::WKB_GEOMETRY;
 
 use crate::{
-    collect::{
-        build_side_batch::BuildSideBatch,
-        build_side_batch_stream::{
-            external::ExternalBuildSideBatchStream, in_mem::InMemoryBuildSideBatchStream,
-            SendableBuildSideBatchStream,
+    evaluated_batch::{
+        evaluated_batch_stream::{
+            external::ExternalEvaluatedBatchStream, in_mem::InMemoryEvaluatedBatchStream,
+            SendableEvaluatedBatchStream,
         },
         spill::build_side_batch_to_spilled_batch,
-        BuildPartition,
+        EvaluatedBatch,
     },
     operand_evaluator::OperandEvaluator,
 };
+
+pub(crate) struct BuildPartition {
+    pub build_side_batch_stream: SendableEvaluatedBatchStream,
+    pub geo_statistics: GeoStatistics,
+
+    /// Memory reservation for tracking the memory usage of the build partition
+    /// Cleared on `BuildPartition` drop
+    pub reservation: MemoryReservation,
+}
 
 /// A collector for evaluating the spatial expression on build side batches and collect
 /// them as asynchronous streams with additional statistics. The asynchronous streams
@@ -108,7 +117,7 @@ impl BuildSideBatchesCollector {
         let evaluator = self.evaluator.as_ref();
         let mut spill_file_opt = None;
         let mut spill_manager_opt: Option<SpillManager> = None;
-        let mut in_mem_batches: Vec<BuildSideBatch> = Vec::new();
+        let mut in_mem_batches: Vec<EvaluatedBatch> = Vec::new();
         let mut analyzer = AnalyzeAccumulator::new(WKB_GEOMETRY, WKB_GEOMETRY);
 
         while let Some(record_batch) = stream.next().await {
@@ -122,7 +131,7 @@ impl BuildSideBatchesCollector {
                 analyzer.update_statistics(wkb, wkb.buf().len())?;
             }
 
-            let build_side_batch = BuildSideBatch {
+            let build_side_batch = EvaluatedBatch {
                 batch: record_batch,
                 geom_array,
             };
@@ -169,7 +178,7 @@ impl BuildSideBatchesCollector {
             }
         }
 
-        let build_side_batch_stream: SendableBuildSideBatchStream = match spill_file_opt {
+        let build_side_batch_stream: SendableEvaluatedBatchStream = match spill_file_opt {
             Some(mut spill_file) => {
                 let finished = spill_file.finish()?;
                 match finished {
@@ -179,15 +188,15 @@ impl BuildSideBatchesCollector {
                                 "In-memory batches should have been spilled when spill file exists"
                             );
                         }
-                        Box::pin(ExternalBuildSideBatchStream::try_new(
+                        Box::pin(ExternalEvaluatedBatchStream::try_new(
                             spill_manager_opt.unwrap(),
                             temp_file,
                         )?)
                     }
-                    None => Box::pin(InMemoryBuildSideBatchStream::new(vec![])),
+                    None => Box::pin(InMemoryEvaluatedBatchStream::new(vec![])),
                 }
             }
-            None => Box::pin(InMemoryBuildSideBatchStream::new(in_mem_batches)),
+            None => Box::pin(InMemoryEvaluatedBatchStream::new(in_mem_batches)),
         };
 
         Ok(BuildPartition {

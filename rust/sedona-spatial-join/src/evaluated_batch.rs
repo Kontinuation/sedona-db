@@ -22,18 +22,18 @@ use wkb::reader::Wkb;
 
 use crate::operand_evaluator::EvaluatedGeometryArray;
 
-/// BuildSide batch containing the original record batch from the build side and the evaluated
+/// EvaluatedBatch contains the original record batch from the input stream and the evaluated
 /// geometry array.
-pub(crate) struct BuildSideBatch {
-    /// Original record batch polled from the build side stream
+pub(crate) struct EvaluatedBatch {
+    /// Original record batch polled from the stream
     pub batch: RecordBatch,
     /// Evaluated geometry array, containing the geometry array containing geometries to be joined,
     /// rects of joined geometries, evaluated distance columnar values if we are running a distance
-    /// join and the distance expression is bound to the build side, etc.
+    /// join, etc.
     pub geom_array: EvaluatedGeometryArray,
 }
 
-impl BuildSideBatch {
+impl EvaluatedBatch {
     pub fn in_mem_size(&self) -> usize {
         // NOTE: sometimes `geom_array` will reuse the memory of `batch`, especially when
         // the expression for evaluating the geometry is a simple column reference. In this case,
@@ -59,3 +59,6 @@ impl BuildSideBatch {
         &self.geom_array.distance
     }
 }
+
+pub(crate) mod evaluated_batch_stream;
+pub(crate) mod spill;

@@ -16,7 +16,7 @@
 // under the License.
 
 mod build_index;
-mod collect;
+mod evaluated_batch;
 pub mod exec;
 mod index;
 pub mod operand_evaluator;
