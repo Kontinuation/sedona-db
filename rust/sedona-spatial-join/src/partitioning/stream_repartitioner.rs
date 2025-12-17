@@ -38,7 +38,7 @@ use arrow::compute::interleave_record_batch;
 use arrow_array::{Array, ArrayRef, BinaryViewArray, RecordBatch, StringViewArray};
 use arrow_select::interleave::interleave as arrow_interleave;
 use datafusion::config::SpillCompression;
-use datafusion_common::{DataFusionError, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue};
 use datafusion_execution::{disk_manager::RefCountedTempFile, runtime_env::RuntimeEnv};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_plan::metrics::SpillMetrics;
@@ -572,6 +572,7 @@ fn interleave_distance_columns(
     // Check consistency and determine if we need array conversion
     let mut first_value: Option<&ColumnarValue> = None;
     let mut needs_array = false;
+    let mut all_null = true;
     let mut first_scalar: Option<&ScalarValue> = None;
 
     for geom in geom_arrays {
@@ -579,33 +580,37 @@ fn interleave_distance_columns(
             Some(value) => {
                 if first_value.is_none() {
                     first_value = Some(value);
-                    if let ColumnarValue::Scalar(scalar) = value {
-                        first_scalar = Some(scalar);
-                    } else {
+                }
+
+                match value {
+                    ColumnarValue::Array(array) => {
                         needs_array = true;
-                    }
-                } else {
-                    // Check for arrays or mismatched scalars
-                    match value {
-                        ColumnarValue::Array(_) => needs_array = true,
-                        ColumnarValue::Scalar(scalar) => {
-                            if let Some(first) = first_scalar {
-                                if first != scalar {
-                                    needs_array = true;
-                                }
-                            }
+                        if all_null && array.logical_null_count() != array.len() {
+                            all_null = false;
                         }
+                    }
+                    ColumnarValue::Scalar(scalar) => {
+                        if let Some(first) = first_scalar {
+                            if first != scalar {
+                                needs_array = true;
+                            }
+                        } else {
+                            first_scalar = Some(scalar);
+                        }
+                        all_null = false;
                     }
                 }
             }
             None => {
-                if first_value.is_some() {
-                    return Err(DataFusionError::Internal(
-                        "Inconsistent distance metadata across batches".to_string(),
-                    ));
+                if first_value.is_some() && !all_null {
+                    return sedona_internal_err!("Inconsistent distance metadata across batches");
                 }
             }
         }
+    }
+
+    if all_null {
+        return Ok(None);
     }
 
     let Some(distance_value) = first_value else {
@@ -628,9 +633,7 @@ fn interleave_distance_columns(
                 arrays.push(value.to_array_of_size(geom.geometry_array.len())?);
             }
             None => {
-                return Err(DataFusionError::Internal(
-                    "Inconsistent distance metadata across batches".to_string(),
-                ));
+                return sedona_internal_err!("Inconsistent distance metadata across batches");
             }
         }
     }
@@ -1282,6 +1285,26 @@ mod tests {
         assert_eq!(view_array.value(1), wkbs2[0].as_slice());
         assert_eq!(view_array.value(2), wkbs1[1].as_slice());
 
+        Ok(())
+    }
+
+    #[test]
+    fn interleave_distance_mixed_none_and_null() -> Result<()> {
+        use arrow_array::Float64Array;
+
+        let wkbs1 = vec![point_wkb(10.0, 10.0)];
+        let wkbs2 = vec![point_wkb(20.0, 20.0)];
+
+        let geom1 = make_geom_array_with_distance(wkbs1, None)?;
+
+        let null_array = Arc::new(Float64Array::new_null(1));
+        let geom2 = make_geom_array_with_distance(wkbs2, Some(ColumnarValue::Array(null_array)))?;
+
+        let geom_arrays = vec![&geom1, &geom2];
+        let assignments = vec![(0, 0), (1, 0)];
+
+        let result = interleave_distance_columns(&geom_arrays, &assignments)?;
+        assert!(result.is_none());
         Ok(())
     }
 }

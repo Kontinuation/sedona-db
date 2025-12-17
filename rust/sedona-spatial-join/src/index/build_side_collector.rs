@@ -194,11 +194,13 @@ impl BuildSideBatchesCollector {
                     // storing this batch in memory first, and switch to writing everything to disk if we fail
                     // to grow the reservation.
                     in_mem_batches.push(build_side_batch);
-                    if reservation.try_grow(in_mem_size).is_err() {
+                    if let Err(e) = reservation.try_grow(in_mem_size) {
                         log::debug!(
-                            "Failed to grow reservation by {} bytes. Current reservation: {} bytes. Spilling...",
+                            "Failed to grow reservation by {} bytes. Current reservation: {} bytes. num rows: {}, reason: {:?}, Spilling...",
                             in_mem_size,
-                            reservation.size()
+                            reservation.size(),
+                            num_rows,
+                            e,
                         );
                         spill_writer_opt =
                             self.spill_in_mem_batches(&mut in_mem_batches, metrics)?;
