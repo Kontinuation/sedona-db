@@ -155,3 +155,6 @@ sedona-geos = { version = "0.3.0", path = "c/sedona-geos" }
 sedona-proj = { version = "0.3.0", path = "c/sedona-proj", default-features = false }
 sedona-s2geography = { version = "0.3.0", path = "c/sedona-s2geography" }
 sedona-tg = { version = "0.3.0", path = "c/sedona-tg" }
+
+[profile.release]
+debug = true
