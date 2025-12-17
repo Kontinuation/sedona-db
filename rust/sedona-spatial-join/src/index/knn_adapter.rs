@@ -33,7 +33,7 @@ pub(crate) struct KnnComponents {
     /// Indexed by rtree data index for O(1) access
     geometry_cache: Vec<OnceCell<Geometry<f64>>>,
     /// Memory reservation to track geometry cache memory usage
-    _reservation: MemoryReservation,
+    reservation: MemoryReservation,
 }
 
 impl KnnComponents {
@@ -57,7 +57,7 @@ impl KnnComponents {
             euclidean_metric: EuclideanDistance,
             haversine_metric: HaversineDistance::default(),
             geometry_cache,
-            _reservation: reservation,
+            reservation,
         })
     }
 
@@ -71,6 +71,10 @@ impl KnnComponents {
             }
         }
         total_wkb_size
+    }
+
+    pub fn estimated_memory_usage(&self) -> usize {
+        self.reservation.size()
     }
 }
 

@@ -23,7 +23,7 @@ use std::sync::{
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion_common::Result;
-use datafusion_execution::memory_pool::{MemoryPool, MemoryReservation};
+use datafusion_execution::memory_pool::MemoryPool;
 use geo_index::rtree::distance::{DistanceMetric, GeometryAccessor};
 use geo_index::rtree::{sort::HilbertSort, RTree, RTreeBuilder, RTreeIndex};
 use geo_index::IndexableNum;
@@ -36,14 +36,11 @@ use wkb::reader::Wkb;
 
 use crate::{
     evaluated_batch::EvaluatedBatch,
-    index::{
-        knn_adapter::{KnnComponents, SedonaKnnAdapter},
-        IndexQueryResult, QueryResultMetrics,
-    },
+    index::knn_adapter::{KnnComponents, SedonaKnnAdapter},
+    index::{IndexQueryResult, QueryResultMetrics},
     operand_evaluator::{create_operand_evaluator, OperandEvaluator},
     refine::{create_refiner, IndexQueryResultRefiner},
     spatial_predicate::SpatialPredicate,
-    utils::concurrent_reservation::ConcurrentReservation,
 };
 use arrow::array::BooleanBufferBuilder;
 use sedona_common::{option::SpatialJoinOptions, sedona_internal_err, ExecutionMode};
@@ -56,9 +53,6 @@ pub struct SpatialIndex {
 
     /// The refiner for refining the index query results.
     pub(crate) refiner: Arc<dyn IndexQueryResultRefiner>,
-
-    /// Memory reservation for tracking the memory usage of the refiner
-    pub(crate) refiner_reservation: ConcurrentReservation,
 
     /// R-tree index for the geometry batches. It takes MBRs as query windows and returns
     /// data indexes. These data indexes should be translated using `data_id_to_batch_pos` to get
@@ -90,11 +84,6 @@ pub struct SpatialIndex {
 
     /// Shared KNN components (distance metrics and geometry cache) for efficient KNN queries
     pub(crate) knn_components: Option<KnnComponents>,
-
-    /// Memory reservation for tracking the memory usage of the spatial index
-    /// Cleared on `SpatialIndex` drop
-    #[expect(dead_code)]
-    pub(crate) reservation: MemoryReservation,
 }
 
 impl SpatialIndex {
@@ -103,7 +92,6 @@ impl SpatialIndex {
         schema: SchemaRef,
         options: SpatialJoinOptions,
         probe_threads_counter: AtomicUsize,
-        mut reservation: MemoryReservation,
         memory_pool: Arc<dyn MemoryPool>,
     ) -> Self {
         let evaluator = create_operand_evaluator(&spatial_predicate, options.clone());
@@ -114,8 +102,6 @@ impl SpatialIndex {
             0,
             GeoStatistics::empty(),
         );
-        let refiner_reservation = reservation.split(0);
-        let refiner_reservation = ConcurrentReservation::try_new(0, refiner_reservation).unwrap();
         let rtree = RTreeBuilder::<f32>::new(0).finish::<HilbertSort>();
         let knn_components = matches!(spatial_predicate, SpatialPredicate::KNearestNeighbors(_))
             .then(|| KnnComponents::new(0, &[], memory_pool.clone()).unwrap());
@@ -123,7 +109,6 @@ impl SpatialIndex {
             schema,
             evaluator,
             refiner,
-            refiner_reservation,
             rtree,
             data_id_to_batch_pos: Vec::new(),
             indexed_batches: Vec::new(),
@@ -131,7 +116,6 @@ impl SpatialIndex {
             visited_left_side: None,
             probe_threads_counter,
             knn_components,
-            reservation,
         }
     }
 
@@ -444,9 +428,6 @@ impl SpatialIndex {
         let results = self.refiner.refine(probe_wkb, &index_query_results)?;
         let num_results = results.len();
         build_batch_positions.extend(results);
-
-        // Update refiner memory reservation
-        self.refiner_reservation.resize(self.refiner.mem_usage())?;
 
         Ok(QueryResultMetrics {
             count: num_results,

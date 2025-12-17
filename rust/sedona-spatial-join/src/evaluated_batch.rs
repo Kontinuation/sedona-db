@@ -16,6 +16,7 @@
 // under the License.
 
 use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use datafusion_expr::ColumnarValue;
 use geo::Rect;
 use wkb::reader::Wkb;
@@ -24,7 +25,7 @@ use crate::operand_evaluator::EvaluatedGeometryArray;
 
 /// EvaluatedBatch contains the original record batch from the input stream and the evaluated
 /// geometry array.
-pub(crate) struct EvaluatedBatch {
+pub struct EvaluatedBatch {
     /// Original record batch polled from the stream
     pub batch: RecordBatch,
     /// Evaluated geometry array, containing the geometry array containing geometries to be joined,
@@ -40,6 +41,10 @@ impl EvaluatedBatch {
         // the in_mem_size will be overestimated. It is a conservative estimation so there's no risk
         // of running out of memory because of underestimation.
         self.batch.get_array_memory_size() + self.geom_array.in_mem_size()
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        self.batch.schema()
     }
 
     pub fn num_rows(&self) -> usize {
@@ -60,4 +65,5 @@ impl EvaluatedBatch {
     }
 }
 
-pub(crate) mod evaluated_batch_stream;
+pub mod evaluated_batch_stream;
+pub(crate) mod spill;

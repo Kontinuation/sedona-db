@@ -45,8 +45,12 @@ class SedonaContext:
         └───────┘
     """
 
-    def __init__(self):
-        self._impl = InternalContext()
+    def __init__(
+        self,
+        memory_limit: Optional[int] = None,
+        temp_dir: Optional[str] = None,
+    ):
+        self._impl = InternalContext(memory_limit, temp_dir)
         self.options = Options()
 
     def create_data_frame(self, obj: Any, schema: Any = None) -> DataFrame:
@@ -273,9 +277,17 @@ class SedonaContext:
         self._impl.register_udf(udf)
 
 
-def connect() -> SedonaContext:
-    """Create a new [SedonaContext][sedonadb.context.SedonaContext]"""
-    return SedonaContext()
+def connect(
+    memory_limit: Optional[int] = None,
+    temp_dir: Optional[str] = None,
+) -> SedonaContext:
+    """Create a new [SedonaContext][sedonadb.context.SedonaContext]
+
+    Args:
+        memory_limit: The maximum amount of memory to use for execution, in bytes.
+        temp_dir: The directory to use for temporary files.
+    """
+    return SedonaContext(memory_limit=memory_limit, temp_dir=temp_dir)
 
 
 def configure_proj(

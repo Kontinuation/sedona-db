@@ -70,6 +70,7 @@ arrow = { version = "56.0.0", features = ["prettyprint", "ffi", "chrono-tz"] }
 arrow-array = { version = "56.0.0" }
 arrow-cast = { version = "56.0.0" }
 arrow-data = { version = "56.0.0" }
+arrow-select = { version = "56.0.0" }
 arrow-json = { version = "56.0.0" }
 arrow-schema = { version = "56.0.0" }
 arrow-buffer = { version = "56.0.0" }
@@ -91,6 +92,7 @@ datafusion-physical-expr = { version = "50.2.0" }
 datafusion-physical-plan = { version = "50.2.0" }
 dirs = "6.0.0"
 env_logger = "0.11"
+log = "^0.4"
 fastrand = "2.0"
 futures = { version = "0.3" }
 object_store = { version = "0.12.0", default-features = false }
@@ -126,6 +128,7 @@ serde_with = { version = "1" }
 tempfile = { version = "3"}
 thiserror = { version = "2" }
 tokio = { version = "1.44" }
+pin-project-lite = "0.2"
 url = "2.5.4"
 
 # Workspace path dependencies for internal crates

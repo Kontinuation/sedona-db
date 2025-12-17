@@ -14,8 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf, sync::Arc};
 
+use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::{
+    disk_manager::{DiskManagerBuilder, DiskManagerMode},
+    memory_pool::TrackConsumersPool,
+};
 use datafusion_expr::ScalarUDFImpl;
 use pyo3::prelude::*;
 use sedona::context::SedonaContext;
@@ -39,7 +45,12 @@ pub struct InternalContext {
 #[pymethods]
 impl InternalContext {
     #[new]
-    fn new(py: Python) -> Result<Self, PySedonaError> {
+    #[pyo3(signature = (memory_limit=None, temp_dir=None))]
+    fn new(
+        py: Python,
+        memory_limit: Option<usize>,
+        temp_dir: Option<String>,
+    ) -> Result<Self, PySedonaError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -47,7 +58,29 @@ impl InternalContext {
                 PySedonaError::SedonaPython(format!("Failed to build multithreaded runtime: {e}"))
             })?;
 
-        let inner = wait_for_future(py, &runtime, SedonaContext::new_local_interactive())??;
+        let mut rt_builder = RuntimeEnvBuilder::new();
+        if let Some(memory_limit) = memory_limit {
+            let pool = FairSpillPool::new(memory_limit);
+            let pool = Arc::new(TrackConsumersPool::new(
+                pool,
+                NonZeroUsize::new(10).unwrap(),
+            ));
+            rt_builder = rt_builder.with_memory_pool(pool);
+        }
+        if let Some(temp_dir) = temp_dir {
+            let dm_builder = DiskManagerBuilder::default()
+                .with_mode(DiskManagerMode::Directories(vec![PathBuf::from(temp_dir)]));
+            rt_builder = rt_builder.with_disk_manager_builder(dm_builder);
+        }
+        let runtime_env = rt_builder.build_arc().map_err(|e| {
+            PySedonaError::SedonaPython(format!("Failed to build runtime env: {e}"))
+        })?;
+
+        let inner = wait_for_future(
+            py,
+            &runtime,
+            SedonaContext::new_local_interactive_with_runtime_env(runtime_env),
+        )??;
 
         Ok(Self {
             inner,

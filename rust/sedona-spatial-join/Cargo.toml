@@ -37,6 +37,7 @@ backtrace = ["datafusion-common/backtrace"]
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
+arrow-select = { workspace = true }
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
@@ -47,6 +48,7 @@ datafusion-common-runtime = { workspace = true }
 futures = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
+tokio = { workspace = true }
 geo = { workspace = true }
 sedona-geo-generic-alg = { workspace = true }
 geo-traits = { workspace = true, features = ["geo-types"] }
@@ -65,14 +67,17 @@ geo-index = { workspace = true }
 geos = { workspace = true }
 float_next_after = { workspace = true }
 fastrand = { workspace = true }
+log = { workspace = true }
+pin-project-lite = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 rstest = { workspace = true }
 sedona-testing = { workspace = true }
 wkt = { workspace = true }
-tokio = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 rand = { workspace = true }
+env_logger = { workspace = true }
 
 [[bench]]
 name = "kdb"
@@ -87,4 +92,9 @@ harness = false
 [[bench]]
 name = "flat"
 path = "bench/partitioning/flat.rs"
+harness = false
+
+[[bench]]
+name = "stream_repartitioner"
+path = "bench/partitioning/stream_repartitioner.rs"
 harness = false

@@ -70,6 +70,68 @@ config_namespace! {
 
         /// Include tie-breakers in KNN join results when there are tied distances
         pub knn_include_tie_breakers: bool, default = false
+
+        /// Maximum number of sample bounding boxes collected from the index side for partitioning the
+        /// data when running out-of-core spatial join
+        pub max_index_side_bbox_samples: usize, default = 10000
+
+        /// Minimum number of sample bounding boxes collected from the index side for partitioning the
+        /// data when running out-of-core spatial join
+        pub min_index_side_bbox_samples: usize, default = 1000
+
+        /// Target sampling rate for sampling bounding boxes from the index side for partitioning the
+        /// data when running out-of-core spatial join
+        pub target_index_side_bbox_sampling_rate: f64, default = 0.01
+
+        /// Options for debugging or testing spatial join
+        pub debug : SpatialJoinDebugOptions, default = SpatialJoinDebugOptions::default()
+    }
+}
+
+config_namespace! {
+    /// Configurations for debugging or testing spatial join
+    pub struct SpatialJoinDebugOptions {
+        /// Number of spatial partitions to use for spatial join
+        pub num_spatial_partitions: NumSpatialPartitionsConfig, default = NumSpatialPartitionsConfig::Auto
+
+        /// Force spilling while collecting the build side or not
+        pub force_spill: bool, default = false
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum NumSpatialPartitionsConfig {
+    /// Automatically determine the number of spatial partitions
+    Auto,
+
+    /// Use a fixed number of spatial partitions
+    Fixed(usize),
+}
+
+impl ConfigField for NumSpatialPartitionsConfig {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        let value = match self {
+            NumSpatialPartitionsConfig::Auto => "auto".into(),
+            NumSpatialPartitionsConfig::Fixed(n) => format!("{n}"),
+        };
+        v.some(key, value, description);
+    }
+
+    fn set(&mut self, _key: &str, value: &str) -> Result<()> {
+        let value = value.to_lowercase();
+        let config = match value.as_str() {
+            "auto" => NumSpatialPartitionsConfig::Auto,
+            _ => match value.parse::<usize>() {
+                Ok(n) => NumSpatialPartitionsConfig::Fixed(n),
+                Err(_) => {
+                    return Err(datafusion_common::DataFusionError::Configuration(format!(
+                        "Unknown num_spatial_partitions config: {value}. Expected formats: auto, <number>"
+                    )));
+                }
+            },
+        };
+        *self = config;
+        Ok(())
     }
 }
 
@@ -413,5 +475,22 @@ mod tests {
         assert!(index_type.set("", "unindexed").is_err());
         assert!(index_type.set("", "invalid").is_err());
         assert!(index_type.set("", "").is_err());
+    }
+
+    #[test]
+    fn test_num_spatial_partitions_config_parsing() {
+        let mut config = NumSpatialPartitionsConfig::Auto;
+
+        assert!(config.set("", "auto").is_ok());
+        assert_eq!(config, NumSpatialPartitionsConfig::Auto);
+
+        assert!(config.set("", "10").is_ok());
+        assert_eq!(config, NumSpatialPartitionsConfig::Fixed(10));
+
+        assert!(config.set("", "0").is_ok());
+        assert_eq!(config, NumSpatialPartitionsConfig::Fixed(0));
+
+        assert!(config.set("", "invalid").is_err());
+        assert!(config.set("", "fixed[10]").is_err());
     }
 }

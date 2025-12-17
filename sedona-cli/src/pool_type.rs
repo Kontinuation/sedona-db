@@ -15,25 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod evaluated_batch;
-pub mod exec;
-mod index;
-pub mod operand_evaluator;
-pub mod optimizer;
-pub mod partitioning;
-mod prepare;
-mod probe;
-pub mod refine;
-pub mod spatial_predicate;
-mod stream;
-pub mod utils;
+use std::{
+    fmt::{self, Display, Formatter},
+    str::FromStr,
+};
 
-pub use exec::SpatialJoinExec;
-pub use optimizer::register_spatial_join_optimizer;
+#[derive(PartialEq, Debug, Clone)]
+pub enum PoolType {
+    Greedy,
+    Fair,
+}
 
-// Re-export types needed for external usage (e.g., in Comet)
-pub use index::{SpatialIndex, SpatialJoinBuildMetrics};
-pub use spatial_predicate::SpatialPredicate;
+impl FromStr for PoolType {
+    type Err = String;
 
-// Re-export option types from sedona-common for convenience
-pub use sedona_common::option::*;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Greedy" | "greedy" => Ok(PoolType::Greedy),
+            "Fair" | "fair" => Ok(PoolType::Fair),
+            _ => Err(format!("Invalid memory pool type '{s}'")),
+        }
+    }
+}
+
+impl Display for PoolType {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            PoolType::Greedy => write!(f, "greedy"),
+            PoolType::Fair => write!(f, "fair"),
+        }
+    }
+}

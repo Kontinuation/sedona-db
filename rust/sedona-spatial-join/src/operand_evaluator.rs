@@ -89,7 +89,9 @@ pub(crate) fn create_operand_evaluator(
 }
 
 /// Result of evaluating a geometry batch.
-pub(crate) struct EvaluatedGeometryArray {
+pub struct EvaluatedGeometryArray {
+    /// Type of geometry_array
+    pub sedona_type: SedonaType,
     /// The array of geometries produced by evaluating the geometry expression.
     pub geometry_array: ArrayRef,
     /// The rects of the geometries in the geometry array. The length of this array is equal to the number of geometries.
@@ -138,6 +140,7 @@ impl EvaluatedGeometryArray {
             .map(|wkb| wkb.map(|wkb| unsafe { transmute(wkb) }))
             .collect();
         Ok(Self {
+            sedona_type: sedona_type.clone(),
             geometry_array,
             rects: rect_vec,
             distance: None,
@@ -168,6 +171,43 @@ impl EvaluatedGeometryArray {
             + self.rects.allocated_size()
             + distance_in_mem_size
             + wkb_vec_size
+    }
+
+    /// Replace the geometry array with a new one.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the new geometry array contains the same geometries as the old one,
+    /// in the same order. This method will not recompute the bounding boxes of the geometries.
+    /// If the new geometry array contains different geometries, the bounding boxes will be incorrect.
+    pub unsafe fn replace_geometry_array(&mut self, geometry_array: ArrayRef) -> Result<()> {
+        if geometry_array.len() != self.rects.len() {
+            return Err(DataFusionError::Internal(format!(
+                "New geometry array length {} does not match existing rects length {}",
+                geometry_array.len(),
+                self.rects.len()
+            )));
+        }
+
+        let num_rows = geometry_array.len();
+        let mut wkbs = Vec::with_capacity(num_rows);
+        geometry_array.iter_as_wkb(&self.sedona_type, num_rows, |wkb_opt| {
+            wkbs.push(wkb_opt);
+            Ok(())
+        })?;
+
+        // Safety: The wkbs must reference buffers inside the `geometry_array`. Since the `geometry_array` and
+        // `wkbs` are both owned by the `EvaluatedGeometryArray`, so they have the same lifetime. We'll never
+        // have a situation where the `EvaluatedGeometryArray` is dropped while the `wkbs` are still in use
+        // (guaranteed by the scope of the `wkbs` field and lifetime signature of the `wkbs` method).
+        let wkbs = wkbs
+            .into_iter()
+            .map(|wkb| wkb.map(|wkb| unsafe { transmute(wkb) }))
+            .collect();
+
+        self.geometry_array = geometry_array;
+        self.wkbs = wkbs;
+        Ok(())
     }
 }
 
@@ -241,10 +281,9 @@ impl DistanceOperandEvaluator {
         match &distance_columnar_value {
             ColumnarValue::Scalar(ScalarValue::Float64(Some(distance))) => {
                 result.rects.iter_mut().for_each(|rect_opt| {
-                    let Some(rect) = rect_opt else {
-                        return;
+                    if let Some(rect) = rect_opt {
+                        expand_rect_in_place(rect, *distance);
                     };
-                    expand_rect_in_place(rect, *distance);
                 });
             }
             ColumnarValue::Scalar(ScalarValue::Float64(None)) => {
@@ -256,10 +295,9 @@ impl DistanceOperandEvaluator {
                     for (geom_idx, rect_opt) in result.rects.iter_mut().enumerate() {
                         if !array.is_null(geom_idx) {
                             let dist = array.value(geom_idx);
-                            let Some(rect) = rect_opt else {
-                                continue;
+                            if let Some(rect) = rect_opt {
+                                expand_rect_in_place(rect, dist);
                             };
-                            expand_rect_in_place(rect, dist);
                         }
                     }
                 } else {

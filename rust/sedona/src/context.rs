@@ -33,7 +33,11 @@ use datafusion::datasource::file_format::format_as_file_type;
 use datafusion::{
     common::{plan_datafusion_err, plan_err},
     error::{DataFusionError, Result},
-    execution::{context::DataFilePaths, runtime_env::RuntimeEnvBuilder, SessionStateBuilder},
+    execution::{
+        context::DataFilePaths,
+        runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
+        SessionStateBuilder,
+    },
     prelude::{DataFrame, SessionConfig, SessionContext},
     sql::parser::{DFParser, Statement},
 };
@@ -77,6 +81,14 @@ impl SedonaContext {
     /// Initializes a context from the current environment and registers access
     /// to the local file system.
     pub async fn new_local_interactive() -> Result<Self> {
+        let rt_builder = RuntimeEnvBuilder::new();
+        let runtime_env = rt_builder.build_arc()?;
+        Self::new_local_interactive_with_runtime_env(runtime_env).await
+    }
+
+    pub async fn new_local_interactive_with_runtime_env(
+        runtime_env: Arc<RuntimeEnv>,
+    ) -> Result<Self> {
         // These three objects enable configuring various elements of the runtime.
         // Eventually we probably want to have a common set of configuration parameters
         // exposed via the CLI/Python as arguments, via ADBC as connection options,
@@ -84,8 +96,6 @@ impl SedonaContext {
         // variables.
         let session_config = SessionConfig::from_env()?.with_information_schema(true);
         let session_config = add_sedona_option_extension(session_config);
-        let rt_builder = RuntimeEnvBuilder::new();
-        let runtime_env = rt_builder.build_arc()?;
 
         let mut state_builder = SessionStateBuilder::new()
             .with_default_features()
