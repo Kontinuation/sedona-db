@@ -49,8 +49,9 @@ class SedonaContext:
         self,
         memory_limit: Optional[int] = None,
         temp_dir: Optional[str] = None,
+        memory_pool_type: Literal["greedy", "fair"] = "fair",
     ):
-        self._impl = InternalContext(memory_limit, temp_dir)
+        self._impl = InternalContext(memory_limit, temp_dir, memory_pool_type)
         self.options = Options()
 
     def create_data_frame(self, obj: Any, schema: Any = None) -> DataFrame:
@@ -280,14 +281,18 @@ class SedonaContext:
 def connect(
     memory_limit: Optional[int] = None,
     temp_dir: Optional[str] = None,
+    memory_pool_type: Literal["greedy", "fair"] = "fair",
 ) -> SedonaContext:
     """Create a new [SedonaContext][sedonadb.context.SedonaContext]
 
     Args:
         memory_limit: The maximum amount of memory to use for execution, in bytes.
         temp_dir: The directory to use for temporary files.
+        memory_pool_type: The type of memory pool to use. Can be "greedy" or "fair".
     """
-    return SedonaContext(memory_limit=memory_limit, temp_dir=temp_dir)
+    return SedonaContext(
+        memory_limit=memory_limit, temp_dir=temp_dir, memory_pool_type=memory_pool_type
+    )
 
 
 def configure_proj(

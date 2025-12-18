@@ -16,7 +16,7 @@
 // under the License.
 use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf, sync::Arc};
 
-use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::{
     disk_manager::{DiskManagerBuilder, DiskManagerMode},
@@ -45,11 +45,12 @@ pub struct InternalContext {
 #[pymethods]
 impl InternalContext {
     #[new]
-    #[pyo3(signature = (memory_limit=None, temp_dir=None))]
+    #[pyo3(signature = (memory_limit=None, temp_dir=None, memory_pool_type=None))]
     fn new(
         py: Python,
         memory_limit: Option<usize>,
         temp_dir: Option<String>,
+        memory_pool_type: Option<String>,
     ) -> Result<Self, PySedonaError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -60,11 +61,29 @@ impl InternalContext {
 
         let mut rt_builder = RuntimeEnvBuilder::new();
         if let Some(memory_limit) = memory_limit {
-            let pool = FairSpillPool::new(memory_limit);
-            let pool = Arc::new(TrackConsumersPool::new(
-                pool,
-                NonZeroUsize::new(10).unwrap(),
-            ));
+            let pool_type = memory_pool_type.as_deref().unwrap_or("fair");
+            let pool: Arc<dyn MemoryPool> = match pool_type {
+                "fair" => {
+                    let pool = FairSpillPool::new(memory_limit);
+                    Arc::new(TrackConsumersPool::new(
+                        pool,
+                        NonZeroUsize::new(10).unwrap(),
+                    ))
+                }
+                "greedy" => {
+                    let pool = GreedyMemoryPool::new(memory_limit);
+                    Arc::new(TrackConsumersPool::new(
+                        pool,
+                        NonZeroUsize::new(10).unwrap(),
+                    ))
+                }
+                _ => {
+                    return Err(PySedonaError::SedonaPython(format!(
+                        "Invalid memory pool type: {}",
+                        pool_type
+                    )))
+                }
+            };
             rt_builder = rt_builder.with_memory_pool(pool);
         }
         if let Some(temp_dir) = temp_dir {
