@@ -1091,7 +1091,7 @@ mod tests {
             ..Default::default()
         };
 
-        log::debug!("Sedona join options: {:?}", options.clone());
+        log::info!("Sedona join options: {:?}", options.clone());
 
         for (idx, sql) in RANGE_JOIN_SQLS.iter().enumerate() {
             let actual_result = run_spatial_join_query(

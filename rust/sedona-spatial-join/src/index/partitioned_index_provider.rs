@@ -181,14 +181,14 @@ impl PartitionedIndexProvider {
                 if let Err(e) = cell.set(Ok(Arc::clone(&idx))) {
                     // This is probably because the cell has been disposed. No one
                     // will get the index from the cell so this failure is not a big deal.
-                    log::debug!("Cannot set the index into the async cell: {:?}", e);
+                    log::info!("Cannot set the index into the async cell: {:?}", e);
                 }
                 Some(Ok(idx))
             }
             Err(err) => {
                 let err_arc = Arc::new(err);
                 if let Err(e) = cell.set(Err(Arc::clone(&err_arc))) {
-                    log::debug!(
+                    log::info!(
                         "Cannot set the index build error into the async cell: {:?}",
                         e
                     );

@@ -79,7 +79,7 @@ pub(crate) async fn prepare_spatial_join_components(
     let memory_pool = context.memory_pool();
     let num_partitions = build_streams.len();
     if num_partitions == 0 {
-        log::debug!("Build side has no data. Creating empty spatial index.");
+        log::info!("Build side has no data. Creating empty spatial index.");
         let partitioned_index_provider = PartitionedIndexProvider::new_empty(
             build_schema,
             spatial_predicate,
@@ -132,7 +132,7 @@ pub(crate) async fn prepare_spatial_join_components(
         compute_memory_plan(build_partitions.iter().map(PartitionMemorySummary::from))?;
     let mut memory_plan_str = String::new();
     if memory_plan.debug_print(&mut memory_plan_str).is_ok() {
-        log::debug!(
+        log::info!(
             "Computed memory plan for spatial join:\n{}",
             memory_plan_str
         );
@@ -144,7 +144,7 @@ pub(crate) async fn prepare_spatial_join_components(
     };
 
     if num_partitions == 1 {
-        log::debug!("Running single-partitioned in-memory spatial join");
+        log::info!("Running single-partitioned in-memory spatial join");
         let partitioned_index_provider = PartitionedIndexProvider::new_single_partition(
             build_schema,
             spatial_predicate,
@@ -200,7 +200,7 @@ pub(crate) async fn prepare_spatial_join_components(
             extent,
         )?);
         let num_partitions = build_partitioner.num_regular_partitions();
-        log::debug!("Actual number of spatial partitions: {}", num_partitions);
+        log::info!("Actual number of spatial partitions: {}", num_partitions);
 
         // Spawn each task for each build partition to repartition the data using the spatial partitioner for
         // the build/indexed side
@@ -240,7 +240,7 @@ pub(crate) async fn prepare_spatial_join_components(
         let merged_spilled_partitions = merge_spilled_partitions(partitioned_spill_files_vec)?;
         let mut s = String::new();
         if merged_spilled_partitions.debug_print(&mut s).is_ok() {
-            log::debug!("Build side spatial partitions:\n{}", s);
+            log::info!("Build side spatial partitions:\n{}", s);
         }
 
         // Sanity check: Multi and None partitions must be empty. All the geometries in the build side

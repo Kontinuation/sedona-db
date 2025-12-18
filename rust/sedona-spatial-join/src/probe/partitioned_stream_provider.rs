@@ -127,7 +127,7 @@ impl PartitionedProbeStreamProvider {
                         Ok(mut spills) => {
                             let mut s = String::new();
                             if spills.debug_print(&mut s).is_ok() {
-                                log::debug!("Probe side spilled partitions:\n{}", s);
+                                log::info!("Probe side spilled partitions:\n{}", s);
                             }
 
                             // Sanity check: Regular(0) and None should be empty
