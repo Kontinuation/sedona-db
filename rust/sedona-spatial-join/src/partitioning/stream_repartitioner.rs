@@ -33,9 +33,10 @@ use crate::{
         partition_slots::PartitionSlots, util::geo_rect_to_bbox, PartitionedSide, SpatialPartition,
         SpatialPartitioner,
     },
+    utils::arrow_utils::compact_batch,
 };
 use arrow::compute::interleave_record_batch;
-use arrow_array::{Array, ArrayRef, BinaryViewArray, RecordBatch, StringViewArray};
+use arrow_array::{Array, ArrayRef, BinaryViewArray, RecordBatch};
 use arrow_select::interleave::interleave as arrow_interleave;
 use datafusion::config::SpillCompression;
 use datafusion_common::{Result, ScalarValue};
@@ -597,7 +598,9 @@ fn interleave_distance_columns(
                         } else {
                             first_scalar = Some(scalar);
                         }
-                        all_null = false;
+                        if !scalar.is_null() {
+                            all_null = false;
+                        }
                     }
                 }
             }
@@ -641,57 +644,6 @@ fn interleave_distance_columns(
     let array_refs: Vec<&dyn Array> = arrays.iter().map(|array| array.as_ref()).collect();
     let array = arrow_interleave(&array_refs, assignments)?;
     Ok(Some(ColumnarValue::Array(array)))
-}
-
-/// Reconstruct `batch` to organize the payload buffers of each `StringViewArray` and
-/// `BinaryViewArray` in sequential order by calling `gc()` on them.
-///
-/// Note this is a workaround until <https://github.com/apache/arrow-rs/issues/7185> is
-/// available.
-///
-/// # Rationale
-///
-/// The `interleave` kernel does not reconstruct the inner buffers of view arrays by default,
-/// leading to non-sequential payload locations. A single payload buffer might be shared by
-/// multiple `RecordBatch`es or multiple rows in the same batch might reference scattered
-/// locations in a large buffer.
-///
-/// When writing each batch to disk, the writer has to write all referenced buffers. This
-/// causes extra disk reads and writes, and potentially execution failure (e.g. No space left
-/// on device).
-///
-/// # Example
-///
-/// Before interleaving:
-/// batch1 -> buffer1 (large)
-/// batch2 -> buffer2 (large)
-///
-/// interleaved_batch -> buffer1 (sparse access)
-///                   -> buffer2 (sparse access)
-///
-/// Then when spilling the interleaved batch, the writer has to write both buffer1 and buffer2
-/// entirely, even if only a few bytes are used.
-fn compact_batch(batch: RecordBatch) -> Result<RecordBatch> {
-    let mut new_columns: Vec<Arc<dyn Array>> = Vec::with_capacity(batch.num_columns());
-    let mut arr_mutated = false;
-
-    for array in batch.columns() {
-        if let Some(view_array) = array.as_any().downcast_ref::<StringViewArray>() {
-            new_columns.push(Arc::new(view_array.gc()));
-            arr_mutated = true;
-        } else if let Some(view_array) = array.as_any().downcast_ref::<BinaryViewArray>() {
-            new_columns.push(Arc::new(view_array.gc()));
-            arr_mutated = true;
-        } else {
-            new_columns.push(Arc::clone(array));
-        }
-    }
-
-    if arr_mutated {
-        Ok(RecordBatch::try_new(batch.schema(), new_columns)?)
-    } else {
-        Ok(batch)
-    }
 }
 
 /// Compact the geometry array in `EvaluatedGeometryArray` if it is a `BinaryViewArray`.
@@ -1294,16 +1246,20 @@ mod tests {
 
         let wkbs1 = vec![point_wkb(10.0, 10.0)];
         let wkbs2 = vec![point_wkb(20.0, 20.0)];
-
-        let geom1 = make_geom_array_with_distance(wkbs1, None)?;
+        let wkbs3 = vec![point_wkb(30.0, 30.0)];
 
         let null_array = Arc::new(Float64Array::new_null(1));
-        let geom2 = make_geom_array_with_distance(wkbs2, Some(ColumnarValue::Array(null_array)))?;
+        let ega1 = make_geom_array_with_distance(wkbs1, Some(ColumnarValue::Array(null_array)))?;
 
-        let geom_arrays = vec![&geom1, &geom2];
-        let assignments = vec![(0, 0), (1, 0)];
+        let null_scalar = ScalarValue::Float64(None);
+        let ega2 = make_geom_array_with_distance(wkbs2, Some(ColumnarValue::Scalar(null_scalar)))?;
 
-        let result = interleave_distance_columns(&geom_arrays, &assignments)?;
+        let ega3 = make_geom_array_with_distance(wkbs3, None)?;
+
+        let vec_ega = vec![&ega1, &ega2, &ega3];
+        let assignments = vec![(0, 0), (1, 0), (2, 0)];
+
+        let result = interleave_distance_columns(&vec_ega, &assignments)?;
         assert!(result.is_none());
         Ok(())
     }

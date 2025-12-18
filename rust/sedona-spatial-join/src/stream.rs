@@ -1007,6 +1007,7 @@ impl SpatialJoinBatchIterator {
             indices: build_indices,
             interleave_indices_map,
         } = self.assemble_partial_build_batch(build_indices)?;
+        let before_filter_len = probe_indices.len();
         let probe_indices = UInt32Array::from(probe_indices);
 
         let (build_indices, probe_indices) = match filter {
@@ -1021,6 +1022,8 @@ impl SpatialJoinBatchIterator {
             None => (build_indices, probe_indices),
         };
 
+        let after_filter_len = probe_indices.len();
+
         // set the left bitmap
         if need_produce_result_in_final(join_type) {
             if let Some(visited_bitmaps) = self.spatial_index.visited_left_side() {
@@ -1032,7 +1035,7 @@ impl SpatialJoinBatchIterator {
             }
         }
 
-        // adjust the two side indices base on the join type
+        // adjust the two side indices based on the join type
         let (build_indices, probe_indices) = {
             let mut visited_probe_side_guard = self.visited_probe_side.as_ref().map(|v| v.lock());
             let visited_info = visited_probe_side_guard
@@ -1049,6 +1052,14 @@ impl SpatialJoinBatchIterator {
                 self.produce_unmatched_probe_rows,
             )?
         };
+
+        let actual_len = probe_indices.len();
+        log::debug!(
+            "Spatial join stream produced {} joined rows (before filter: {}, after filter: {})",
+            actual_len,
+            before_filter_len,
+            after_filter_len,
+        );
 
         // Build the final result batch
         let result_batch = build_batch_from_indices(

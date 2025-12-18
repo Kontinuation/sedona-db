@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
+use arrow_schema::{DataType, SchemaRef};
 use datafusion_common::Result;
 use datafusion_physical_plan::SendableRecordBatchStream;
 use futures::{Stream, StreamExt};
@@ -29,6 +30,7 @@ use crate::evaluated_batch::{
     EvaluatedBatch,
 };
 use crate::operand_evaluator::{EvaluatedGeometryArray, OperandEvaluator};
+use crate::utils::arrow_utils::compact_batch;
 
 trait Evaluator: Unpin {
     fn evaluate(&self, batch: &RecordBatch) -> Result<EvaluatedGeometryArray>;
@@ -59,12 +61,26 @@ impl Evaluator for ProbeSideEvaluator {
 struct EvaluateRecordStream<E: Evaluator> {
     inner: SendableRecordBatchStream,
     evaluator: E,
+    gc_view_arrays: bool,
 }
 
 impl<E: Evaluator> EvaluateRecordStream<E> {
-    fn new(inner: SendableRecordBatchStream, evaluator: E) -> Self {
-        Self { inner, evaluator }
+    fn new(inner: SendableRecordBatchStream, evaluator: E, gc_view_arrays: bool) -> Self {
+        let gc_view_arrays = gc_view_arrays && schema_contains_view_types(&inner.schema());
+        Self {
+            inner,
+            evaluator,
+            gc_view_arrays,
+        }
     }
+}
+
+/// Checks if the schema contains any view types (Utf8View or BinaryView).
+fn schema_contains_view_types(schema: &SchemaRef) -> bool {
+    schema
+        .flattened_fields()
+        .iter()
+        .any(|field| matches!(field.data_type(), DataType::Utf8View | DataType::BinaryView))
 }
 
 impl<E: Evaluator> EvaluatedBatchStream for EvaluateRecordStream<E> {
@@ -84,6 +100,11 @@ impl<E: Evaluator> Stream for EvaluateRecordStream<E> {
         let self_mut = self.get_mut();
         match self_mut.inner.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(batch))) => {
+                let batch = if self_mut.gc_view_arrays {
+                    compact_batch(batch)?
+                } else {
+                    batch
+                };
                 let geom_array = self_mut.evaluator.evaluate(&batch)?;
                 let evaluated = EvaluatedBatch { batch, geom_array };
                 Poll::Ready(Some(Ok(evaluated)))
@@ -101,9 +122,13 @@ pub(crate) fn create_evaluated_build_stream(
     stream: SendableRecordBatchStream,
     evaluator: Arc<dyn OperandEvaluator>,
 ) -> SendableEvaluatedBatchStream {
+    // Enable gc_view_arrays for build-side since build-side batches needs to be long-lived
+    // in memory during the join process. Poorly managed sparse view arrays could lead to
+    // unnecessary high memory usage or excessive spilling.
     Box::pin(EvaluateRecordStream::new(
         stream,
         BuildSideEvaluator { evaluator },
+        true,
     ))
 }
 
@@ -116,5 +141,6 @@ pub(crate) fn create_evaluated_probe_stream(
     Box::pin(EvaluateRecordStream::new(
         stream,
         ProbeSideEvaluator { evaluator },
+        false,
     ))
 }
