@@ -38,7 +38,7 @@ use crate::{
 use arrow::compute::interleave_record_batch;
 use arrow_array::{Array, ArrayRef, BinaryViewArray, RecordBatch};
 use arrow_select::interleave::interleave as arrow_interleave;
-use datafusion::config::SpillCompression;
+use datafusion::{config::SpillCompression, parquet::file::reader::Length};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_execution::{disk_manager::RefCountedTempFile, runtime_env::RuntimeEnv};
 use datafusion_expr::ColumnarValue;
@@ -221,7 +221,7 @@ impl SpilledPartitions {
             if let Some(spilled_partition) = &self.partitions[k] {
                 let bbox_str = if let Some(bbox) = spilled_partition.bounding_box() {
                     format!(
-                        "x: [{:.2}, {:.2}], y: [{:.2}, {:.2}]",
+                        "x: [{:.6}, {:.6}], y: [{:.6}, {:.6}]",
                         bbox.x().lo(),
                         bbox.x().hi(),
                         bbox.y().lo(),
@@ -230,16 +230,22 @@ impl SpilledPartitions {
                 } else {
                     "None".to_string()
                 };
+                let spill_files = spilled_partition.spill_files();
+                let spill_file_sizes = spill_files
+                    .iter()
+                    .map(|sp| sp.inner().as_file().len())
+                    .collect::<Vec<_>>();
                 writeln!(
                     f,
-                    "Partition {:?}: {} spill file(s), num non-empty geoms: {:?}, bbox: {}",
+                    "Partition {:?}: {} spill file(s), num non-empty geoms: {:?}, bbox: {}, spill file sizes: {:?}",
                     self.slots.partition(k),
                     spilled_partition.spill_files().len(),
                     spilled_partition
                         .geo_statistics()
                         .total_geometries()
                         .unwrap_or_default(),
-                    bbox_str
+                    bbox_str,
+                    spill_file_sizes,
                 )?;
             } else {
                 writeln!(f, "Partition {}: already taken away", k)?;

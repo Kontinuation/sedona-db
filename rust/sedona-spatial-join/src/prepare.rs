@@ -193,12 +193,19 @@ pub(crate) async fn prepare_spatial_join_components(
         let samples = bbox_samples.take_samples();
         let max_items_per_node = 1.max(samples.len() / num_partitions);
         let max_levels = num_partitions;
-        let build_partitioner: Arc<dyn SpatialPartitioner> = Arc::new(KDBPartitioner::build(
-            samples.into_iter(),
-            max_items_per_node,
-            max_levels,
-            extent,
-        )?);
+
+        let kdb_partitioner =
+            KDBPartitioner::build(samples.into_iter(), max_items_per_node, max_levels, extent)?;
+        log::info!(
+            "Built KDB spatial partitioner with {} partitions",
+            num_partitions
+        );
+        let mut kdb_dbg_str = String::new();
+        if kdb_partitioner.debug_print(&mut kdb_dbg_str).is_ok() {
+            log::info!("KDB partitioner debug info:\n{}", kdb_dbg_str);
+        }
+
+        let build_partitioner: Arc<dyn SpatialPartitioner> = Arc::new(kdb_partitioner);
         let num_partitions = build_partitioner.num_regular_partitions();
         log::info!("Actual number of spatial partitions: {}", num_partitions);
 
@@ -235,6 +242,14 @@ pub(crate) async fn prepare_spatial_join_components(
         let mut partitioned_spill_files_vec = Vec::with_capacity(results.len());
         for result in results {
             partitioned_spill_files_vec.push(result?);
+        }
+
+        log::info!("Per-index-partition spilled partitions collected.");
+        for (k, spilled_partitions) in partitioned_spill_files_vec.iter().enumerate() {
+            let mut s = String::new();
+            if spilled_partitions.debug_print(&mut s).is_ok() {
+                log::info!("Build partition {} spilled partitions:\n{}", k, s);
+            }
         }
 
         let merged_spilled_partitions = merge_spilled_partitions(partitioned_spill_files_vec)?;
