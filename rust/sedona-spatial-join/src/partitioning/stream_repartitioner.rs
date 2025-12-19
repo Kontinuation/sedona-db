@@ -38,7 +38,7 @@ use crate::{
 use arrow::compute::interleave_record_batch;
 use arrow_array::{Array, ArrayRef, BinaryViewArray, RecordBatch};
 use arrow_select::interleave::interleave as arrow_interleave;
-use datafusion::{config::SpillCompression, parquet::file::reader::Length};
+use datafusion::config::SpillCompression;
 use datafusion_common::{Result, ScalarValue};
 use datafusion_execution::{disk_manager::RefCountedTempFile, runtime_env::RuntimeEnv};
 use datafusion_expr::ColumnarValue;
@@ -233,7 +233,13 @@ impl SpilledPartitions {
                 let spill_files = spilled_partition.spill_files();
                 let spill_file_sizes = spill_files
                     .iter()
-                    .map(|sp| sp.inner().as_file().len())
+                    .map(|sp| {
+                        sp.inner()
+                            .as_file()
+                            .metadata()
+                            .map(|m| m.len())
+                            .unwrap_or(0)
+                    })
                     .collect::<Vec<_>>();
                 writeln!(
                     f,
@@ -540,7 +546,6 @@ pub(crate) fn interleave_evaluated_batch(
     let batch = interleave_record_batch(record_batches, indices)?;
     let batch = compact_batch(batch)?;
     let geom_array = interleave_geometry_array(geom_arrays, indices)?;
-    let geom_array = compact_geometry_array(geom_array)?;
     Ok(EvaluatedBatch { batch, geom_array })
 }
 
@@ -552,22 +557,24 @@ fn interleave_geometry_array(
         return sedona_internal_err!("interleave_geometry_array requires at least one batch");
     }
     let sedona_type = &geom_arrays[0].sedona_type;
-    let total_len = indices.len();
     let value_refs: Vec<&dyn Array> = geom_arrays
         .iter()
         .map(|geom| geom.geometry_array.as_ref())
         .collect();
     let geometry_array = arrow_interleave(&value_refs, indices)?;
 
-    let mut rects = Vec::with_capacity(total_len);
-    for &(batch_idx, row_idx) in indices {
-        rects.push(geom_arrays[batch_idx].rects[row_idx]);
-    }
+    // Compact the geometry array in `EvaluatedGeometryArray` if it is a `BinaryViewArray`.
+    // See [`compact_batch`] for the rationale.
+    let compacted_geometry_array =
+        if let Some(view_array) = geometry_array.as_any().downcast_ref::<BinaryViewArray>() {
+            Arc::new(view_array.gc())
+        } else {
+            geometry_array
+        };
 
     let distance = interleave_distance_columns(geom_arrays, indices)?;
 
-    let mut result = EvaluatedGeometryArray::try_new(geometry_array, sedona_type)?;
-    result.rects = rects;
+    let mut result = EvaluatedGeometryArray::try_new(compacted_geometry_array, sedona_type)?;
     result.distance = distance;
     Ok(result)
 }
@@ -650,21 +657,6 @@ fn interleave_distance_columns(
     let array_refs: Vec<&dyn Array> = arrays.iter().map(|array| array.as_ref()).collect();
     let array = arrow_interleave(&array_refs, assignments)?;
     Ok(Some(ColumnarValue::Array(array)))
-}
-
-/// Compact the geometry array in `EvaluatedGeometryArray` if it is a `BinaryViewArray`.
-///
-/// See [`compact_batch`] for the rationale.
-fn compact_geometry_array(
-    mut geom_array: EvaluatedGeometryArray,
-) -> Result<EvaluatedGeometryArray> {
-    let array = geom_array.geometry_array.clone();
-    if let Some(view_array) = array.as_any().downcast_ref::<BinaryViewArray>() {
-        let new_array = view_array.gc();
-        // Safety: gc() only compacts the memory, the logical values are the same.
-        unsafe { geom_array.replace_geometry_array(Arc::new(new_array))? };
-    }
-    Ok(geom_array)
 }
 
 #[cfg(test)]

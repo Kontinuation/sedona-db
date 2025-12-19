@@ -122,7 +122,15 @@ impl ConfigField for NumSpatialPartitionsConfig {
         let config = match value.as_str() {
             "auto" => NumSpatialPartitionsConfig::Auto,
             _ => match value.parse::<usize>() {
-                Ok(n) => NumSpatialPartitionsConfig::Fixed(n),
+                Ok(n) => {
+                    if n > 0 {
+                        NumSpatialPartitionsConfig::Fixed(n)
+                    } else {
+                        return Err(datafusion_common::DataFusionError::Configuration(
+                            "num_spatial_partitions must be greater than 0".to_string(),
+                        ));
+                    }
+                }
                 Err(_) => {
                     return Err(datafusion_common::DataFusionError::Configuration(format!(
                         "Unknown num_spatial_partitions config: {value}. Expected formats: auto, <number>"
@@ -487,9 +495,7 @@ mod tests {
         assert!(config.set("", "10").is_ok());
         assert_eq!(config, NumSpatialPartitionsConfig::Fixed(10));
 
-        assert!(config.set("", "0").is_ok());
-        assert_eq!(config, NumSpatialPartitionsConfig::Fixed(0));
-
+        assert!(config.set("", "0").is_err());
         assert!(config.set("", "invalid").is_err());
         assert!(config.set("", "fixed[10]").is_err());
     }

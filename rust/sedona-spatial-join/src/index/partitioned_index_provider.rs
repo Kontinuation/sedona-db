@@ -17,12 +17,15 @@
 
 use arrow_schema::SchemaRef;
 use datafusion_common::{DataFusionError, Result, SharedResult};
+use datafusion_common_runtime::JoinSet;
 use datafusion_execution::memory_pool::{MemoryPool, MemoryReservation};
 use datafusion_expr::JoinType;
+use futures::StreamExt;
 use parking_lot::Mutex;
 use sedona_common::{sedona_internal_err, SpatialJoinOptions};
 use std::ops::DerefMut;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use crate::evaluated_batch::evaluated_batch_stream::external::ExternalEvaluatedBatchStream;
 use crate::index::BuildPartition;
@@ -307,11 +310,50 @@ impl PartitionedIndexProvider {
             self.metrics.clone(),
         )?;
 
+        // Spawn tasks to load indexed batches from spilled files concurrently
         let (spill_files, geo_statistics, _) = spilled_partition.into_inner();
-        let stream = ExternalEvaluatedBatchStream::try_from_spill_files(spill_files)?;
-        index_builder
-            .add_stream(Box::pin(stream), geo_statistics)
-            .await?;
+        let mut join_set: JoinSet<Result<(), DataFusionError>> = JoinSet::new();
+        let (tx, mut rx) = mpsc::channel(spill_files.len() * 2 + 1);
+        for spill_file in spill_files {
+            let tx = tx.clone();
+            join_set.spawn(async move {
+                let result = async {
+                    let mut stream =
+                        ExternalEvaluatedBatchStream::try_from_spill_files(vec![spill_file])?;
+                    while let Some(batch) = stream.next().await {
+                        let indexed_batch = batch?;
+                        if tx.send(Ok(indexed_batch)).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Ok::<(), DataFusionError>(())
+                }
+                .await;
+                if let Err(e) = result {
+                    let _ = tx.send(Err(e)).await;
+                }
+                Ok(())
+            });
+        }
+        drop(tx);
+
+        // Collect the loaded indexed batches and add them to the index builder
+        while let Some(res) = rx.recv().await {
+            let batch = res?;
+            index_builder.add_batch(batch);
+        }
+
+        // Ensure all tasks completed successfully
+        while let Some(res) = join_set.join_next().await {
+            if let Err(e) = res {
+                if e.is_panic() {
+                    std::panic::resume_unwind(e.into_panic());
+                }
+                return Err(DataFusionError::External(Box::new(e)));
+            }
+        }
+
+        index_builder.merge_stats(geo_statistics);
 
         let index = index_builder.finish()?;
         Ok(Arc::new(index))
