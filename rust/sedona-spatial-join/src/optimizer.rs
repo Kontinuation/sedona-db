@@ -40,6 +40,8 @@ use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::joins::utils::ColumnIndex;
 use datafusion_physical_plan::joins::{HashJoinExec, NestedLoopJoinExec};
 use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::repartition::RepartitionExec;
+use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::{joins::utils::JoinFilter, ExecutionPlan};
 use sedona_common::{option::SedonaOptions, sedona_internal_err};
 use sedona_expr::utils::{parse_distance_predicate, ParsedDistancePredicate};
@@ -291,6 +293,12 @@ impl SpatialJoinOptimizer {
                 )? {
                     return Ok(None);
                 }
+
+                let num_right_partition = right.output_partitioning().partition_count();
+                let right = Arc::new(RepartitionExec::try_new(
+                    right,
+                    datafusion_physical_expr::Partitioning::RoundRobinBatch(num_right_partition),
+                )?);
 
                 // Create the spatial join
                 let spatial_join = SpatialJoinExec::try_new(
