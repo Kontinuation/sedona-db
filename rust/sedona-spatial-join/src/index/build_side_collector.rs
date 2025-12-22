@@ -180,7 +180,7 @@ impl BuildSideBatchesCollector {
             }
 
             let num_rows = build_side_batch.num_rows();
-            let in_mem_size = build_side_batch.in_mem_size();
+            let in_mem_size = build_side_batch.in_mem_size()?;
             total_num_rows += num_rows;
             total_size_bytes += in_mem_size;
 

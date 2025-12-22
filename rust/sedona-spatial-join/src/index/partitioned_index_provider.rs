@@ -340,7 +340,7 @@ impl PartitionedIndexProvider {
         // Collect the loaded indexed batches and add them to the index builder
         while let Some(res) = rx.recv().await {
             let batch = res?;
-            index_builder.add_batch(batch);
+            index_builder.add_batch(batch)?;
         }
 
         // Ensure all tasks completed successfully
@@ -467,10 +467,10 @@ mod tests {
             .unwrap_or_else(|| Arc::new(Schema::empty()));
         let geo_statistics = geo_stats_from_batches(&batches)?;
         let num_rows = batches.iter().map(|batch| batch.num_rows()).sum();
-        let estimated_usage = batches
-            .iter()
-            .map(|batch| batch.in_mem_size())
-            .sum::<usize>();
+        let mut estimated_usage = 0;
+        for batch in &batches {
+            estimated_usage += batch.in_mem_size()?;
+        }
         let stream: SendableEvaluatedBatchStream =
             Box::pin(InMemoryEvaluatedBatchStream::new(schema, batches));
         Ok(BuildPartition {

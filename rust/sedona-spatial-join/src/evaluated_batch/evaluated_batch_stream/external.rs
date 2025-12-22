@@ -36,7 +36,7 @@ use pin_project_lite::pin_project;
 
 use crate::evaluated_batch::{
     evaluated_batch_stream::EvaluatedBatchStream,
-    spill::{spilled_batch_to_build_side_batch, SpillReader},
+    spill::{spilled_batch_to_evaluated_batch, SpillReader},
     EvaluatedBatch,
 };
 
@@ -158,7 +158,7 @@ impl futures::Stream for RecordBatchToEvaluatedStream {
         let mut this = self.project();
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(batch))) => {
-                Poll::Ready(Some(spilled_batch_to_build_side_batch(batch)))
+                Poll::Ready(Some(spilled_batch_to_evaluated_batch(batch)))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => Poll::Ready(None),

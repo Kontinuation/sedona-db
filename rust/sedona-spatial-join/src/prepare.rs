@@ -140,7 +140,10 @@ pub(crate) async fn prepare_spatial_join_components(
     let memory_for_intermittent_usage = memory_plan.memory_for_intermittent_usage;
     let num_partitions = match sedona_options.spatial_join.debug.num_spatial_partitions {
         NumSpatialPartitionsConfig::Auto => memory_plan.num_partitions,
-        NumSpatialPartitionsConfig::Fixed(n) => n,
+        NumSpatialPartitionsConfig::Fixed(n) => {
+            log::info!("Override number of spatial partitions to {}", n);
+            n
+        }
     };
 
     if num_partitions == 1 {
@@ -190,10 +193,17 @@ pub(crate) async fn prepare_spatial_join_components(
         } else {
             extent
         };
-        let samples = bbox_samples.take_samples();
+        let mut samples = bbox_samples.take_samples();
         let max_items_per_node = 1.max(samples.len() / num_partitions);
         let max_levels = num_partitions;
 
+        log::info!(
+            "Number of samples: {}, max_items_per_node: {}, max_levels: {}",
+            samples.len(),
+            max_items_per_node,
+            max_levels
+        );
+        rng.shuffle(&mut samples);
         let kdb_partitioner =
             KDBPartitioner::build(samples.into_iter(), max_items_per_node, max_levels, extent)?;
         log::info!(

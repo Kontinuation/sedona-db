@@ -342,7 +342,7 @@ impl StreamRepartitioner {
         row_assignments: &[SpatialPartition],
     ) -> Result<()> {
         let batch_idx = self.pending_batches.len();
-        self.pending_bytes += batch.in_mem_size();
+        self.pending_bytes += batch.in_mem_size()?;
         self.pending_batches.push(batch);
         let batch_ref = &self.pending_batches[batch_idx];
         assert_eq!(row_assignments.len(), batch_ref.num_rows());

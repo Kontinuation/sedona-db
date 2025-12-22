@@ -139,19 +139,24 @@ impl SpatialIndexBuilder {
         // Estimate the amount of memory needed for the R-tree
         let rtree_mem_usage = num_geoms * RTREE_MEMORY_ESTIMATE_PER_RECT;
 
+        // Estimate the amount of memory needed for auxiliary data structures, such as
+        // batch_pos_vec and geom_idx_vec.
+        let auxiliary = num_geoms * 16;
+
         // The final estimation is the sum of all above
-        refiner_mem_usage + rtree_mem_usage
+        refiner_mem_usage + rtree_mem_usage + auxiliary
     }
 
     /// Add a geometry batch to be indexed.
     ///
     /// This method accumulates geometry batches that will be used to build the spatial index.
     /// Each batch contains processed geometry data along with memory usage information.
-    pub fn add_batch(&mut self, indexed_batch: EvaluatedBatch) {
-        let in_mem_size = indexed_batch.in_mem_size();
+    pub fn add_batch(&mut self, indexed_batch: EvaluatedBatch) -> Result<()> {
+        let in_mem_size = indexed_batch.in_mem_size()?;
         self.indexed_batches.push(indexed_batch);
         self.memory_used += in_mem_size;
         self.metrics.build_mem_used.set_max(self.memory_used);
+        Ok(())
     }
 
     pub fn merge_stats(&mut self, stats: GeoStatistics) -> &mut Self {
@@ -293,6 +298,10 @@ impl SpatialIndexBuilder {
         };
         self.metrics.build_mem_used.set_max(self.memory_used);
 
+        log::info!(
+            "Estimated memory used by spatial index: {}",
+            self.memory_used
+        );
         Ok(SpatialIndex {
             schema: self.schema,
             evaluator,
@@ -314,7 +323,7 @@ impl SpatialIndexBuilder {
     ) -> Result<()> {
         while let Some(batch) = stream.next().await {
             let indexed_batch = batch?;
-            self.add_batch(indexed_batch);
+            self.add_batch(indexed_batch)?;
         }
         self.merge_stats(geo_statistics);
         Ok(())

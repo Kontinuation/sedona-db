@@ -18,7 +18,7 @@
 use std::{fs::File, io::BufReader, sync::Arc};
 
 use arrow::{
-    array::{Float32Array, Float32Builder, Float64Array, NullBufferBuilder},
+    array::Float64Array,
     ipc::{
         reader::StreamReader,
         writer::{IpcWriteOptions, StreamWriter},
@@ -31,8 +31,6 @@ use datafusion_common::{DataFusionError, Result, ScalarValue};
 use datafusion_execution::{disk_manager::RefCountedTempFile, runtime_env::RuntimeEnv};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_plan::metrics::SpillMetrics;
-use geo::coord;
-use geo_types::Rect;
 use sedona_schema::datatypes::SedonaType;
 
 use crate::{evaluated_batch::EvaluatedBatch, operand_evaluator::EvaluatedGeometryArray};
@@ -50,13 +48,10 @@ pub(crate) struct SpillWriter {
     /// The spill_schema has 4 fields:
     /// * `data`: StructArray containing the original record batch columns
     /// * `geom`: geometry array in storage format
-    /// * `rect`: StructArray containing min_x, min_y, max_x, max_y fields
     /// * `dist`: distance field
     spill_schema: Schema,
     /// Inner fields of the "data" StructArray in the spilled record batches
     data_inner_fields: Fields,
-    /// Inner fields of the "rect" StructArray in the spilled record batches
-    rect_inner_fields: Fields,
 }
 
 impl SpillWriter {
@@ -74,15 +69,8 @@ impl SpillWriter {
         let data_struct_field =
             Field::new("data", DataType::Struct(data_inner_fields.clone()), false);
         let geom_field = sedona_type.to_storage_field("geom", true)?;
-        let rect_inner_fields = Fields::from(vec![
-            Field::new("min_x", DataType::Float32, false),
-            Field::new("min_y", DataType::Float32, false),
-            Field::new("max_x", DataType::Float32, false),
-            Field::new("max_y", DataType::Float32, false),
-        ]);
-        let rect_field = Field::new("rect", DataType::Struct(rect_inner_fields.clone()), true);
         let dist_field = Field::new("dist", DataType::Float64, true);
-        let spill_schema = Schema::new(vec![data_struct_field, geom_field, rect_field, dist_field]);
+        let spill_schema = Schema::new(vec![data_struct_field, geom_field, dist_field]);
 
         // Create spill file
         let in_progress_file = env.disk_manager.create_tmp_file(request_description)?;
@@ -100,14 +88,13 @@ impl SpillWriter {
             metrics,
             spill_schema,
             data_inner_fields,
-            rect_inner_fields,
         })
     }
 
     /// Append an EvaluatedBatch to the spill file
     pub fn append(&mut self, evaluated_batch: &EvaluatedBatch) -> Result<()> {
         let num_rows = evaluated_batch.num_rows();
-        let num_bytes = evaluated_batch.in_mem_size();
+        let num_bytes = evaluated_batch.in_mem_size()?;
         let record_batch = self.spilled_record_batch(evaluated_batch)?;
         self.writer.write(&record_batch).map_err(|e| {
             DataFusionError::Execution(format!(
@@ -138,43 +125,6 @@ impl SpillWriter {
         let data_arrays = data_batch.columns().to_vec();
         let data_struct_array =
             StructArray::try_new(self.data_inner_fields.clone(), data_arrays, None)?;
-
-        // Store bbox into a StructArray
-        let mut min_x_builder = Float32Builder::with_capacity(num_rows);
-        let mut min_y_builder = Float32Builder::with_capacity(num_rows);
-        let mut max_x_builder = Float32Builder::with_capacity(num_rows);
-        let mut max_y_builder = Float32Builder::with_capacity(num_rows);
-        let mut null_buffer_builder = NullBufferBuilder::new(num_rows);
-        for rect_opt in evaluated_batch.rects() {
-            if let Some(rect) = rect_opt {
-                min_x_builder.append_value(rect.min().x);
-                min_y_builder.append_value(rect.min().y);
-                max_x_builder.append_value(rect.max().x);
-                max_y_builder.append_value(rect.max().y);
-                null_buffer_builder.append_non_null();
-            } else {
-                min_x_builder.append_value(0.0);
-                min_y_builder.append_value(0.0);
-                max_x_builder.append_value(0.0);
-                max_y_builder.append_value(0.0);
-                null_buffer_builder.append_null();
-            }
-        }
-        let min_x_array = min_x_builder.finish();
-        let min_y_array = min_y_builder.finish();
-        let max_x_array = max_x_builder.finish();
-        let max_y_array = max_y_builder.finish();
-        let null_buffer = null_buffer_builder.finish();
-        let rect_array = StructArray::try_new(
-            self.rect_inner_fields.clone(),
-            vec![
-                Arc::new(min_x_array),
-                Arc::new(min_y_array),
-                Arc::new(max_x_array),
-                Arc::new(max_y_array),
-            ],
-            null_buffer,
-        )?;
 
         // Store dist into a Float64Array
         let mut dist_builder = arrow::array::Float64Builder::with_capacity(num_rows);
@@ -211,7 +161,6 @@ impl SpillWriter {
         let columns = vec![
             Arc::new(data_struct_array) as Arc<dyn arrow::array::Array>,
             Arc::clone(&geom_array.geometry_array),
-            Arc::new(rect_array) as Arc<dyn arrow::array::Array>,
             Arc::new(dist_array) as Arc<dyn arrow::array::Array>,
         ];
         let spilled_record_batch =
@@ -246,7 +195,7 @@ impl SpillReader {
     #[allow(unused)]
     pub fn next_batch(&mut self) -> Option<Result<EvaluatedBatch>> {
         self.next_raw_batch()
-            .map(|record_batch| record_batch.and_then(spilled_batch_to_build_side_batch))
+            .map(|record_batch| record_batch.and_then(spilled_batch_to_evaluated_batch))
     }
 
     /// Read the next raw RecordBatch from the spill file
@@ -257,7 +206,7 @@ impl SpillReader {
     }
 }
 
-pub(crate) fn spilled_batch_to_build_side_batch(
+pub(crate) fn spilled_batch_to_evaluated_batch(
     record_batch: RecordBatch,
 ) -> Result<EvaluatedBatch> {
     // Extract the data struct array (column 0) and convert back to the original RecordBatch
@@ -292,61 +241,9 @@ pub(crate) fn spilled_batch_to_build_side_batch(
     let geom_field = schema.field(1);
     let sedona_type = SedonaType::from_storage_field(geom_field)?;
 
-    // Extract the rect array (column 2) and convert back to Vec<Option<Rect<f32>>>
-    let rect_array = record_batch
-        .column(2)
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(|| {
-            DataFusionError::Internal("Expected rect column to be a StructArray".to_string())
-        })?;
-
-    let min_x_array = rect_array
-        .column(0)
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| {
-            DataFusionError::Internal("Expected min_x to be Float32Array".to_string())
-        })?;
-    let min_y_array = rect_array
-        .column(1)
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| {
-            DataFusionError::Internal("Expected min_y to be Float32Array".to_string())
-        })?;
-    let max_x_array = rect_array
-        .column(2)
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| {
-            DataFusionError::Internal("Expected max_x to be Float32Array".to_string())
-        })?;
-    let max_y_array = rect_array
-        .column(3)
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| {
-            DataFusionError::Internal("Expected max_y to be Float32Array".to_string())
-        })?;
-
-    let mut rects = Vec::with_capacity(rect_array.len());
-    for i in 0..rect_array.len() {
-        if rect_array.is_null(i) {
-            rects.push(None);
-        } else {
-            let min_x = min_x_array.value(i);
-            let min_y = min_y_array.value(i);
-            let max_x = max_x_array.value(i);
-            let max_y = max_y_array.value(i);
-            let rect = Rect::new(coord! { x: min_x, y: min_y }, coord! { x: max_x, y: max_y });
-            rects.push(Some(rect));
-        }
-    }
-
     // Extract the distance array (column 3) and convert back to ColumnarValue
     let dist_array = record_batch
-        .column(3)
+        .column(2)
         .as_any()
         .downcast_ref::<Float64Array>()
         .ok_or_else(|| {
@@ -373,7 +270,7 @@ pub(crate) fn spilled_batch_to_build_side_batch(
         if all_same {
             Some(ColumnarValue::Scalar(ScalarValue::Float64(first_value)))
         } else {
-            Some(ColumnarValue::Array(Arc::clone(record_batch.column(3))))
+            Some(ColumnarValue::Array(Arc::clone(record_batch.column(2))))
         }
     } else {
         None
@@ -382,9 +279,6 @@ pub(crate) fn spilled_batch_to_build_side_batch(
     // Create EvaluatedGeometryArray
     let mut geom_array = EvaluatedGeometryArray::try_new(geom_array, &sedona_type)?;
     geom_array.distance = distance;
-    // Note: rects are already computed in try_new, but we need to replace them with the ones from the spilled batch
-    // because the spilled batch may have been modified (e.g., filtered)
-    geom_array.rects = rects;
 
     Ok(EvaluatedBatch { batch, geom_array })
 }
@@ -517,11 +411,10 @@ mod tests {
         )?;
 
         // Verify the spill schema has the expected structure
-        assert_eq!(writer.spill_schema.fields().len(), 4);
+        assert_eq!(writer.spill_schema.fields().len(), 3);
         assert_eq!(writer.spill_schema.field(0).name(), "data");
         assert_eq!(writer.spill_schema.field(1).name(), "geom");
-        assert_eq!(writer.spill_schema.field(2).name(), "rect");
-        assert_eq!(writer.spill_schema.field(3).name(), "dist");
+        assert_eq!(writer.spill_schema.field(2).name(), "dist");
 
         Ok(())
     }
