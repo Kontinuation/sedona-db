@@ -33,7 +33,11 @@ use datafusion_expr::ColumnarValue;
 use datafusion_physical_plan::metrics::SpillMetrics;
 use sedona_schema::datatypes::SedonaType;
 
-use crate::{evaluated_batch::EvaluatedBatch, operand_evaluator::EvaluatedGeometryArray};
+use crate::{
+    evaluated_batch::EvaluatedBatch,
+    operand_evaluator::EvaluatedGeometryArray,
+    utils::arrow_utils::{compact_batch, get_record_batch_memory_size},
+};
 
 /// Writer for spilling evaluated batches to disk
 pub(crate) struct SpillWriter {
@@ -52,6 +56,8 @@ pub(crate) struct SpillWriter {
     spill_schema: Schema,
     /// Inner fields of the "data" StructArray in the spilled record batches
     data_inner_fields: Fields,
+    /// The in memory size threshold of batches written to spill files.
+    batch_size_threshold: Option<usize>,
 }
 
 impl SpillWriter {
@@ -63,6 +69,7 @@ impl SpillWriter {
         request_description: &str,
         compression: SpillCompression,
         metrics: SpillMetrics,
+        batch_size_threshold: Option<usize>,
     ) -> Result<Self> {
         // Construct schema of record batches to be written. The written batches is augmented from the original record batches.
         let data_inner_fields = schema.fields().clone();
@@ -88,6 +95,7 @@ impl SpillWriter {
             metrics,
             spill_schema,
             data_inner_fields,
+            batch_size_threshold,
         })
     }
 
@@ -96,16 +104,49 @@ impl SpillWriter {
         let num_rows = evaluated_batch.num_rows();
         let num_bytes = evaluated_batch.in_mem_size()?;
         let record_batch = self.spilled_record_batch(evaluated_batch)?;
-        self.writer.write(&record_batch).map_err(|e| {
+
+        let rows_per_split = self.calculate_rows_per_split(&record_batch, num_rows)?;
+
+        if rows_per_split < num_rows {
+            let mut offset = 0;
+            while offset < num_rows {
+                let length = std::cmp::min(rows_per_split, num_rows - offset);
+                let slice = record_batch.slice(offset, length);
+                let compacted = compact_batch(slice)?;
+                self.write_batch(&compacted)?;
+                offset += length;
+            }
+        } else {
+            self.write_batch(&record_batch)?;
+        }
+
+        self.metrics.spilled_rows.add(num_rows);
+        self.metrics.spilled_bytes.add(num_bytes);
+        Ok(())
+    }
+
+    fn calculate_rows_per_split(&self, batch: &RecordBatch, num_rows: usize) -> Result<usize> {
+        if let Some(threshold) = self.batch_size_threshold {
+            if threshold > 0 {
+                let batch_size = get_record_batch_memory_size(batch)?;
+                if batch_size > threshold {
+                    let num_splits = (batch_size + threshold - 1) / threshold;
+                    let rows = (num_rows + num_splits - 1) / num_splits;
+                    return Ok(std::cmp::max(1, rows));
+                }
+            }
+        }
+        Ok(num_rows)
+    }
+
+    fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.writer.write(batch).map_err(|e| {
             DataFusionError::Execution(format!(
                 "Failed to write RecordBatch to spill file {:?}: {}",
                 self.in_progress_file.path(),
                 e
             ))
-        })?;
-        self.metrics.spilled_rows.add(num_rows);
-        self.metrics.spilled_bytes.add(num_bytes);
-        Ok(())
+        })
     }
 
     /// Finish writing and return the temporary file
@@ -408,6 +449,7 @@ mod tests {
             "test_spill",
             SpillCompression::Uncompressed,
             metrics,
+            None,
         )?;
 
         // Verify the spill schema has the expected structure
@@ -434,6 +476,7 @@ mod tests {
             "test_spill",
             SpillCompression::Uncompressed,
             metrics,
+            None,
         )?;
 
         let evaluated_batch = create_test_evaluated_batch()?;
@@ -474,6 +517,7 @@ mod tests {
             "test_spill",
             SpillCompression::Uncompressed,
             metrics,
+            None,
         )?;
 
         let evaluated_batch = create_test_evaluated_batch_with_array_distance()?;
@@ -514,6 +558,7 @@ mod tests {
             "test_spill",
             SpillCompression::Uncompressed,
             metrics,
+            None,
         )?;
 
         let evaluated_batch = create_test_evaluated_batch_with_nulls()?;
@@ -557,6 +602,7 @@ mod tests {
             "test_spill",
             SpillCompression::Uncompressed,
             metrics,
+            None,
         )?;
 
         // Write multiple batches
@@ -602,6 +648,7 @@ mod tests {
             "test_spill",
             SpillCompression::Uncompressed,
             metrics.clone(),
+            None,
         )?;
 
         let evaluated_batch = create_test_evaluated_batch()?;
@@ -634,6 +681,7 @@ mod tests {
             "test_spill",
             SpillCompression::Uncompressed,
             metrics,
+            None,
         )?;
 
         let evaluated_batch = create_test_evaluated_batch()?;
@@ -678,6 +726,7 @@ mod tests {
             "test_spill",
             SpillCompression::Uncompressed,
             metrics,
+            None,
         )?;
 
         let evaluated_batch = create_test_evaluated_batch()?;
@@ -713,6 +762,7 @@ mod tests {
             "test_spill",
             SpillCompression::Uncompressed,
             metrics,
+            None,
         )?;
 
         // Create an empty batch
@@ -736,6 +786,59 @@ mod tests {
         let mut reader = SpillReader::try_new(&temp_file)?;
         let read_batch = reader.next_batch().unwrap()?;
         assert_eq!(read_batch.num_rows(), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_spill_batch_splitting() -> Result<()> {
+        let env = create_test_runtime_env()?;
+        let schema = create_test_schema();
+        let sedona_type = WKB_GEOMETRY;
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = SpillMetrics::new(&metrics_set, 0);
+
+        // Create a batch
+        let evaluated_batch = create_test_evaluated_batch()?;
+        let batch_size = get_record_batch_memory_size(&evaluated_batch.batch)?;
+
+        // Set threshold to be smaller than batch size, so it splits into at least 2 parts
+        let threshold = batch_size / 2;
+
+        let mut writer = SpillWriter::try_new(
+            env,
+            schema,
+            &sedona_type,
+            "test_spill",
+            SpillCompression::Uncompressed,
+            metrics,
+            Some(threshold),
+        )?;
+
+        writer.append(&evaluated_batch)?;
+        let temp_file = writer.finish()?;
+
+        // Read back the spilled data
+        let mut reader = SpillReader::try_new(&temp_file)?;
+
+        // We expect multiple batches
+        let mut num_batches = 0;
+        let mut total_rows = 0;
+        while let Some(batch_result) = reader.next_batch() {
+            let batch = batch_result?;
+            num_batches += 1;
+            total_rows += batch.num_rows();
+        }
+
+        assert!(
+            num_batches > 1,
+            "Batch should have been split into multiple batches"
+        );
+        assert_eq!(
+            total_rows,
+            evaluated_batch.num_rows(),
+            "Total rows should match"
+        );
 
         Ok(())
     }

@@ -329,6 +329,7 @@ mod tests {
             "test_external_stream",
             SpillCompression::Uncompressed,
             metrics,
+            None,
         )?;
 
         for i in 0..num_batches {

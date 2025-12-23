@@ -1083,6 +1083,7 @@ mod tests {
         let debug = SpatialJoinDebugOptions {
             num_spatial_partitions: NumSpatialPartitionsConfig::Fixed(4),
             force_spill: true,
+            memory_for_intermittent_usage: None,
         };
         let options = SpatialJoinOptions {
             spatial_library,
@@ -1128,6 +1129,7 @@ mod tests {
         let debug = SpatialJoinDebugOptions {
             num_spatial_partitions: NumSpatialPartitionsConfig::Fixed(4),
             force_spill: true,
+            memory_for_intermittent_usage: None,
         };
         let options = SpatialJoinOptions {
             debug,
@@ -1156,6 +1158,7 @@ mod tests {
         let debug = SpatialJoinDebugOptions {
             num_spatial_partitions: NumSpatialPartitionsConfig::Fixed(4),
             force_spill: true,
+            memory_for_intermittent_usage: None,
         };
         let options = SpatialJoinOptions {
             debug,

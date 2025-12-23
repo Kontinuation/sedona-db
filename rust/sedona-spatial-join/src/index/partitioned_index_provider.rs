@@ -499,6 +499,7 @@ mod tests {
             "partitioned-index-provider-test",
             SpillCompression::Uncompressed,
             SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            None,
         )?;
         let mut num_rows = 0;
         for batch in &batches {

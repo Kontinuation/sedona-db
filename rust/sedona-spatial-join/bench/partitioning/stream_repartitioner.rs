@@ -90,6 +90,7 @@ fn bench_stream_partitioner(c: &mut Criterion) {
                         spill_metrics.clone(),
                         REPARTITIONER_BUFFER_BYTES,
                         ROWS_PER_BATCH,
+                        None,
                     )
                     .await
                     .expect("repartition should succeed in benchmark");

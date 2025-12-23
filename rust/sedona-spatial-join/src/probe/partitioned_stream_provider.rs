@@ -42,6 +42,7 @@ pub(crate) struct ProbeStreamOptions {
     pub target_batch_rows: usize,
     pub spill_compression: SpillCompression,
     pub buffer_bytes_threshold: usize,
+    pub spilled_batch_in_memory_size_threshold: Option<usize>,
 }
 
 pub(crate) struct PartitionedProbeStreamProvider {
@@ -118,6 +119,7 @@ impl PartitionedProbeStreamProvider {
                     self.metrics.spill_metrics.clone(),
                     self.options.buffer_bytes_threshold,
                     self.options.target_batch_rows,
+                    self.options.spilled_batch_in_memory_size_threshold,
                 );
 
                 let state = Arc::clone(&self.state);
@@ -373,6 +375,7 @@ mod tests {
                 target_batch_rows: 1024,
                 spill_compression: SpillCompression::Uncompressed,
                 buffer_bytes_threshold: 0,
+                spilled_batch_in_memory_size_threshold: None,
             },
             stream,
             ProbeStreamMetrics::new(0, &ExecutionPlanMetricsSet::new()),

@@ -281,6 +281,7 @@ pub struct StreamRepartitioner {
     spill_metrics: SpillMetrics,
     buffer_bytes_threshold: usize,
     target_batch_size: usize,
+    spilled_batch_in_memory_size_threshold: Option<usize>,
     pending_batches: Vec<EvaluatedBatch>,
     pending_bytes: usize,
 }
@@ -295,6 +296,7 @@ impl StreamRepartitioner {
         spill_metrics: SpillMetrics,
         buffer_bytes_threshold: usize,
         target_batch_size: usize,
+        spilled_batch_in_memory_size_threshold: Option<usize>,
     ) -> Self {
         let slots = PartitionSlots::new(partitioner.num_regular_partitions());
         let slot_count = slots.total_slots();
@@ -314,6 +316,7 @@ impl StreamRepartitioner {
             spill_metrics,
             buffer_bytes_threshold,
             target_batch_size,
+            spilled_batch_in_memory_size_threshold,
             pending_batches: Vec::new(),
             pending_bytes: 0,
         }
@@ -449,6 +452,7 @@ impl StreamRepartitioner {
                 "streaming repartitioner",
                 self.spill_compression,
                 self.spill_metrics.clone(),
+                self.spilled_batch_in_memory_size_threshold,
             )?);
         }
         Ok(self.spill_registry[slot_idx]
@@ -468,6 +472,7 @@ pub async fn repartition_evaluated_batches(
     spill_metrics: SpillMetrics,
     buffer_bytes_threshold: usize,
     target_batch_size: usize,
+    spilled_batch_in_memory_size_threshold: Option<usize>,
 ) -> Result<SpilledPartitions> {
     let mut repartitioner = StreamRepartitioner::new(
         runtime_env,
@@ -477,6 +482,7 @@ pub async fn repartition_evaluated_batches(
         spill_metrics,
         buffer_bytes_threshold,
         target_batch_size,
+        spilled_batch_in_memory_size_threshold,
     );
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;
@@ -789,6 +795,7 @@ mod tests {
             metrics,
             BUFFER_BYTES,
             TARGET_BATCH_SIZE,
+            None,
         )
         .await?;
 
@@ -873,6 +880,7 @@ mod tests {
             metrics,
             BUFFER_BYTES,
             TARGET_BATCH_SIZE,
+            None,
         )
         .await?;
 
@@ -930,6 +938,7 @@ mod tests {
             spill_metrics,
             0,
             TARGET_BATCH_SIZE,
+            None,
         );
 
         repartitioner.repartition_batch(batch)?;
@@ -973,6 +982,7 @@ mod tests {
             spill_metrics,
             usize::MAX,
             TARGET_BATCH_SIZE,
+            None,
         );
 
         repartitioner.repartition_batch(batch_a)?;
@@ -1005,6 +1015,7 @@ mod tests {
             spill_metrics,
             usize::MAX,
             1,
+            None,
         );
 
         repartitioner.repartition_batch(batch_a)?;

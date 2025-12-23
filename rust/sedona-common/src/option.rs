@@ -83,6 +83,12 @@ config_namespace! {
         /// data when running out-of-core spatial join
         pub target_index_side_bbox_sampling_rate: f64, default = 0.01
 
+        /// The in memory size threshold of batches written to spill files. If the spilled batch is
+        /// too large, it will be broken into several smaller parts before written to spill files.
+        /// This is for avoiding overshooting the memory limit when reading spilled batches from
+        /// spill files. Specify 0 for unlimited size.
+        pub spilled_batch_in_memory_size_threshold: usize, default = 0
+
         /// Options for debugging or testing spatial join
         pub debug : SpatialJoinDebugOptions, default = SpatialJoinDebugOptions::default()
     }
@@ -93,6 +99,9 @@ config_namespace! {
     pub struct SpatialJoinDebugOptions {
         /// Number of spatial partitions to use for spatial join
         pub num_spatial_partitions: NumSpatialPartitionsConfig, default = NumSpatialPartitionsConfig::Auto
+
+        /// The amount of memory for intermittent usage such as spatially repartitioning the data
+        pub memory_for_intermittent_usage: Option<usize>, default = None
 
         /// Force spilling while collecting the build side or not
         pub force_spill: bool, default = false

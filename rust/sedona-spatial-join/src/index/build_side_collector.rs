@@ -374,6 +374,18 @@ impl BuildSideBatchesCollector {
             "spilling build side batches",
             self.spill_compression,
             metrics.spill_metrics.clone(),
+            if self
+                .spatial_join_options
+                .spilled_batch_in_memory_size_threshold
+                == 0
+            {
+                None
+            } else {
+                Some(
+                    self.spatial_join_options
+                        .spilled_batch_in_memory_size_threshold,
+                )
+            },
         )?;
 
         for in_mem_batch in in_mem_batches.iter() {

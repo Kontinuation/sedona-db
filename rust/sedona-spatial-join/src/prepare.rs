@@ -75,6 +75,19 @@ pub(crate) async fn prepare_spatial_join_components(
         .cloned()
         .unwrap_or_default();
     let concurrent = sedona_options.spatial_join.concurrent_build_side_collection;
+    let spilled_batch_in_memory_size_threshold = if sedona_options
+        .spatial_join
+        .spilled_batch_in_memory_size_threshold
+        == 0
+    {
+        None
+    } else {
+        Some(
+            sedona_options
+                .spatial_join
+                .spilled_batch_in_memory_size_threshold,
+        )
+    };
     let spill_compression = session_config.spill_compression();
     let memory_pool = context.memory_pool();
     let num_partitions = build_streams.len();
@@ -94,6 +107,7 @@ pub(crate) async fn prepare_spatial_join_components(
             target_batch_rows: target_batch_size,
             spill_compression: session_config.spill_compression(),
             buffer_bytes_threshold: 0,
+            spilled_batch_in_memory_size_threshold,
         };
         return Ok(SpatialJoinComponents {
             partitioned_index_provider: Arc::new(partitioned_index_provider),
@@ -137,13 +151,23 @@ pub(crate) async fn prepare_spatial_join_components(
             memory_plan_str
         );
     }
-    let memory_for_intermittent_usage = memory_plan.memory_for_intermittent_usage;
     let num_partitions = match sedona_options.spatial_join.debug.num_spatial_partitions {
         NumSpatialPartitionsConfig::Auto => memory_plan.num_partitions,
         NumSpatialPartitionsConfig::Fixed(n) => {
             log::info!("Override number of spatial partitions to {}", n);
             n
         }
+    };
+    let memory_for_intermittent_usage = match sedona_options
+        .spatial_join
+        .debug
+        .memory_for_intermittent_usage
+    {
+        Some(value) => {
+            log::info!("Override memory for intermittent usage to {}", value);
+            value
+        }
+        None => memory_plan.memory_for_intermittent_usage,
     };
 
     if num_partitions == 1 {
@@ -163,6 +187,7 @@ pub(crate) async fn prepare_spatial_join_components(
             target_batch_rows: target_batch_size,
             spill_compression: session_config.spill_compression(),
             buffer_bytes_threshold: 0,
+            spilled_batch_in_memory_size_threshold,
         };
         Ok(SpatialJoinComponents {
             partitioned_index_provider: Arc::new(partitioned_index_provider),
@@ -241,6 +266,7 @@ pub(crate) async fn prepare_spatial_join_components(
                     spill_metrics,
                     buffer_bytes_threshold,
                     target_batch_size,
+                    spilled_batch_in_memory_size_threshold,
                 )
                 .await;
                 partitioned_spill_files
@@ -311,6 +337,7 @@ pub(crate) async fn prepare_spatial_join_components(
             target_batch_rows: target_batch_size,
             spill_compression,
             buffer_bytes_threshold,
+            spilled_batch_in_memory_size_threshold,
         };
 
         Ok(SpatialJoinComponents {
