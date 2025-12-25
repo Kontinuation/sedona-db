@@ -540,6 +540,9 @@ impl SpatialJoinStream {
 
         let result = match batch_opt {
             Some(batch) => {
+                self.join_metrics.output_batches.add(1);
+                self.join_metrics.output_rows.add(batch.num_rows());
+
                 // Check if iterator is complete
                 if is_complete {
                     self.state = SpatialJoinStreamState::FetchProbeBatch(partition_desc);
@@ -1006,8 +1009,6 @@ impl SpatialJoinBatchIterator {
             };
 
             if let Some(batch) = joined_batch_opt {
-                self.join_metrics.output_batches.add(1);
-                self.join_metrics.output_rows.add(batch.num_rows());
                 return Ok(Some(batch));
             }
         }
@@ -1493,6 +1494,7 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow_array::cast::AsArray;
+    use rand::Rng;
 
     fn create_test_batches(
         num_batches: usize,
@@ -1712,5 +1714,163 @@ mod tests {
             assert_eq!(original_id, assembled_id,
                 "Data mismatch when mapping back from assembled batch row {i} to original batch {original_batch_idx} row {original_row_idx}");
         }
+    }
+
+    #[test]
+    fn test_produce_joined_indices() {
+        for max_batch_size in 1..20 {
+            verify_produce_probe_indices(&[], 0, max_batch_size);
+            verify_produce_probe_indices(&[0, 0, 0, 0], 1, max_batch_size);
+            verify_produce_probe_indices(&[0, 0, 0, 0], 10, max_batch_size);
+            verify_produce_probe_indices(&[3, 3, 3], 10, max_batch_size);
+            verify_produce_probe_indices(&[0, 0, 3, 3, 3, 6, 7], 10, max_batch_size);
+            verify_produce_probe_indices(&[0, 3, 3, 3, 4, 5, 5, 9], 10, max_batch_size);
+            verify_produce_probe_indices(&[0, 3, 3, 4, 5, 5, 9, 9], 10, max_batch_size);
+        }
+    }
+
+    #[test]
+    fn test_fuzz_produce_probe_indices() {
+        let num_rows_range = 0..100;
+        let max_batch_size_range = 1..100;
+        let match_probability = 0.5;
+        let num_matches_range = 1..100;
+        for _ in 0..1000 {
+            fuzz_produce_probe_indices(
+                num_rows_range.clone(),
+                max_batch_size_range.clone(),
+                match_probability,
+                num_matches_range.clone(),
+            );
+        }
+    }
+
+    fn fuzz_produce_probe_indices(
+        num_rows_range: Range<usize>,
+        max_batch_size_range: Range<usize>,
+        match_probability: f64,
+        num_matches_range: Range<usize>,
+    ) {
+        let mut rng = rand::thread_rng();
+        let num_rows = rng.gen_range(num_rows_range);
+        let max_batch_size = rng.gen_range(max_batch_size_range);
+        let mut probe_indices = Vec::with_capacity(num_rows);
+        for row in 0..num_rows {
+            let has_matches = rng.gen_bool(match_probability);
+            if has_matches {
+                let num_matches = rng.gen_range(num_matches_range.clone());
+                probe_indices.extend(std::iter::repeat_n(row as u32, num_matches));
+            }
+        }
+        verify_produce_probe_indices(&probe_indices, num_rows, max_batch_size);
+    }
+
+    fn verify_produce_probe_indices(probe_indices: &[u32], num_rows: usize, max_batch_size: usize) {
+        for join_type in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::LeftSemi,
+            JoinType::LeftAnti,
+            JoinType::LeftMark,
+            JoinType::RightSemi,
+            JoinType::RightAnti,
+            JoinType::RightMark,
+        ] {
+            let expected_probe_indices =
+                produce_probe_indices_once(&probe_indices, num_rows, join_type);
+            let produced_probe_indices = produce_probe_indices_incrementally(
+                &probe_indices,
+                num_rows,
+                max_batch_size,
+                join_type,
+            );
+            assert_eq!(
+                expected_probe_indices, produced_probe_indices,
+                "Fuzz test failed for num_rows: {}, max_batch_size: {}, probe_indices: {:?}",
+                num_rows, max_batch_size, probe_indices
+            );
+        }
+    }
+
+    fn produce_probe_indices_once(
+        probe_indices: &[u32],
+        num_rows: usize,
+        join_type: JoinType,
+    ) -> Vec<u32> {
+        let build_indices = UInt64Array::from(vec![0; probe_indices.len()]);
+        let probe_indices_array = UInt32Array::from(probe_indices.to_vec());
+        let probe_range = 0..num_rows;
+        let (_, result_probe_indices) = adjust_indices_with_visited_info(
+            build_indices,
+            probe_indices_array,
+            probe_range,
+            join_type,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        let mut expected_probe_indices = result_probe_indices.values().to_vec();
+        expected_probe_indices.sort();
+        expected_probe_indices
+    }
+
+    fn produce_probe_indices_incrementally(
+        probe_indices: &[u32],
+        num_rows: usize,
+        max_batch_size: usize,
+        join_type: JoinType,
+    ) -> Vec<u32> {
+        let build_batch_positions = vec![(0, 0); probe_indices.len()];
+        let mut progress = ProbeProgress {
+            current_probe_idx: 0,
+            last_produced_probe_idx: -1,
+            build_batch_positions,
+            probe_indices: probe_indices.to_vec(),
+            pos: 0,
+        };
+        let mut produced_probe_indices: Vec<u32> = Vec::new();
+        loop {
+            let Some((_, probe_indices)) =
+                progress.indices_for_next_batch(JoinSide::Left, join_type, max_batch_size)
+            else {
+                break;
+            };
+            let probe_indices = probe_indices.to_vec();
+            let adjust_range = progress.next_probe_range(&probe_indices);
+            let build_indices = UInt64Array::from(vec![0; probe_indices.len()]);
+            let probe_indices = UInt32Array::from(probe_indices);
+            let (_, result_probe_indices) = adjust_indices_with_visited_info(
+                build_indices,
+                probe_indices,
+                adjust_range,
+                join_type,
+                false,
+                None,
+                true,
+            )
+            .unwrap();
+            produced_probe_indices.extend(result_probe_indices.values().as_ref());
+        }
+        if let Some(last_range) = progress.last_probe_range(num_rows) {
+            let build_indices = UInt64Array::from(Vec::<u64>::new());
+            let probe_indices = UInt32Array::from(Vec::<u32>::new());
+            let (_, result_probe_indices) = adjust_indices_with_visited_info(
+                build_indices,
+                probe_indices,
+                last_range,
+                join_type,
+                false,
+                None,
+                true,
+            )
+            .unwrap();
+            produced_probe_indices.extend(result_probe_indices.values().as_ref());
+        }
+
+        produced_probe_indices.sort();
+        produced_probe_indices
     }
 }
