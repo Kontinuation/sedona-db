@@ -846,6 +846,81 @@ struct ProbeProgress {
     pos: usize,
 }
 
+impl ProbeProgress {
+    fn indices_for_next_batch(
+        &mut self,
+        build_side: JoinSide,
+        join_type: JoinType,
+        max_batch_size: usize,
+    ) -> Option<(&[(i32, i32)], &[u32])> {
+        let end = self.probe_indices.len();
+
+        // Advance the produced probe end index to skip already hit probe side rows
+        // when running probe-semi, probe-anti or probe-mark joins. This is because
+        // semi/anti/mark joins only care about whether a probe row has matches,
+        // and we don't want to produce duplicate unmatched probe rows when the same
+        // probe row P has multiple matches and we splitted probe_indices range into
+        // multiple pieces containing P.
+        let should_skip_lastly_produced_probe_rows = match (build_side, join_type) {
+            (JoinSide::Left, JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark) => {
+                true
+            }
+            (JoinSide::Right, JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark) => true,
+            _ => false,
+        };
+        if should_skip_lastly_produced_probe_rows {
+            while self.pos < end
+                && self.probe_indices[self.pos] as i64 == self.last_produced_probe_idx
+            {
+                self.pos += 1;
+            }
+        }
+
+        if self.pos >= end {
+            // No more results to produce. Should switch to Probing or Complete state.
+            return None;
+        }
+
+        // Take a slice of the accumulated results to produce
+        let slice_end = (self.pos + max_batch_size).min(end);
+        let build_indices = &self.build_batch_positions[self.pos..slice_end];
+        let probe_indices = &self.probe_indices[self.pos..slice_end];
+        self.pos = slice_end;
+
+        Some((build_indices, probe_indices))
+    }
+
+    fn next_probe_range(&mut self, probe_indices: &[u32]) -> Range<usize> {
+        let last_produced_probe_idx = self.last_produced_probe_idx;
+        let start_probe_idx = if probe_indices[0] as i64 == last_produced_probe_idx {
+            last_produced_probe_idx as usize
+        } else {
+            (last_produced_probe_idx + 1) as usize
+        };
+        let end_probe_idx = {
+            let last_probe_idx = probe_indices[probe_indices.len() - 1] as usize;
+            self.last_produced_probe_idx = last_probe_idx as i64;
+            last_probe_idx + 1
+        };
+        start_probe_idx..end_probe_idx
+    }
+
+    fn last_probe_range(&mut self, num_rows: usize) -> Option<Range<usize>> {
+        // Check if we have already produced all probe rows. There are 2 cases:
+        // 1. The last produced probe index is at the end (the last row had matches)
+        // 2. We have already called produce_last_result_batch before. Ignore this call.
+        if self.last_produced_probe_idx + 1 >= num_rows as i64 {
+            self.last_produced_probe_idx = num_rows as i64;
+            return None;
+        }
+
+        let start_probe_idx = (self.last_produced_probe_idx + 1) as usize;
+        let end_probe_idx = num_rows;
+        self.last_produced_probe_idx = end_probe_idx as i64;
+        Some(start_probe_idx..end_probe_idx)
+    }
+}
+
 /// Parameters for creating a SpatialJoinBatchIterator
 pub(crate) struct SpatialJoinBatchIteratorParams {
     pub schema: SchemaRef,
@@ -1033,36 +1108,16 @@ impl SpatialJoinBatchIterator {
     }
 
     fn produce_result_batch(&self, progress: &mut ProbeProgress) -> Result<Option<RecordBatch>> {
-        let end = progress.probe_indices.len();
-
-        // Advance the produced probe end index to skip already hit probe side rows
-        // when running probe-semi, probe-anti or probe-mark joins. This is because
-        // semi/anti/mark joins only care about whether a probe row has matches,
-        // and we don't want to produce duplicate unmatched probe rows when the same
-        // probe row P has multiple matches and we splitted probe_indices range into
-        // multiple pieces containing P.
-        if self.should_skip_produced_probe_rows() {
-            while progress.pos < end
-                && progress.probe_indices[progress.pos] as i64 == progress.last_produced_probe_idx
-            {
-                progress.pos += 1;
-            }
-        }
-
-        if progress.pos >= end {
-            // No more results to produce. Should switch to Probing or Complete state.
+        let Some((build_indices, probe_indices)) =
+            progress.indices_for_next_batch(self.build_side, self.join_type, self.max_batch_size)
+        else {
+            // No more results to produce
             return Ok(None);
-        }
+        };
 
-        // Take a slice of the accumulated results to produce
-        let slice_end = (progress.pos + self.max_batch_size).min(end);
-        let build_indices = &progress.build_batch_positions[progress.pos..slice_end];
-        let probe_indices = &progress.probe_indices[progress.pos..slice_end];
-        progress.pos = slice_end;
-
-        // Run filter on indices
+        // Produce filtered indices that will actually be used to build the joined batch
         let (build_partial_batch, build_indices_array, probe_indices_array) =
-            self.filter_indices(build_indices, probe_indices.to_vec())?;
+            self.produce_filtered_indices(build_indices, probe_indices.to_vec())?;
         if probe_indices_array.is_empty() {
             // No results after filtering
             return Ok(None);
@@ -1071,18 +1126,7 @@ impl SpatialJoinBatchIterator {
         // Compute the probe range
         let probe_range = {
             let probe_indices = probe_indices_array.values().as_ref();
-            let last_produced_probe_idx = progress.last_produced_probe_idx;
-            let start_probe_idx = if probe_indices[0] as i64 == last_produced_probe_idx {
-                last_produced_probe_idx as usize
-            } else {
-                (last_produced_probe_idx + 1) as usize
-            };
-            let end_probe_idx = {
-                let last_probe_idx = probe_indices[probe_indices.len() - 1] as usize;
-                progress.last_produced_probe_idx = last_probe_idx as i64;
-                last_probe_idx + 1
-            };
-            start_probe_idx..end_probe_idx
+            progress.next_probe_range(probe_indices)
         };
 
         // Produce the final joined batch
@@ -1108,25 +1152,15 @@ impl SpatialJoinBatchIterator {
         assert_eq!(progress.current_probe_idx, num_rows);
         assert_eq!(progress.pos, progress.probe_indices.len());
 
-        // Check if we have already produced all probe rows. There are 2 cases:
-        // 1. The last produced probe index is at the end (the last row had matches)
-        // 2. We have already called produce_last_result_batch before. Ignore this call.
-        if progress.last_produced_probe_idx + 1 >= num_rows as i64 {
-            progress.last_produced_probe_idx = num_rows as i64;
+        let Some(probe_range) = progress.last_probe_range(num_rows) else {
             return Ok(None);
-        }
+        };
 
         // Produce unmatched results in range [last_produced_probe_idx + 1, num_rows)
         let build_schema = self.spatial_index.schema();
         let build_empty_batch = RecordBatch::new_empty(build_schema);
         let build_indices_array = UInt64Array::from(Vec::<u64>::new());
         let probe_indices_array = UInt32Array::from(Vec::<u32>::new());
-        let probe_range = {
-            let start_probe_idx = (progress.last_produced_probe_idx + 1) as usize;
-            let end_probe_idx = num_rows;
-            progress.last_produced_probe_idx = end_probe_idx as i64;
-            start_probe_idx..end_probe_idx
-        };
         let batch = self.build_joined_batch(
             &build_empty_batch,
             build_indices_array,
@@ -1143,16 +1177,6 @@ impl SpatialJoinBatchIterator {
         progress.pos = 0;
     }
 
-    fn should_skip_produced_probe_rows(&self) -> bool {
-        match (self.build_side, self.join_type) {
-            (JoinSide::Left, JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark) => {
-                true
-            }
-            (JoinSide::Right, JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark) => true,
-            _ => false,
-        }
-    }
-
     /// Check if the iterator has finished processing
     pub fn is_complete(&self) -> bool {
         let progress = self
@@ -1166,7 +1190,7 @@ impl SpatialJoinBatchIterator {
         progress.last_produced_probe_idx >= self.probe_evaluated_batch.batch.num_rows() as i64
     }
 
-    fn filter_indices(
+    fn produce_filtered_indices(
         &self,
         build_indices: &[(i32, i32)],
         probe_indices: Vec<u32>,
