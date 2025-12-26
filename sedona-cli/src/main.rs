@@ -23,11 +23,10 @@ use std::process::ExitCode;
 use std::sync::{Arc, LazyLock};
 
 use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::memory_pool::{
-    FairSpillPool, GreedyMemoryPool, MemoryPool, TrackConsumersPool,
-};
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use sedona::context::SedonaContext;
+use sedona::memory_pool::{SedonaFairSpillPool, DEFAULT_UNSPILLABLE_RESERVE_RATIO};
 use sedona_cli::{
     exec,
     pool_type::PoolType,
@@ -79,6 +78,13 @@ struct Args {
         default_value_t = PoolType::Greedy
     )]
     mem_pool_type: PoolType,
+
+    #[clap(
+        long,
+        help = "The fraction of memory reserved for unspillable consumers (0.0 - 1.0)",
+        default_value_t = DEFAULT_UNSPILLABLE_RESERVE_RATIO
+    )]
+    unspillable_reserve_ratio: f64,
 
     #[clap(
         short,
@@ -162,7 +168,7 @@ async fn main_inner() -> Result<()> {
         // set memory pool type
         let pool: Arc<dyn MemoryPool> = match args.mem_pool_type {
             PoolType::Fair => Arc::new(TrackConsumersPool::new(
-                FairSpillPool::new(memory_limit),
+                SedonaFairSpillPool::new(memory_limit, args.unspillable_reserve_ratio),
                 NonZeroUsize::new(10).unwrap(),
             )),
             PoolType::Greedy => Arc::new(TrackConsumersPool::new(

@@ -50,8 +50,11 @@ class SedonaContext:
         memory_limit: Optional[int] = None,
         temp_dir: Optional[str] = None,
         memory_pool_type: Literal["greedy", "fair"] = "fair",
+        unspillable_reserve_ratio: Optional[float] = None,
     ):
-        self._impl = InternalContext(memory_limit, temp_dir, memory_pool_type)
+        self._impl = InternalContext(
+            memory_limit, temp_dir, memory_pool_type, unspillable_reserve_ratio
+        )
         self.options = Options()
 
     def create_data_frame(self, obj: Any, schema: Any = None) -> DataFrame:
@@ -282,6 +285,7 @@ def connect(
     memory_limit: Optional[int] = None,
     temp_dir: Optional[str] = None,
     memory_pool_type: Literal["greedy", "fair"] = "fair",
+    unspillable_reserve_ratio: Optional[float] = None,
 ) -> SedonaContext:
     """Create a new [SedonaContext][sedonadb.context.SedonaContext]
 
@@ -289,9 +293,13 @@ def connect(
         memory_limit: The maximum amount of memory to use for execution, in bytes.
         temp_dir: The directory to use for temporary files.
         memory_pool_type: The type of memory pool to use. Can be "greedy" or "fair".
+        unspillable_reserve_ratio: The fraction of memory reserved for unspillable consumers (0.0 - 1.0).
     """
     return SedonaContext(
-        memory_limit=memory_limit, temp_dir=temp_dir, memory_pool_type=memory_pool_type
+        memory_limit=memory_limit,
+        temp_dir=temp_dir,
+        memory_pool_type=memory_pool_type,
+        unspillable_reserve_ratio=unspillable_reserve_ratio,
     )
 
 

@@ -16,7 +16,7 @@
 // under the License.
 use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf, sync::Arc};
 
-use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool, MemoryPool};
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::{
     disk_manager::{DiskManagerBuilder, DiskManagerMode},
@@ -25,6 +25,7 @@ use datafusion::execution::{
 use datafusion_expr::ScalarUDFImpl;
 use pyo3::prelude::*;
 use sedona::context::SedonaContext;
+use sedona::memory_pool::{SedonaFairSpillPool, DEFAULT_UNSPILLABLE_RESERVE_RATIO};
 use tokio::runtime::Runtime;
 
 use crate::{
@@ -45,12 +46,13 @@ pub struct InternalContext {
 #[pymethods]
 impl InternalContext {
     #[new]
-    #[pyo3(signature = (memory_limit=None, temp_dir=None, memory_pool_type=None))]
+    #[pyo3(signature = (memory_limit=None, temp_dir=None, memory_pool_type=None, unspillable_reserve_ratio=None))]
     fn new(
         py: Python,
         memory_limit: Option<usize>,
         temp_dir: Option<String>,
         memory_pool_type: Option<String>,
+        unspillable_reserve_ratio: Option<f64>,
     ) -> Result<Self, PySedonaError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -64,7 +66,9 @@ impl InternalContext {
             let pool_type = memory_pool_type.as_deref().unwrap_or("fair");
             let pool: Arc<dyn MemoryPool> = match pool_type {
                 "fair" => {
-                    let pool = FairSpillPool::new(memory_limit);
+                    let unspillable_reserve =
+                        unspillable_reserve_ratio.unwrap_or(DEFAULT_UNSPILLABLE_RESERVE_RATIO);
+                    let pool = SedonaFairSpillPool::new(memory_limit, unspillable_reserve);
                     Arc::new(TrackConsumersPool::new(
                         pool,
                         NonZeroUsize::new(10).unwrap(),
