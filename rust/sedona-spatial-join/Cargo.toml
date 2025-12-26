@@ -98,3 +98,8 @@ harness = false
 name = "stream_repartitioner"
 path = "bench/partitioning/stream_repartitioner.rs"
 harness = false
+
+[[bench]]
+name = "rsgrove"
+path = "bench/partitioning/rsgrove.rs"
+harness = false
