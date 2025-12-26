@@ -34,6 +34,7 @@ use sedona_schema::datatypes::WKB_GEOMETRY;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::evaluated_batch::evaluated_batch_stream::evaluate::create_evaluated_probe_stream;
 use crate::evaluated_batch::evaluated_batch_stream::SendableEvaluatedBatchStream;
@@ -540,6 +541,9 @@ impl SpatialJoinStream {
 
         let result = match batch_opt {
             Some(batch) => {
+                self.join_metrics.output_batches.add(1);
+                self.join_metrics.output_rows.add(batch.num_rows());
+
                 // Check if iterator is complete
                 if is_complete {
                     self.state = SpatialJoinStreamState::FetchProbeBatch(partition_desc);
@@ -745,6 +749,7 @@ impl SpatialJoinStream {
         };
 
         SpatialJoinBatchIterator::new(SpatialJoinBatchIteratorParams {
+            partition_id: self.probe_partition_id,
             schema: self.schema.clone(),
             filter: self.filter.clone(),
             join_type: self.join_type,
@@ -792,6 +797,8 @@ struct PartialBuildBatch {
 
 /// Iterator that processes spatial join results in configurable batch sizes
 pub(crate) struct SpatialJoinBatchIterator {
+    /// Probe side Partition ID
+    partition_id: usize,
     /// Schema of the output record batches
     schema: SchemaRef,
     /// Optional join filter to be applied to the join results
@@ -923,6 +930,7 @@ impl ProbeProgress {
 
 /// Parameters for creating a SpatialJoinBatchIterator
 pub(crate) struct SpatialJoinBatchIteratorParams {
+    pub partition_id: usize,
     pub schema: SchemaRef,
     pub filter: Option<JoinFilter>,
     pub join_type: JoinType,
@@ -943,6 +951,7 @@ pub(crate) struct SpatialJoinBatchIteratorParams {
 impl SpatialJoinBatchIterator {
     pub(crate) fn new(params: SpatialJoinBatchIteratorParams) -> Result<Self> {
         Ok(Self {
+            partition_id: params.partition_id,
             schema: params.schema,
             filter: params.filter,
             join_type: params.join_type,
@@ -1006,8 +1015,6 @@ impl SpatialJoinBatchIterator {
             };
 
             if let Some(batch) = joined_batch_opt {
-                self.join_metrics.output_batches.add(1);
-                self.join_metrics.output_rows.add(batch.num_rows());
                 return Ok(Some(batch));
             }
         }
@@ -1021,9 +1028,18 @@ impl SpatialJoinBatchIterator {
         let rects = &geom_array.rects;
         let distance = &geom_array.distance;
 
+        let probe_idx_before = progress.current_probe_idx;
+        let pending_results_before = progress.probe_indices.len();
+        let mut total_candidates = 0;
+
+        let start_time = Instant::now();
+        let mut most_time_consuming_duration = std::time::Duration::ZERO;
+
         // Process from current position until we hit batch size limit or complete
         let num_rows = wkbs.len();
         while progress.current_probe_idx < num_rows {
+            let probe_start_time = Instant::now();
+
             // Get WKB for current probe index
             let wkb_opt = &wkbs[progress.current_probe_idx];
 
@@ -1065,6 +1081,7 @@ impl SpatialJoinBatchIterator {
                     self.join_metrics
                         .join_result_count
                         .add(join_result_metrics.count);
+                    total_candidates += join_result_metrics.candidate_count;
                 }
                 _ => {
                     // Regular spatial join: process all rects for this probe index
@@ -1088,8 +1105,15 @@ impl SpatialJoinBatchIterator {
                         self.join_metrics
                             .join_result_count
                             .add(join_result_metrics.count);
+                        total_candidates += join_result_metrics.candidate_count;
                     }
                 }
+            }
+
+            let probe_end_time = Instant::now();
+            let probe_duration = probe_end_time.duration_since(probe_start_time);
+            if probe_duration > most_time_consuming_duration {
+                most_time_consuming_duration = probe_duration;
             }
 
             assert!(
@@ -1103,6 +1127,23 @@ impl SpatialJoinBatchIterator {
                 break;
             }
         }
+
+        let end_time = Instant::now();
+        let duration = end_time.duration_since(start_time);
+        let probe_idx_after = progress.current_probe_idx;
+        let pending_results_after = progress.probe_indices.len();
+        let num_probed_rows = probe_idx_after - probe_idx_before;
+        let num_new_results = pending_results_after - pending_results_before;
+
+        log::info!(
+            "[Partition {}] ###SpatialJoinBatchIterator### Probed {} rows, produced {} pre-filtered results from {} candidates in {:?}, Most time consuming probe: {:?}",
+            self.partition_id,
+            num_probed_rows,
+            num_new_results,
+            total_candidates,
+            duration,
+            most_time_consuming_duration,
+        );
 
         Ok(())
     }
