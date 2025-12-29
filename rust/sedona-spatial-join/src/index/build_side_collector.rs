@@ -196,7 +196,8 @@ impl BuildSideBatchesCollector {
                     in_mem_batches.push(build_side_batch);
                     if let Err(e) = reservation.try_grow(in_mem_size) {
                         log::info!(
-                            "Failed to grow reservation by {} bytes. Current reservation: {} bytes. num rows: {}, reason: {:?}, Spilling...",
+                            "Failed to grow reservation by {} bytes. Current reservation: {} bytes. \
+                            num rows: {}, reason: {:?}, Spilling...",
                             in_mem_size,
                             reservation.size(),
                             num_rows,
@@ -221,7 +222,16 @@ impl BuildSideBatchesCollector {
 
         // Try to grow the reservation a bit more to account for any underestimation of
         // memory usage. We proceed even when the growth fails.
-        let _ = reservation.try_grow(extra_mem + (extra_mem + reservation.size()) / 5);
+        let additional_reservation = extra_mem + (extra_mem + reservation.size()) / 5;
+        if let Err(e) = reservation.try_grow(additional_reservation) {
+            log::info!(
+                "Failed to grow reservation by {} bytes to account for spatial index building memory usage. \
+                Current reservation: {} bytes. reason: {:?}",
+                additional_reservation,
+                reservation.size(),
+                e,
+            );
+        }
 
         // If force spill is enabled, flush everything to disk regardless of whether the memory
         // is enough or not.

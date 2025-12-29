@@ -104,18 +104,18 @@ impl MemoryPool for SedonaFairSpillPool {
     fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
         let mut state = self.state.lock();
 
+        // Calculate the amount of memory reserved for unspillable consumers
+        let reserved_for_unspillable =
+            (self.pool_size as f64 * self.unspillable_reserve_ratio) as usize;
+
+        // The effective unspillable usage is the max of actual usage and the reserved amount
+        let effective_unspillable = state.unspillable.max(reserved_for_unspillable);
+
+        // The total amount of memory available to spilling consumers
+        let spill_available = self.pool_size.saturating_sub(effective_unspillable);
+
         match reservation.consumer().can_spill() {
             true => {
-                // Calculate the amount of memory reserved for unspillable consumers
-                let reserved_for_unspillable =
-                    (self.pool_size as f64 * self.unspillable_reserve_ratio) as usize;
-
-                // The effective unspillable usage is the max of actual usage and the reserved amount
-                let effective_unspillable = state.unspillable.max(reserved_for_unspillable);
-
-                // The total amount of memory available to spilling consumers
-                let spill_available = self.pool_size.saturating_sub(effective_unspillable);
-
                 // No spiller may use more than their fraction of the memory available
                 let available = spill_available
                     .checked_div(state.num_spill)
@@ -126,6 +126,8 @@ impl MemoryPool for SedonaFairSpillPool {
                         reservation,
                         additional,
                         available,
+                        effective_unspillable,
+                        spill_available,
                     ));
                 }
                 state.spillable += additional;
@@ -140,6 +142,8 @@ impl MemoryPool for SedonaFairSpillPool {
                         reservation,
                         additional,
                         available,
+                        effective_unspillable,
+                        spill_available,
                     ));
                 }
                 state.unspillable += additional;
@@ -162,13 +166,18 @@ fn insufficient_capacity_err(
     reservation: &MemoryReservation,
     additional: usize,
     available: usize,
+    unspillable: usize,
+    spill_available: usize,
 ) -> DataFusionError {
     resources_datafusion_err!(
-        "Failed to allocate additional {} bytes for {} with {} bytes already allocated - maximum available is {} bytes",
+        "Failed to allocate additional {} bytes for {} with {} bytes already allocated - maximum available is {} bytes. \
+        Current unspillable memory usage: {} bytes, spillable memory available: {} bytes",
         additional,
         reservation.consumer().name(),
         reservation.size(),
-        available
+        available,
+        unspillable,
+        spill_available
     )
 }
 

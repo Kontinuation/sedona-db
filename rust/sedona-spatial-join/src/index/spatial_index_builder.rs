@@ -276,8 +276,9 @@ impl SpatialIndexBuilder {
             &self.spatial_predicate,
             self.options.clone(),
             num_geoms,
-            self.stats,
+            self.stats.clone(),
         );
+        self.memory_used += refiner.estimate_max_memory_usage(&self.stats);
 
         let cache_size = batch_pos_vec.len();
         let knn_components_opt = {
