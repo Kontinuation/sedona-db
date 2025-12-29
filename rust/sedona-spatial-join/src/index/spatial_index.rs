@@ -21,6 +21,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Instant,
 };
 
 use arrow_array::RecordBatch;
@@ -449,10 +450,12 @@ impl SpatialIndex {
 
             let min = probe_rect.min();
             let max = probe_rect.max();
+            let start = Instant::now();
             let mut candidates = self.rtree.search(min.x, min.y, max.x, max.y);
             if candidates.is_empty() {
                 continue;
             }
+            let rtree_search_duration = start.elapsed();
 
             let Some(probe_wkb) = evaluated_batch.wkb(row_idx) else {
                 return sedona_internal_err!(
@@ -482,6 +485,7 @@ impl SpatialIndex {
                 total_candidates_count += metrics.candidate_count;
             } else {
                 // For large candidate sets, spawn several tasks to parallelize refinement
+                let start = Instant::now();
                 let mut join_set = JoinSet::new();
                 for (i, chunk) in candidates.chunks(refine_chunk_size).enumerate() {
                     let cloned_evaluated_batch = Arc::clone(evaluated_batch);
@@ -524,6 +528,16 @@ impl SpatialIndex {
                     build_batch_positions.extend(positions);
                 }
                 probe_indices.extend(std::iter::repeat_n(row_idx as u32, total_matches_for_probe));
+
+                let refine_duration = start.elapsed();
+                log::info!(
+                    "Refined {} candidates for probe row {} resulted in {} matches. (Refine: {:?}, R-tree search: {:?})",
+                    candidates.len(),
+                    row_idx,
+                    total_matches_for_probe,
+                    refine_duration,
+                    rtree_search_duration
+                );
             }
 
             if total_count >= max_result_size {
