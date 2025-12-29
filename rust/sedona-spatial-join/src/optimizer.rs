@@ -237,11 +237,13 @@ impl SpatialJoinOptimizer {
     fn try_optimize_join(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
         // Check if this is a NestedLoopJoinExec that we can convert to spatial join
         if let Some(nested_loop_join) = plan.as_any().downcast_ref::<NestedLoopJoinExec>() {
-            if let Some(spatial_join) = self.try_convert_to_spatial_join(nested_loop_join)? {
+            if let Some(spatial_join) =
+                self.try_convert_to_spatial_join(nested_loop_join, config)?
+            {
                 return Ok(Transformed::yes(spatial_join));
             }
         }
@@ -263,6 +265,7 @@ impl SpatialJoinOptimizer {
     fn try_convert_to_spatial_join(
         &self,
         nested_loop_join: &NestedLoopJoinExec,
+        config: &ConfigOptions,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         if let Some(join_filter) = nested_loop_join.filter() {
             if let Some((spatial_predicate, remainder)) = transform_join_filter(join_filter) {
@@ -294,11 +297,21 @@ impl SpatialJoinOptimizer {
                     return Ok(None);
                 }
 
-                let num_right_partition = right.output_partitioning().partition_count();
-                let right = Arc::new(RepartitionExec::try_new(
-                    right,
-                    datafusion_physical_expr::Partitioning::RoundRobinBatch(num_right_partition),
-                )?);
+                // Repartition the probe side when `sedona.spatial_join.repartition_probe_side` is enabled
+                let repartition_probe_side = config
+                    .extensions
+                    .get::<SedonaOptions>()
+                    .map_or(false, |ext| ext.spatial_join.repartition_probe_side);
+
+                let right = if repartition_probe_side {
+                    let num_partitions = right.output_partitioning().partition_count();
+                    Arc::new(RepartitionExec::try_new(
+                        right,
+                        datafusion_physical_expr::Partitioning::RoundRobinBatch(num_partitions),
+                    )?)
+                } else {
+                    right
+                };
 
                 // Create the spatial join
                 let spatial_join = SpatialJoinExec::try_new(
