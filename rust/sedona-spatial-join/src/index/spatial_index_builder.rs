@@ -304,6 +304,7 @@ impl SpatialIndexBuilder {
         );
         Ok(SpatialIndex {
             schema: self.schema,
+            options: self.options,
             evaluator,
             refiner,
             rtree,

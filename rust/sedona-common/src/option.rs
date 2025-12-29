@@ -94,6 +94,9 @@ config_namespace! {
         /// spill files. Specify 0 for unlimited size.
         pub spilled_batch_in_memory_size_threshold: usize, default = 0
 
+        /// The chunk size for parallel refinement in spatial join.
+        pub parallel_refinement_chunk_size: usize, default = 8192
+
         /// Options for debugging or testing spatial join
         pub debug : SpatialJoinDebugOptions, default = SpatialJoinDebugOptions::default()
     }

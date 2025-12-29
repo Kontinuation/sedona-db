@@ -39,7 +39,7 @@ use crate::evaluated_batch::evaluated_batch_stream::evaluate::create_evaluated_p
 use crate::evaluated_batch::evaluated_batch_stream::SendableEvaluatedBatchStream;
 use crate::evaluated_batch::EvaluatedBatch;
 use crate::index::{partitioned_index_provider::PartitionedIndexProvider, SpatialIndex};
-use crate::operand_evaluator::{create_operand_evaluator, distance_value_at};
+use crate::operand_evaluator::create_operand_evaluator;
 use crate::partitioning::SpatialPartition;
 use crate::prepare::SpatialJoinComponents;
 use crate::probe::partitioned_stream_provider::PartitionedProbeStreamProvider;
@@ -207,7 +207,10 @@ pub(crate) enum SpatialJoinStreamState {
     /// fetching probe-side
     FetchProbeBatch(PartitionDescriptor),
     /// Indicates that we're processing a probe batch using the batch iterator
-    ProcessProbeBatch(PartitionDescriptor, SpatialJoinBatchIterator),
+    ProcessProbeBatch(
+        PartitionDescriptor,
+        BoxFuture<'static, (Box<SpatialJoinBatchIterator>, Result<Option<RecordBatch>>)>,
+    ),
     /// Indicates that we have exhausted the current probe stream, move to the Multi partition
     /// or prepare for emitting unmatched build batch
     ExhaustedProbeStream(PartitionDescriptor),
@@ -236,11 +239,9 @@ impl std::fmt::Debug for SpatialJoinStreamState {
                 .field(build)
                 .finish(),
             Self::FetchProbeBatch(desc) => f.debug_tuple("FetchProbeBatch").field(desc).finish(),
-            Self::ProcessProbeBatch(desc, iter) => f
-                .debug_tuple("ProcessProbeBatch")
-                .field(desc)
-                .field(iter)
-                .finish(),
+            Self::ProcessProbeBatch(desc, _) => {
+                f.debug_tuple("ProcessProbeBatch").field(desc).finish()
+            }
             Self::ExhaustedProbeStream(desc) => {
                 f.debug_tuple("ExhaustedProbeStream").field(desc).finish()
             }
@@ -306,7 +307,7 @@ impl SpatialJoinStream {
                     handle_state!(ready!(self.fetch_probe_batch(*desc, cx)))
                 }
                 SpatialJoinStreamState::ProcessProbeBatch(_, _) => {
-                    handle_state!(ready!(self.process_probe_batch()))
+                    handle_state!(ready!(self.process_probe_batch(cx)))
                 }
                 SpatialJoinStreamState::ExhaustedProbeStream(desc) => {
                     self.probe_evaluated_stream = None;
@@ -501,10 +502,15 @@ impl SpatialJoinStream {
             Poll::Ready(Some(Ok(batch))) => {
                 let num_rows = batch.num_rows();
                 match self.create_spatial_join_iterator(partition_desc, batch, self.probe_offset) {
-                    Ok(iterator) => {
+                    Ok(mut iterator) => {
                         self.probe_offset += num_rows;
+                        let future = async move {
+                            let result = iterator.next_batch().await;
+                            (iterator, result)
+                        }
+                        .boxed();
                         self.state =
-                            SpatialJoinStreamState::ProcessProbeBatch(partition_desc, iterator);
+                            SpatialJoinStreamState::ProcessProbeBatch(partition_desc, future);
                         Poll::Ready(Ok(StatefulStreamResult::Continue))
                     }
                     Err(e) => Poll::Ready(Err(e)),
@@ -519,20 +525,28 @@ impl SpatialJoinStream {
         }
     }
 
-    fn process_probe_batch(&mut self) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+    fn process_probe_batch(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
         // Extract the necessary data first to avoid borrowing conflicts
-        let (partition_desc, batch_opt, is_complete) = {
+        let (partition_desc, mut iterator, batch_opt, is_complete) = {
             let _timer = self.join_metrics.join_time.timer();
             match &mut self.state {
-                SpatialJoinStreamState::ProcessProbeBatch(desc, iterator) => {
-                    let batch_opt = match iterator.next_batch() {
-                        Ok(opt) => opt,
-                        Err(e) => {
-                            return Poll::Ready(Err(e));
+                SpatialJoinStreamState::ProcessProbeBatch(desc, future) => {
+                    match future.poll_unpin(cx) {
+                        Poll::Ready((iterator, result)) => {
+                            let batch_opt = match result {
+                                Ok(opt) => opt,
+                                Err(e) => {
+                                    return Poll::Ready(Err(e));
+                                }
+                            };
+                            let is_complete = iterator.is_complete();
+                            (*desc, iterator, batch_opt, is_complete)
                         }
-                    };
-                    let is_complete = iterator.is_complete();
-                    (*desc, batch_opt, is_complete)
+                        Poll::Pending => return Poll::Pending,
+                    }
                 }
                 _ => unreachable!(),
             }
@@ -546,6 +560,13 @@ impl SpatialJoinStream {
                 // Check if iterator is complete
                 if is_complete {
                     self.state = SpatialJoinStreamState::FetchProbeBatch(partition_desc);
+                } else {
+                    let future = async move {
+                        let result = iterator.next_batch().await;
+                        (iterator, result)
+                    }
+                    .boxed();
+                    self.state = SpatialJoinStreamState::ProcessProbeBatch(partition_desc, future);
                 }
                 batch
             }
@@ -708,7 +729,7 @@ impl SpatialJoinStream {
         partition_desc: PartitionDescriptor,
         probe_evaluated_batch: EvaluatedBatch,
         probe_offset: usize,
-    ) -> Result<SpatialJoinBatchIterator> {
+    ) -> Result<Box<SpatialJoinBatchIterator>> {
         // Get the spatial index
         let spatial_index = self
             .spatial_index
@@ -747,14 +768,13 @@ impl SpatialJoinStream {
             _ => JoinSide::Left,
         };
 
-        SpatialJoinBatchIterator::new(SpatialJoinBatchIteratorParams {
+        let iterator = SpatialJoinBatchIterator::new(SpatialJoinBatchIteratorParams {
             schema: self.schema.clone(),
             filter: self.filter.clone(),
             join_type: self.join_type,
             column_indices: self.column_indices.clone(),
             build_side,
             spatial_index: spatial_index.clone(),
-            probe_evaluated_batch,
             join_metrics: self.join_metrics.clone(),
             max_batch_size: self.target_output_batch_size,
             probe_side_ordered: self.probe_side_ordered,
@@ -763,7 +783,9 @@ impl SpatialJoinStream {
             visited_probe_side,
             probe_offset,
             produce_unmatched_probe_rows: is_last_build_partition,
-        })
+            probe_evaluated_batch: Arc::new(probe_evaluated_batch),
+        })?;
+        Ok(Box::new(iterator))
     }
 }
 
@@ -808,7 +830,7 @@ pub(crate) struct SpatialJoinBatchIterator {
     /// The spatial index reference
     spatial_index: Arc<SpatialIndex>,
     /// The probe side batch being processed
-    probe_evaluated_batch: EvaluatedBatch,
+    probe_evaluated_batch: Arc<EvaluatedBatch>,
     /// Join metrics for tracking performance
     join_metrics: SpatialJoinProbeMetrics,
     /// Maximum batch size before yielding a result
@@ -932,7 +954,7 @@ pub(crate) struct SpatialJoinBatchIteratorParams {
     pub column_indices: Vec<ColumnIndex>,
     pub build_side: JoinSide,
     pub spatial_index: Arc<SpatialIndex>,
-    pub probe_evaluated_batch: EvaluatedBatch,
+    pub probe_evaluated_batch: Arc<EvaluatedBatch>,
     pub join_metrics: SpatialJoinProbeMetrics,
     pub max_batch_size: usize,
     pub probe_side_ordered: bool,
@@ -971,15 +993,15 @@ impl SpatialJoinBatchIterator {
         })
     }
 
-    pub fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         let progress_opt = std::mem::take(&mut self.progress);
         let mut progress = progress_opt.expect("Progress should be available");
-        let res = self.next_batch_inner(&mut progress);
+        let res = self.next_batch_inner(&mut progress).await;
         self.progress = Some(progress);
         res
     }
 
-    fn next_batch_inner(&self, progress: &mut ProbeProgress) -> Result<Option<RecordBatch>> {
+    async fn next_batch_inner(&self, progress: &mut ProbeProgress) -> Result<Option<RecordBatch>> {
         let num_rows = self.probe_evaluated_batch.num_rows();
         loop {
             // Check if we have produced results for the entire probe batch
@@ -991,7 +1013,10 @@ impl SpatialJoinBatchIterator {
             if progress.current_probe_idx < num_rows
                 && progress.probe_indices.len() < self.max_batch_size
             {
-                self.probe(progress)?;
+                match &self.spatial_predicate {
+                    SpatialPredicate::KNearestNeighbors(_) => self.probe_knn(progress)?,
+                    _ => self.probe_range(progress).await?,
+                }
             }
 
             // Produce result batch from accumulated results
@@ -1014,13 +1039,46 @@ impl SpatialJoinBatchIterator {
         }
     }
 
+    async fn probe_range(&self, progress: &mut ProbeProgress) -> Result<()> {
+        let num_rows = self.probe_evaluated_batch.num_rows();
+        let range = progress.current_probe_idx..num_rows;
+
+        // Calculate remaining capacity in the progress buffer to respect max_batch_size
+        let max_result_size = self
+            .max_batch_size
+            .saturating_sub(progress.probe_indices.len());
+
+        let (metrics, next_row_idx) = self
+            .spatial_index
+            .query_batch(
+                &self.probe_evaluated_batch,
+                range,
+                max_result_size,
+                &mut progress.build_batch_positions,
+                &mut progress.probe_indices,
+            )
+            .await?;
+
+        progress.current_probe_idx = next_row_idx;
+
+        self.join_metrics
+            .join_result_candidates
+            .add(metrics.candidate_count);
+        self.join_metrics.join_result_count.add(metrics.count);
+
+        assert!(
+            progress.probe_indices.len() == progress.build_batch_positions.len(),
+            "Probe indices and build batch positions length should match"
+        );
+
+        Ok(())
+    }
+
     /// Process more probe rows and fill in the build_batch_positions and probe_indices
     /// until we have filled in enough results or processed all probe rows.
-    fn probe(&self, progress: &mut ProbeProgress) -> Result<()> {
+    fn probe_knn(&self, progress: &mut ProbeProgress) -> Result<()> {
         let geom_array = &self.probe_evaluated_batch.geom_array;
         let wkbs = geom_array.wkbs();
-        let rects = &geom_array.rects;
-        let distance = &geom_array.distance;
 
         // Process from current position until we hit batch size limit or complete
         let num_rows = wkbs.len();
@@ -1034,63 +1092,34 @@ impl SpatialJoinBatchIterator {
                 continue;
             };
 
-            let dist = match distance {
-                Some(dist) => distance_value_at(dist, progress.current_probe_idx)?,
-                None => None,
-            };
-
             // Handle KNN queries differently from regular spatial joins
-            match &self.spatial_predicate {
-                SpatialPredicate::KNearestNeighbors(knn_predicate) => {
-                    // For KNN, call query_knn only once per probe geometry (not per rect)
-                    let k = knn_predicate.k;
-                    let use_spheroid = knn_predicate.use_spheroid;
-                    let include_tie_breakers = self.options.knn_include_tie_breakers;
+            if let SpatialPredicate::KNearestNeighbors(knn_predicate) = &self.spatial_predicate {
+                // For KNN, call query_knn only once per probe geometry (not per rect)
+                let k = knn_predicate.k;
+                let use_spheroid = knn_predicate.use_spheroid;
+                let include_tie_breakers = self.options.knn_include_tie_breakers;
 
-                    let join_result_metrics = self.spatial_index.query_knn(
-                        wkb,
-                        k,
-                        use_spheroid,
-                        include_tie_breakers,
-                        &mut progress.build_batch_positions,
-                    )?;
+                let join_result_metrics = self.spatial_index.query_knn(
+                    wkb,
+                    k,
+                    use_spheroid,
+                    include_tie_breakers,
+                    &mut progress.build_batch_positions,
+                )?;
 
-                    progress.probe_indices.extend(std::iter::repeat_n(
-                        progress.current_probe_idx as u32,
-                        join_result_metrics.count,
-                    ));
+                progress.probe_indices.extend(std::iter::repeat_n(
+                    progress.current_probe_idx as u32,
+                    join_result_metrics.count,
+                ));
 
-                    self.join_metrics
-                        .join_result_candidates
-                        .add(join_result_metrics.candidate_count);
-                    self.join_metrics
-                        .join_result_count
-                        .add(join_result_metrics.count);
-                }
-                _ => {
-                    // Regular spatial join: process all rects for this probe index
-                    let rect_opt = &rects[progress.current_probe_idx];
-                    if let Some(rect) = rect_opt {
-                        let join_result_metrics = self.spatial_index.query(
-                            wkb,
-                            rect,
-                            &dist,
-                            &mut progress.build_batch_positions,
-                        )?;
-
-                        progress.probe_indices.extend(std::iter::repeat_n(
-                            progress.current_probe_idx as u32,
-                            join_result_metrics.count,
-                        ));
-
-                        self.join_metrics
-                            .join_result_candidates
-                            .add(join_result_metrics.candidate_count);
-                        self.join_metrics
-                            .join_result_count
-                            .add(join_result_metrics.count);
-                    }
-                }
+                self.join_metrics
+                    .join_result_candidates
+                    .add(join_result_metrics.candidate_count);
+                self.join_metrics
+                    .join_result_count
+                    .add(join_result_metrics.count);
+            } else {
+                unreachable!("probe_knn called for non-KNN predicate");
             }
 
             assert!(
