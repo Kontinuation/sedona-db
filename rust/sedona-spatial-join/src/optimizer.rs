@@ -301,7 +301,7 @@ impl SpatialJoinOptimizer {
                 let repartition_probe_side = config
                     .extensions
                     .get::<SedonaOptions>()
-                    .map_or(false, |ext| ext.spatial_join.repartition_probe_side);
+                    .is_some_and(|ext| ext.spatial_join.repartition_probe_side);
 
                 let right = if repartition_probe_side {
                     let num_partitions = right.output_partitioning().partition_count();

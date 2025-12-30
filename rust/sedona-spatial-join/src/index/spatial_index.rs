@@ -485,7 +485,6 @@ impl SpatialIndex {
                 let mut join_set = JoinSet::new();
                 for (i, chunk) in candidates.chunks(refine_chunk_size).enumerate() {
                     let cloned_evaluated_batch = Arc::clone(evaluated_batch);
-                    let distance = distance.clone();
                     let chunk = chunk.to_vec();
                     let index_ref = self.clone();
                     let mut local_positions: Vec<(i32, i32)> = Vec::with_capacity(chunk.len());
@@ -500,7 +499,7 @@ impl SpatialIndex {
                             );
                         };
                         let res =
-                            index_ref.refine(&probe_wkb, &chunk, &distance, &mut local_positions);
+                            index_ref.refine(probe_wkb, &chunk, &distance, &mut local_positions);
                         (i, res.map(|r| (r, local_positions)))
                     });
                 }
@@ -532,13 +531,13 @@ impl SpatialIndex {
         }
 
         let end_idx = current_row_idx + 1;
-        return Ok((
+        Ok((
             QueryResultMetrics {
                 count: total_count,
                 candidate_count: total_candidates_count,
             },
             end_idx,
-        ));
+        ))
     }
 
     fn refine(

@@ -871,13 +871,16 @@ struct ProbeProgress {
     pos: usize,
 }
 
+/// Type alias for a tuple of build and probe indices slices
+type BuildAndProbeIndices<'a> = (&'a [(i32, i32)], &'a [u32]);
+
 impl ProbeProgress {
     fn indices_for_next_batch(
         &mut self,
         build_side: JoinSide,
         join_type: JoinType,
         max_batch_size: usize,
-    ) -> Option<(&[(i32, i32)], &[u32])> {
+    ) -> Option<BuildAndProbeIndices<'_>> {
         let end = self.probe_indices.len();
 
         // Advance the produced probe end index to skip already hit probe side rows
@@ -886,13 +889,16 @@ impl ProbeProgress {
         // and we don't want to produce duplicate unmatched probe rows when the same
         // probe row P has multiple matches and we splitted probe_indices range into
         // multiple pieces containing P.
-        let should_skip_lastly_produced_probe_rows = match (build_side, join_type) {
-            (JoinSide::Left, JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark) => {
-                true
-            }
-            (JoinSide::Right, JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark) => true,
-            _ => false,
-        };
+        let should_skip_lastly_produced_probe_rows = matches!(
+            (build_side, join_type),
+            (
+                JoinSide::Left,
+                JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark
+            ) | (
+                JoinSide::Right,
+                JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark
+            )
+        );
         if should_skip_lastly_produced_probe_rows {
             while self.pos < end
                 && self.probe_indices[self.pos] as i64 == self.last_produced_probe_idx

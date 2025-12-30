@@ -23,17 +23,23 @@ use parking_lot::Mutex;
 
 pub const DEFAULT_UNSPILLABLE_RESERVE_RATIO: f64 = 0.2;
 
-/// A [`MemoryPool`] that prevents spillable reservations from using more than
-/// an even fraction of the available memory sans any unspillable reservations
-/// (i.e. `(pool_size - unspillable_memory) / num_spillable_reservations`)
+/// A [`MemoryPool`] implementation similar to DataFusion's [`datafusion::execution::memory_pool::FairSpillPool`],
+/// but with the following changes:
 ///
-/// This pool works best when you know beforehand the query has
-/// multiple spillable operators that will likely all need to
-/// spill. Sometimes it will cause spills even when there was
-/// sufficient memory (reserved for other operators) to avoid doing
-/// so.
+/// It implements a reservation mechanism for unspillable memory consumers. This addresses an issue
+/// where spillable consumers could potentially exhaust all available memory, preventing unspillable
+/// operations from acquiring necessary resources. This behavior is tracked in DataFusion issue
+/// https://github.com/apache/datafusion/issues/17334. In the context of Sedona, a typical example
+/// is a [`sedona_spatial_join::exec::SpatialJoinExec`] operator with an auto inserted
+/// [`datafusion::physical_plan::repartition::RepartitionExec`] for the probe side. The Merge
+/// consumer of [`datafusion::physical_plan::repartition::RepartitionExec`] is unspillable, while
+/// the [`sedona_spatial_join::exec::SpatialJoinExec`] is spillable.
+/// [`sedona_spatial_join::exec::SpatialJoinExec`] could consume all memory, resulting a reservation
+/// failure of [`datafusion::physical_plan::repartition::RepartitionExec`].
 ///
-/// Unspillable memory is allocated in a first-come, first-serve fashion
+/// By reserving a configurable fraction of the total memory pool specifically for unspillable
+/// allocations (defined by `unspillable_reserve_ratio`), this pool ensures that critical
+/// non-spillable operations can proceed even under heavy memory pressure from spillable operators.
 #[derive(Debug)]
 pub struct SedonaFairSpillPool {
     /// The total memory limit

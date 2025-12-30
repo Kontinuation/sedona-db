@@ -130,8 +130,8 @@ impl SpillWriter {
             if threshold > 0 {
                 let batch_size = get_record_batch_memory_size(batch)?;
                 if batch_size > threshold {
-                    let num_splits = (batch_size + threshold - 1) / threshold;
-                    let rows = (num_rows + num_splits - 1) / num_splits;
+                    let num_splits = batch_size.div_ceil(threshold);
+                    let rows = num_rows.div_ceil(num_splits);
                     return Ok(std::cmp::max(1, rows));
                 }
             }
