@@ -15,15 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 use arrow::array::BooleanBufferBuilder;
-use arrow::compute::interleave_record_batch;
+use arrow::compute::{
+    concat_batches, interleave_record_batch, lexsort_to_indices, SortColumn, SortOptions,
+};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::StreamWriter;
 use arrow_array::{UInt32Array, UInt64Array};
 use datafusion_common::{JoinSide, Result};
+use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_expr::JoinType;
 use datafusion_physical_plan::joins::utils::StatefulStreamResult;
 use datafusion_physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion_physical_plan::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder};
-use datafusion_physical_plan::{handle_state, RecordBatchStream, SendableRecordBatchStream};
+use datafusion_physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use futures::future::BoxFuture;
 use futures::stream::StreamExt;
 use futures::{ready, task::Poll, FutureExt};
@@ -32,6 +38,8 @@ use sedona_common::sedona_internal_err;
 use sedona_functions::st_analyze_agg::AnalyzeAccumulator;
 use sedona_schema::datatypes::WKB_GEOMETRY;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufReader;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -52,7 +60,7 @@ use crate::utils::join_utils::{
 };
 use crate::utils::once_fut::{OnceAsync, OnceFut};
 use arrow::array::RecordBatch;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use sedona_common::option::SpatialJoinOptions;
 
 /// Stream for producing spatial join result batches.
@@ -108,6 +116,28 @@ pub(crate) struct SpatialJoinStream {
     visited_multi_probe_side: Option<Arc<Mutex<BooleanBufferBuilder>>>,
     /// Current offset in the probe side partition
     probe_offset: usize,
+    /// Spill file for KNN intermediate results
+    knn_spill_file: Option<Arc<RefCountedTempFile>>,
+    /// Spill file for the next KNN intermediate results
+    knn_next_spill_file: Option<Arc<RefCountedTempFile>>,
+    /// Stream for reading previous KNN intermediate results
+    knn_prev_stream: Option<StreamReader<BufReader<File>>>,
+    /// Writer for current KNN intermediate results
+    knn_next_writer: Option<StreamWriter<File>>,
+    /// Accumulator for KNN results for the current probe batch
+    knn_current_probe_batch_results: Vec<(RecordBatch, Vec<u32>)>,
+    /// Schema for KNN spill files (includes probe_index)
+    knn_schema: Option<Arc<Schema>>,
+}
+
+fn add_probe_index_column(batch: &RecordBatch, indices: &[u32]) -> Result<RecordBatch> {
+    let probe_index_array = UInt32Array::from(indices.to_vec());
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(probe_index_array));
+    let mut fields = batch.schema().fields().to_vec();
+    fields.push(Arc::new(Field::new("probe_index", DataType::UInt32, false)));
+    let schema = Arc::new(Schema::new(fields));
+    Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 impl SpatialJoinStream {
@@ -131,6 +161,14 @@ impl SpatialJoinStream {
         let evaluator = create_operand_evaluator(on, options.clone());
         let probe_stream = create_evaluated_probe_stream(probe_stream, Arc::clone(&evaluator));
         let probe_stream_schema = probe_stream.schema();
+        let knn_schema = if matches!(on, SpatialPredicate::KNearestNeighbors(_)) {
+            let mut fields = schema.fields().to_vec();
+            fields.push(Arc::new(Field::new("probe_index", DataType::UInt32, false)));
+            Some(Arc::new(Schema::new(fields)))
+        } else {
+            None
+        };
+
         Self {
             probe_partition_id,
             schema,
@@ -156,6 +194,12 @@ impl SpatialJoinStream {
             spatial_predicate: on.clone(),
             visited_multi_probe_side: None,
             probe_offset: 0,
+            knn_spill_file: None,
+            knn_next_spill_file: None,
+            knn_prev_stream: None,
+            knn_next_writer: None,
+            knn_current_probe_batch_results: Vec::new(),
+            knn_schema,
         }
     }
 }
@@ -209,7 +253,13 @@ pub(crate) enum SpatialJoinStreamState {
     /// Indicates that we're processing a probe batch using the batch iterator
     ProcessProbeBatch(
         PartitionDescriptor,
-        BoxFuture<'static, (Box<SpatialJoinBatchIterator>, Result<Option<RecordBatch>>)>,
+        BoxFuture<
+            'static,
+            (
+                Box<SpatialJoinBatchIterator>,
+                Result<Option<(RecordBatch, Option<Vec<u32>>)>>,
+            ),
+        >,
     ),
     /// Indicates that we have exhausted the current probe stream, move to the Multi partition
     /// or prepare for emitting unmatched build batch
@@ -225,6 +275,8 @@ pub(crate) enum SpatialJoinStreamState {
     /// If we are the last one finishing processing the current partition, we can safely
     /// drop the current index and kick off the building of the index for the next partition.
     PrepareForNextPartition(u32, bool),
+    /// Yield final KNN results from spill file
+    YieldKnnResults(Option<StreamReader<BufReader<File>>>),
     /// Indicates that SpatialJoinStream execution is completed
     Completed,
 }
@@ -259,6 +311,7 @@ impl std::fmt::Debug for SpatialJoinStreamState {
                 .field(id)
                 .field(last)
                 .finish(),
+            Self::YieldKnnResults(_) => write!(f, "YieldKnnResults"),
             Self::Completed => write!(f, "Completed"),
         }
     }
@@ -292,22 +345,64 @@ impl SpatialJoinStream {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Result<RecordBatch>>> {
         loop {
-            return match &self.state {
+            let state = std::mem::replace(&mut self.state, SpatialJoinStreamState::Completed);
+            match state {
                 SpatialJoinStreamState::WaitPrepareSpatialJoinComponents => {
-                    handle_state!(ready!(self.wait_create_spatial_join_components(cx)))
+                    match self.wait_create_spatial_join_components(cx) {
+                        Poll::Ready(Ok(StatefulStreamResult::Ready(opt))) => match opt {
+                            Some(batch) => return Poll::Ready(Some(Ok(batch))),
+                            None => continue,
+                        },
+                        Poll::Ready(Ok(StatefulStreamResult::Continue)) => continue,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                        Poll::Pending => {
+                            self.state = SpatialJoinStreamState::WaitPrepareSpatialJoinComponents;
+                            return Poll::Pending;
+                        }
+                    }
                 }
                 SpatialJoinStreamState::WaitBuildIndex(partition_id, should_build) => {
-                    handle_state!(ready!(self.wait_build_index(
-                        *partition_id,
-                        *should_build,
-                        cx
-                    )))
+                    match self.wait_build_index(partition_id, should_build, cx) {
+                        Poll::Ready(Ok(StatefulStreamResult::Ready(opt))) => match opt {
+                            Some(batch) => return Poll::Ready(Some(Ok(batch))),
+                            None => continue,
+                        },
+                        Poll::Ready(Ok(StatefulStreamResult::Continue)) => continue,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                        Poll::Pending => {
+                            self.state =
+                                SpatialJoinStreamState::WaitBuildIndex(partition_id, should_build);
+                            return Poll::Pending;
+                        }
+                    }
                 }
                 SpatialJoinStreamState::FetchProbeBatch(desc) => {
-                    handle_state!(ready!(self.fetch_probe_batch(*desc, cx)))
+                    match self.fetch_probe_batch(desc, cx) {
+                        Poll::Ready(Ok(StatefulStreamResult::Ready(opt))) => match opt {
+                            Some(batch) => return Poll::Ready(Some(Ok(batch))),
+                            None => continue,
+                        },
+                        Poll::Ready(Ok(StatefulStreamResult::Continue)) => continue,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                        Poll::Pending => {
+                            self.state = SpatialJoinStreamState::FetchProbeBatch(desc);
+                            return Poll::Pending;
+                        }
+                    }
                 }
-                SpatialJoinStreamState::ProcessProbeBatch(_, _) => {
-                    handle_state!(ready!(self.process_probe_batch(cx)))
+                SpatialJoinStreamState::ProcessProbeBatch(desc, future) => {
+                    match self.process_probe_batch(cx, desc, future) {
+                        Poll::Ready(Ok(StatefulStreamResult::Ready(opt))) => match opt {
+                            Some(batch) => return Poll::Ready(Some(Ok(batch))),
+                            None => continue,
+                        },
+                        Poll::Ready(Ok(StatefulStreamResult::Continue)) => continue,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                        Poll::Pending => {
+                            // process_probe_batch restores state if pending
+                            return Poll::Pending;
+                        }
+                    }
                 }
                 SpatialJoinStreamState::ExhaustedProbeStream(desc) => {
                     self.probe_evaluated_stream = None;
@@ -316,7 +411,7 @@ impl SpatialJoinStream {
                             if self.num_regular_partitions == Some(1) {
                                 // Single-partition spatial join does not have to process the Multi partition.
                                 self.state =
-                                    SpatialJoinStreamState::PrepareUnmatchedBuildBatch(*desc);
+                                    SpatialJoinStreamState::PrepareUnmatchedBuildBatch(desc);
                             } else {
                                 log::info!(
                                     "[Partition {}] Start probing the Multi partition",
@@ -328,26 +423,83 @@ impl SpatialJoinStream {
                             }
                         }
                         SpatialPartition::Multi => {
-                            self.state = SpatialJoinStreamState::PrepareUnmatchedBuildBatch(*desc);
+                            self.state = SpatialJoinStreamState::PrepareUnmatchedBuildBatch(desc);
                         }
                         _ => unreachable!(),
                     }
                     continue;
                 }
                 SpatialJoinStreamState::PrepareUnmatchedBuildBatch(desc) => {
-                    handle_state!(ready!(self.setup_unmatched_build_batch_processing(*desc)))
+                    match self.setup_unmatched_build_batch_processing(desc) {
+                        Poll::Ready(Ok(StatefulStreamResult::Ready(opt))) => match opt {
+                            Some(batch) => return Poll::Ready(Some(Ok(batch))),
+                            None => continue,
+                        },
+                        Poll::Ready(Ok(StatefulStreamResult::Continue)) => continue,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                        Poll::Pending => {
+                            self.state = SpatialJoinStreamState::PrepareUnmatchedBuildBatch(desc);
+                            return Poll::Pending;
+                        }
+                    }
                 }
-                SpatialJoinStreamState::ProcessUnmatchedBuildBatch(_, _) => {
-                    handle_state!(ready!(self.process_unmatched_build_batch()))
+                SpatialJoinStreamState::ProcessUnmatchedBuildBatch(desc, iterator) => {
+                    self.state = SpatialJoinStreamState::ProcessUnmatchedBuildBatch(desc, iterator);
+                    match self.process_unmatched_build_batch() {
+                        Poll::Ready(Ok(StatefulStreamResult::Ready(opt))) => match opt {
+                            Some(batch) => return Poll::Ready(Some(Ok(batch))),
+                            None => continue,
+                        },
+                        Poll::Ready(Ok(StatefulStreamResult::Continue)) => continue,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                        Poll::Pending => return Poll::Pending,
+                    }
                 }
                 SpatialJoinStreamState::PrepareForNextPartition(partition_id, is_last_stream) => {
-                    handle_state!(ready!(
-                        self.prepare_for_next_partition(*partition_id, *is_last_stream)
-                    ))
+                    match self.prepare_for_next_partition(partition_id, is_last_stream) {
+                        Poll::Ready(Ok(StatefulStreamResult::Ready(opt))) => match opt {
+                            Some(batch) => return Poll::Ready(Some(Ok(batch))),
+                            None => continue,
+                        },
+                        Poll::Ready(Ok(StatefulStreamResult::Continue)) => continue,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
+                        Poll::Pending => {
+                            self.state = SpatialJoinStreamState::PrepareForNextPartition(
+                                partition_id,
+                                is_last_stream,
+                            );
+                            return Poll::Pending;
+                        }
+                    }
+                }
+                SpatialJoinStreamState::YieldKnnResults(mut stream_opt) => {
+                    if let Some(stream) = stream_opt.as_mut() {
+                        match stream.next() {
+                            Some(Ok(batch)) => {
+                                // Remove probe_index column
+                                let batch_without_index = batch
+                                    .project(&(0..batch.num_columns() - 1).collect::<Vec<_>>())?;
+                                self.state = SpatialJoinStreamState::YieldKnnResults(stream_opt);
+                                return Poll::Ready(Some(Ok(batch_without_index)));
+                            }
+                            Some(Err(e)) => {
+                                self.state = SpatialJoinStreamState::Completed;
+                                return Poll::Ready(Some(Err(e.into())));
+                            }
+                            None => {
+                                self.state = SpatialJoinStreamState::Completed;
+                                continue;
+                            }
+                        }
+                    } else {
+                        self.state = SpatialJoinStreamState::Completed;
+                        continue;
+                    }
                 }
                 SpatialJoinStreamState::Completed => {
                     log::info!("[Partition {}] Completed", self.probe_partition_id);
-                    Poll::Ready(None)
+                    self.state = SpatialJoinStreamState::Completed;
+                    return Poll::Ready(None);
                 }
             };
         }
@@ -440,6 +592,37 @@ impl SpatialJoinStream {
             Poll::Ready(Some(Ok(index))) => {
                 self.pending_index_future = None;
                 self.spatial_index = Some(index);
+
+                if matches!(
+                    self.spatial_predicate,
+                    SpatialPredicate::KNearestNeighbors(_)
+                ) {
+                    // Rotate spill files
+                    if let Some(mut writer) = self.knn_next_writer.take() {
+                        writer.finish()?;
+                    }
+                    self.knn_spill_file = self.knn_next_spill_file.take();
+
+                    if let Some(file) = &self.knn_spill_file {
+                        let reader = BufReader::new(File::open(file.path())?);
+                        let stream_reader = StreamReader::try_new(reader, None)?;
+                        self.knn_prev_stream = Some(stream_reader);
+                    } else {
+                        self.knn_prev_stream = None;
+                    }
+
+                    let spill_file = self.runtime_env.disk_manager.create_tmp_file("knn_spill")?;
+                    self.knn_next_spill_file = Some(Arc::new(spill_file));
+
+                    if self.knn_schema.is_none() {
+                        self.knn_schema = Some(Arc::new(self.get_knn_spill_schema()));
+                    }
+                    let schema = self.knn_schema.as_ref().unwrap().clone();
+                    let file = File::create(self.knn_next_spill_file.as_ref().unwrap().path())?;
+                    let writer = StreamWriter::try_new(file, &schema)?;
+                    self.knn_next_writer = Some(writer);
+                }
+
                 log::info!(
                     "[Partition {}] Start probing spatial partition {}",
                     self.probe_partition_id,
@@ -487,9 +670,40 @@ impl SpatialJoinStream {
                 }
             }
 
-            let evaluated_stream = probe_stream_provider.stream_for(partition_desc.partition)?;
+            let probe_partition = if matches!(
+                self.spatial_predicate,
+                SpatialPredicate::KNearestNeighbors(_)
+            ) && self.num_regular_partitions != Some(1)
+            {
+                SpatialPartition::Multi
+            } else {
+                partition_desc.partition
+            };
+
+            let evaluated_stream = probe_stream_provider.stream_for(probe_partition)?;
             self.probe_evaluated_stream = Some(evaluated_stream);
             self.probe_offset = 0;
+
+            if matches!(
+                self.spatial_predicate,
+                SpatialPredicate::KNearestNeighbors(_)
+            ) {
+                if let Some(file) = &self.knn_spill_file {
+                    let file = File::open(file.path())?;
+                    let reader = StreamReader::try_new(BufReader::new(file), None)?;
+                    self.knn_prev_stream = Some(reader);
+                }
+
+                let new_file = self.runtime_env.disk_manager.create_tmp_file("knn_spill")?;
+                let file = File::create(new_file.path())?;
+                let schema = self
+                    .knn_schema
+                    .as_ref()
+                    .expect("KNN schema should be initialized");
+                let writer = StreamWriter::try_new(file, schema)?;
+                self.knn_next_writer = Some(writer);
+                self.knn_next_spill_file = Some(Arc::new(new_file));
+            }
         }
 
         let probe_evaluated_stream = self
@@ -525,35 +739,192 @@ impl SpatialJoinStream {
         }
     }
 
+    fn get_knn_spill_schema(&self) -> Schema {
+        let mut fields = self.schema.fields().to_vec();
+        fields.push(Arc::new(Field::new("probe_index", DataType::UInt32, false)));
+        Schema::new(fields)
+    }
+
+    fn merge_knn_batches(
+        &self,
+        current_batch: Option<RecordBatch>,
+        prev_batch: Option<RecordBatch>,
+    ) -> Result<RecordBatch> {
+        let k = match &self.spatial_predicate {
+            SpatialPredicate::KNearestNeighbors(k) => k.k as usize,
+            _ => return sedona_internal_err!("Not a KNN join"),
+        };
+
+        let batches = vec![current_batch, prev_batch]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        if batches.is_empty() {
+            if let Some(schema) = &self.knn_schema {
+                return Ok(RecordBatch::new_empty(schema.clone()));
+            } else {
+                return sedona_internal_err!("KNN schema not initialized");
+            }
+        }
+
+        let merged = concat_batches(&batches[0].schema(), &batches)?;
+
+        // Sort by probe_index ASC, distance ASC
+        // We assume distance is the last column of the original schema.
+        // The merged schema has probe_index appended.
+        // So distance is at index `self.schema.fields().len() - 1`.
+        let distance_col_idx = self.schema.fields().len() - 1;
+        let probe_index_col_idx = merged.num_columns() - 1;
+
+        let sort_columns = vec![
+            SortColumn {
+                values: merged.column(probe_index_col_idx).clone(),
+                options: Some(SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+            },
+            SortColumn {
+                values: merged.column(distance_col_idx).clone(),
+                options: Some(SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+            },
+        ];
+
+        let indices = lexsort_to_indices(&sort_columns, None)?;
+
+        let probe_index_col = merged
+            .column(probe_index_col_idx)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+
+        let mut keep_indices = Vec::new();
+        let mut current_probe_idx = None;
+        let mut count = 0;
+
+        for &row_idx in indices.values() {
+            let row_idx = row_idx as usize;
+            let probe_idx = probe_index_col.value(row_idx);
+
+            if Some(probe_idx) != current_probe_idx {
+                current_probe_idx = Some(probe_idx);
+                count = 0;
+            }
+
+            if count < k {
+                keep_indices.push(row_idx);
+                count += 1;
+            }
+        }
+
+        let take_indices =
+            UInt32Array::from(keep_indices.iter().map(|&x| x as u32).collect::<Vec<_>>());
+
+        let new_columns = merged
+            .columns()
+            .iter()
+            .map(|c| arrow::compute::take(c, &take_indices, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RecordBatch::try_new(merged.schema(), new_columns)?)
+    }
+
+    fn merge_and_spill_knn_batch(&mut self) -> Result<()> {
+        let mut batches = Vec::new();
+        for (batch, indices) in self.knn_current_probe_batch_results.drain(..) {
+            let batch_with_index = add_probe_index_column(&batch, &indices)?;
+            batches.push(batch_with_index);
+        }
+
+        let current_merged = if batches.is_empty() {
+            None
+        } else {
+            Some(concat_batches(&batches[0].schema(), &batches)?)
+        };
+
+        let prev_batch = if let Some(stream) = &mut self.knn_prev_stream {
+            if let Some(result) = stream.next() {
+                Some(result?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let merged = self.merge_knn_batches(current_merged, prev_batch)?;
+
+        if let Some(writer) = &mut self.knn_next_writer {
+            writer.write(&merged)?;
+        }
+
+        Ok(())
+    }
+
     fn process_probe_batch(
         &mut self,
         cx: &mut std::task::Context<'_>,
+        partition_desc: PartitionDescriptor,
+        mut future: BoxFuture<
+            'static,
+            (
+                Box<SpatialJoinBatchIterator>,
+                Result<Option<(RecordBatch, Option<Vec<u32>>)>>,
+            ),
+        >,
     ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
         // Extract the necessary data first to avoid borrowing conflicts
         let (partition_desc, mut iterator, batch_opt, is_complete) = {
             let _timer = self.join_metrics.join_time.timer();
-            match &mut self.state {
-                SpatialJoinStreamState::ProcessProbeBatch(desc, future) => {
-                    match future.poll_unpin(cx) {
-                        Poll::Ready((iterator, result)) => {
-                            let batch_opt = match result {
-                                Ok(opt) => opt,
-                                Err(e) => {
-                                    return Poll::Ready(Err(e));
-                                }
-                            };
-                            let is_complete = iterator.is_complete();
-                            (*desc, iterator, batch_opt, is_complete)
+            match future.poll_unpin(cx) {
+                Poll::Ready((iterator, result)) => {
+                    let batch_opt = match result {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            return Poll::Ready(Err(e));
                         }
-                        Poll::Pending => return Poll::Pending,
-                    }
+                    };
+                    let is_complete = iterator.is_complete();
+                    (partition_desc, iterator, batch_opt, is_complete)
                 }
-                _ => unreachable!(),
+                Poll::Pending => {
+                    self.state = SpatialJoinStreamState::ProcessProbeBatch(partition_desc, future);
+                    return Poll::Pending;
+                }
             }
         };
 
         let result = match batch_opt {
-            Some(batch) => {
+            Some((batch, indices)) => {
+                if matches!(
+                    self.spatial_predicate,
+                    SpatialPredicate::KNearestNeighbors(_)
+                ) {
+                    // KNN logic
+                    if let Some(indices) = indices {
+                        self.knn_current_probe_batch_results.push((batch, indices));
+                    } else {
+                        return Poll::Ready(sedona_internal_err!("KNN batch missing indices"));
+                    }
+
+                    if is_complete {
+                        self.merge_and_spill_knn_batch()?;
+                        self.state = SpatialJoinStreamState::FetchProbeBatch(partition_desc);
+                    } else {
+                        let future = async move {
+                            let result = iterator.next_batch().await;
+                            (iterator, result)
+                        }
+                        .boxed();
+                        self.state =
+                            SpatialJoinStreamState::ProcessProbeBatch(partition_desc, future);
+                    }
+                    return Poll::Ready(Ok(StatefulStreamResult::Continue));
+                }
+
                 self.join_metrics.output_batches.add(1);
                 self.join_metrics.output_rows.add(batch.num_rows());
 
@@ -571,6 +942,12 @@ impl SpatialJoinStream {
                 batch
             }
             None => {
+                if matches!(
+                    self.spatial_predicate,
+                    SpatialPredicate::KNearestNeighbors(_)
+                ) {
+                    self.merge_and_spill_knn_batch()?;
+                }
                 // Iterator finished, move to next probe batch
                 self.state = SpatialJoinStreamState::FetchProbeBatch(partition_desc);
                 return Poll::Ready(Ok(StatefulStreamResult::Continue));
@@ -716,7 +1093,28 @@ impl SpatialJoinStream {
                 once_async.take();
             }
 
-            self.state = SpatialJoinStreamState::Completed;
+            if matches!(
+                self.spatial_predicate,
+                SpatialPredicate::KNearestNeighbors(_)
+            ) {
+                // Finish the last writer
+                if let Some(mut writer) = self.knn_next_writer.take() {
+                    writer.finish()?;
+                }
+
+                // The final results are in knn_next_spill_file
+                self.knn_spill_file = self.knn_next_spill_file.take();
+
+                if let Some(file) = &self.knn_spill_file {
+                    let reader = BufReader::new(File::open(file.path())?);
+                    let stream_reader = StreamReader::try_new(reader, None)?;
+                    self.state = SpatialJoinStreamState::YieldKnnResults(Some(stream_reader));
+                } else {
+                    self.state = SpatialJoinStreamState::YieldKnnResults(None);
+                }
+            } else {
+                self.state = SpatialJoinStreamState::Completed;
+            }
             Poll::Ready(Ok(StatefulStreamResult::Continue))
         } else {
             self.state = SpatialJoinStreamState::WaitBuildIndex(next_partition_id, is_last_stream);
@@ -999,7 +1397,7 @@ impl SpatialJoinBatchIterator {
         })
     }
 
-    pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    pub async fn next_batch(&mut self) -> Result<Option<(RecordBatch, Option<Vec<u32>>)>> {
         let progress_opt = std::mem::take(&mut self.progress);
         let mut progress = progress_opt.expect("Progress should be available");
         let res = self.next_batch_inner(&mut progress).await;
@@ -1007,7 +1405,10 @@ impl SpatialJoinBatchIterator {
         res
     }
 
-    async fn next_batch_inner(&self, progress: &mut ProbeProgress) -> Result<Option<RecordBatch>> {
+    async fn next_batch_inner(
+        &self,
+        progress: &mut ProbeProgress,
+    ) -> Result<Option<(RecordBatch, Option<Vec<u32>>)>> {
         let num_rows = self.probe_evaluated_batch.num_rows();
         loop {
             // Check if we have produced results for the entire probe batch
@@ -1143,7 +1544,10 @@ impl SpatialJoinBatchIterator {
         Ok(())
     }
 
-    fn produce_result_batch(&self, progress: &mut ProbeProgress) -> Result<Option<RecordBatch>> {
+    fn produce_result_batch(
+        &self,
+        progress: &mut ProbeProgress,
+    ) -> Result<Option<(RecordBatch, Option<Vec<u32>>)>> {
         let Some((build_indices, probe_indices)) =
             progress.indices_for_next_batch(self.build_side, self.join_type, self.max_batch_size)
         else {
@@ -1168,12 +1572,21 @@ impl SpatialJoinBatchIterator {
         // Produce the final joined batch
         let batch = self.build_joined_batch(
             &build_partial_batch,
-            build_indices_array,
-            probe_indices_array,
+            build_indices_array.clone(),
+            probe_indices_array.clone(),
             probe_range,
         )?;
 
-        Ok(Some(batch))
+        let indices = if matches!(
+            self.spatial_predicate,
+            SpatialPredicate::KNearestNeighbors(_)
+        ) {
+            Some(probe_indices_array.values().to_vec())
+        } else {
+            None
+        };
+
+        Ok(Some((batch, indices)))
     }
 
     /// There might be unmatched results at the tail of the probe row range that has not been produced,
@@ -1182,7 +1595,7 @@ impl SpatialJoinBatchIterator {
     fn produce_last_result_batch(
         &self,
         progress: &mut ProbeProgress,
-    ) -> Result<Option<RecordBatch>> {
+    ) -> Result<Option<(RecordBatch, Option<Vec<u32>>)>> {
         // Ensure all probe rows have been probed, and all pending results have been produced
         let num_rows = self.probe_evaluated_batch.num_rows();
         assert_eq!(progress.current_probe_idx, num_rows);
@@ -1203,7 +1616,7 @@ impl SpatialJoinBatchIterator {
             probe_indices_array,
             probe_range,
         )?;
-        Ok(Some(batch))
+        Ok(Some((batch, None)))
     }
 
     fn drain_produced_indices(&self, progress: &mut ProbeProgress) {

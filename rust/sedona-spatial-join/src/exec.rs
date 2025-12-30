@@ -177,6 +177,7 @@ impl SpatialJoinExec {
             &right,
             Arc::clone(&join_schema),
             *join_type,
+            &on,
             projection.as_ref(),
             filter.as_ref(),
             converted_from_hash_join,
@@ -247,6 +248,7 @@ impl SpatialJoinExec {
         right: &Arc<dyn ExecutionPlan>,
         schema: SchemaRef,
         join_type: JoinType,
+        on: &SpatialPredicate,
         projection: Option<&Vec<usize>>,
         filter: Option<&JoinFilter>,
         converted_from_hash_join: bool,
@@ -290,7 +292,14 @@ impl SpatialJoinExec {
                 _ => asymmetric_join_output_partitioning(left, right, &join_type)?,
             }
         } else {
-            asymmetric_join_output_partitioning(left, right, &join_type)?
+            match on {
+                SpatialPredicate::KNearestNeighbors(knn) => match knn.probe_side {
+                    JoinSide::Left => left.output_partitioning().clone(),
+                    JoinSide::Right => right.output_partitioning().clone(),
+                    _ => asymmetric_join_output_partitioning(left, right, &join_type)?,
+                },
+                _ => asymmetric_join_output_partitioning(left, right, &join_type)?,
+            }
         };
 
         if let Some(projection) = projection {
@@ -742,6 +751,57 @@ mod tests {
         }
 
         Ok(ctx)
+    }
+
+    #[tokio::test]
+    async fn test_partitioned_knn_join() -> Result<()> {
+        let ((left_schema, left_partitions), (right_schema, right_partitions)) =
+            create_test_data_with_size_range((0.1, 10.0), WKB_GEOMETRY)?;
+
+        // Test with k=3
+        let k = 3;
+        let sql = format!(
+            "SELECT * FROM L JOIN R ON ST_KNN(L.geometry, R.geometry, {}, false)",
+            k
+        );
+
+        let options = SpatialJoinOptions {
+            execution_mode: ExecutionMode::PrepareNone,
+            ..Default::default()
+        };
+
+        // Run with small batch size to force multiple batches and spilling
+        let batch_size = 10;
+        let result = run_spatial_join_query(
+            &left_schema,
+            &right_schema,
+            left_partitions.clone(),
+            right_partitions.clone(),
+            Some(options),
+            batch_size,
+            &sql,
+        )
+        .await?;
+
+        // Verify results
+        // For each left row, we should have at most k matches
+        // And they should be the closest ones.
+        // The total rows should be num_left_rows * k (assuming enough right rows exist).
+        // Note: Null geometries in left side will not match anything.
+
+        let num_left_rows: usize = left_partitions
+            .iter()
+            .flatten()
+            .map(|b| {
+                let geom_col = b.column(2); // geometry is at index 2
+                geom_col.len() - geom_col.null_count()
+            })
+            .sum();
+        let expected_total_rows = num_left_rows * k;
+
+        assert_eq!(result.num_rows(), expected_total_rows);
+
+        Ok(())
     }
 
     #[tokio::test]
