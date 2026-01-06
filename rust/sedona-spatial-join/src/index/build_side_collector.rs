@@ -38,7 +38,7 @@ use crate::{
             evaluate::create_evaluated_build_stream, external::ExternalEvaluatedBatchStream,
             in_mem::InMemoryEvaluatedBatchStream, SendableEvaluatedBatchStream,
         },
-        spill::SpillWriter,
+        spill::EvaluatedBatchSpillWriter,
         EvaluatedBatch,
     },
     index::SpatialIndexBuilder,
@@ -368,7 +368,7 @@ impl BuildSideBatchesCollector {
         &self,
         in_mem_batches: &mut Vec<EvaluatedBatch>,
         metrics: &CollectBuildSideMetrics,
-    ) -> Result<Option<SpillWriter>> {
+    ) -> Result<Option<EvaluatedBatchSpillWriter>> {
         if in_mem_batches.is_empty() {
             return Ok(None);
         }
@@ -377,7 +377,7 @@ impl BuildSideBatchesCollector {
 
         let schema = build_side_batch.schema();
         let sedona_type = &build_side_batch.geom_array.sedona_type;
-        let mut spill_writer = SpillWriter::try_new(
+        let mut spill_writer = EvaluatedBatchSpillWriter::try_new(
             Arc::clone(&self.runtime_env),
             schema,
             sedona_type,

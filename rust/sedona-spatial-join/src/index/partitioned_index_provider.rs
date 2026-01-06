@@ -397,7 +397,7 @@ mod tests {
     use sedona_geometry::analyze::analyze_geometry;
     use sedona_schema::datatypes::WKB_GEOMETRY;
 
-    use crate::evaluated_batch::spill::SpillWriter;
+    use crate::evaluated_batch::spill::EvaluatedBatchSpillWriter;
     use crate::partitioning::stream_repartitioner::{SpilledPartition, SpilledPartitions};
     use crate::spatial_predicate::{RelationPredicate, SpatialRelationType};
 
@@ -491,7 +491,7 @@ mod tests {
         }
         let schema = batches[0].schema();
         let sedona_type = batches[0].geom_array.sedona_type.clone();
-        let mut writer = SpillWriter::try_new(
+        let mut writer = EvaluatedBatchSpillWriter::try_new(
             runtime_env,
             schema,
             &sedona_type,

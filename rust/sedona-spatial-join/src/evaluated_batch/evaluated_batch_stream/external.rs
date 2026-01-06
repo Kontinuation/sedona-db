@@ -36,7 +36,10 @@ use pin_project_lite::pin_project;
 
 use crate::evaluated_batch::{
     evaluated_batch_stream::EvaluatedBatchStream,
-    spill::{spilled_batch_to_evaluated_batch, spilled_schema_to_evaluated_schema, SpillReader},
+    spill::{
+        spilled_batch_to_evaluated_batch, spilled_schema_to_evaluated_schema,
+        EvaluatedBatchSpillReader,
+    },
     EvaluatedBatch,
 };
 
@@ -58,8 +61,8 @@ pin_project! {
 
 enum State {
     AwaitingFile,
-    Opening(SpawnedTask<Result<SpillReader>>),
-    Reading(SpawnedTask<(SpillReader, Option<Result<RecordBatch>>)>),
+    Opening(SpawnedTask<Result<EvaluatedBatchSpillReader>>),
+    Reading(SpawnedTask<(EvaluatedBatchSpillReader, Option<Result<RecordBatch>>)>),
     Finished,
 }
 
@@ -220,7 +223,7 @@ impl ExternalRecordBatchStream {
         let spill_files = spill_files.into_iter().collect::<VecDeque<_>>();
         let (schema, is_empty) = match spill_files.front() {
             Some(file) => {
-                let reader = SpillReader::try_new(file)?;
+                let reader = EvaluatedBatchSpillReader::try_new(file)?;
                 (reader.schema(), false)
             }
             None => (Arc::new(Schema::empty()), true),
@@ -254,8 +257,9 @@ impl futures::Stream for ExternalRecordBatchStream {
             match &mut self_mut.state {
                 State::AwaitingFile => match self_mut.spill_files.pop_front() {
                     Some(spill_file) => {
-                        let task =
-                            SpawnedTask::spawn_blocking(move || SpillReader::try_new(&spill_file));
+                        let task = SpawnedTask::spawn_blocking(move || {
+                            EvaluatedBatchSpillReader::try_new(&spill_file)
+                        });
                         self_mut.state = State::Opening(task);
                     }
                     None => {
@@ -313,7 +317,7 @@ impl futures::Stream for ExternalRecordBatchStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evaluated_batch::spill::SpillWriter;
+    use crate::evaluated_batch::spill::EvaluatedBatchSpillWriter;
     use crate::operand_evaluator::EvaluatedGeometryArray;
     use arrow_array::{Array, ArrayRef, BinaryArray, Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -384,7 +388,7 @@ mod tests {
         let metrics_set = ExecutionPlanMetricsSet::new();
         let metrics = SpillMetrics::new(&metrics_set, 0);
 
-        let mut writer = SpillWriter::try_new(
+        let mut writer = EvaluatedBatchSpillWriter::try_new(
             env,
             schema,
             &sedona_type,

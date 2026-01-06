@@ -15,15 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{fs::File, io::BufReader, sync::Arc};
+use std::sync::Arc;
 
-use arrow::{
-    array::Float64Array,
-    ipc::{
-        reader::StreamReader,
-        writer::{IpcWriteOptions, StreamWriter},
-    },
-};
+use arrow::array::Float64Array;
 use arrow_array::{Array, RecordBatch, StructArray};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::config::SpillCompression;
@@ -37,17 +31,13 @@ use sedona_schema::datatypes::SedonaType;
 use crate::{
     evaluated_batch::EvaluatedBatch,
     operand_evaluator::EvaluatedGeometryArray,
-    utils::arrow_utils::{compact_batch, get_record_batch_memory_size},
+    utils::spill::{RecordBatchSpillReader, RecordBatchSpillWriter},
 };
 
 /// Writer for spilling evaluated batches to disk
-pub(crate) struct SpillWriter {
+pub(crate) struct EvaluatedBatchSpillWriter {
     /// The temporary spill file being written to
-    in_progress_file: RefCountedTempFile,
-    /// Stream writer writes data to spill file in IPC format
-    writer: StreamWriter<File>,
-    /// The spill metrics to update
-    metrics: SpillMetrics,
+    inner: RecordBatchSpillWriter,
 
     /// Schema of the spilled record batches. It is augmented from the schema of original record batches
     /// The spill_schema has 4 fields:
@@ -57,11 +47,9 @@ pub(crate) struct SpillWriter {
     spill_schema: Schema,
     /// Inner fields of the "data" StructArray in the spilled record batches
     data_inner_fields: Fields,
-    /// The in memory size threshold of batches written to spill files.
-    batch_size_threshold: Option<usize>,
 }
 
-impl SpillWriter {
+impl EvaluatedBatchSpillWriter {
     /// Create a new SpillWriter
     pub fn try_new(
         env: Arc<RuntimeEnv>,
@@ -81,82 +69,34 @@ impl SpillWriter {
         let spill_schema = Schema::new(vec![data_struct_field, geom_field, dist_field]);
 
         // Create spill file
-        let in_progress_file = env.disk_manager.create_tmp_file(request_description)?;
-        let spill_file_path = in_progress_file.path();
-        let file = File::create(spill_file_path)?;
-
-        let mut write_options = IpcWriteOptions::default();
-        write_options = write_options.try_with_compression(compression.into())?;
-        let writer = StreamWriter::try_new_with_options(file, &spill_schema, write_options)?;
-        metrics.spill_file_count.add(1);
+        let inner = RecordBatchSpillWriter::try_new(
+            env,
+            Arc::new(spill_schema.clone()),
+            request_description,
+            compression,
+            metrics,
+            batch_size_threshold,
+        )?;
 
         Ok(Self {
-            in_progress_file,
-            writer,
-            metrics,
+            inner,
             spill_schema,
             data_inner_fields,
-            batch_size_threshold,
         })
     }
 
     /// Append an EvaluatedBatch to the spill file
     pub fn append(&mut self, evaluated_batch: &EvaluatedBatch) -> Result<()> {
-        let num_rows = evaluated_batch.num_rows();
-        let num_bytes = evaluated_batch.in_mem_size()?;
         let record_batch = self.spilled_record_batch(evaluated_batch)?;
 
-        let rows_per_split = self.calculate_rows_per_split(&record_batch, num_rows)?;
-
-        if rows_per_split < num_rows {
-            let mut offset = 0;
-            while offset < num_rows {
-                let length = std::cmp::min(rows_per_split, num_rows - offset);
-                let slice = record_batch.slice(offset, length);
-                let compacted = compact_batch(slice)?;
-                self.write_batch(&compacted)?;
-                offset += length;
-            }
-        } else {
-            self.write_batch(&record_batch)?;
-        }
-
-        self.metrics.spilled_rows.add(num_rows);
-        self.metrics.spilled_bytes.add(num_bytes);
+        // Splitting/compaction and spill bytes/rows metrics are handled by `RecordBatchSpillWriter`.
+        self.inner.write_batch(&record_batch)?;
         Ok(())
-    }
-
-    fn calculate_rows_per_split(&self, batch: &RecordBatch, num_rows: usize) -> Result<usize> {
-        if let Some(threshold) = self.batch_size_threshold {
-            if threshold > 0 {
-                let batch_size = get_record_batch_memory_size(batch)?;
-                if batch_size > threshold {
-                    let num_splits = batch_size.div_ceil(threshold);
-                    let rows = num_rows.div_ceil(num_splits);
-                    return Ok(std::cmp::max(1, rows));
-                }
-            }
-        }
-        Ok(num_rows)
-    }
-
-    fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        self.writer.write(batch).map_err(|e| {
-            DataFusionError::Execution(format!(
-                "Failed to write RecordBatch to spill file {:?}: {}",
-                self.in_progress_file.path(),
-                e
-            ))
-        })
     }
 
     /// Finish writing and return the temporary file
     pub fn finish(self) -> Result<RefCountedTempFile> {
-        let mut in_progress_file = self.in_progress_file;
-        in_progress_file.update_disk_usage()?;
-        let size = in_progress_file.current_disk_usage();
-        self.metrics.spilled_bytes.add(size as usize);
-        Ok(in_progress_file)
+        self.inner.finish()
     }
 
     fn spilled_record_batch(&self, evaluated_batch: &EvaluatedBatch) -> Result<RecordBatch> {
@@ -211,26 +151,20 @@ impl SpillWriter {
     }
 }
 /// Reader for reading spilled evaluated batches from disk
-pub(crate) struct SpillReader {
-    stream_reader: StreamReader<BufReader<File>>,
+pub(crate) struct EvaluatedBatchSpillReader {
+    inner: RecordBatchSpillReader,
 }
-impl SpillReader {
+impl EvaluatedBatchSpillReader {
     /// Create a new SpillReader
     pub fn try_new(temp_file: &RefCountedTempFile) -> Result<Self> {
-        let file = File::open(temp_file.path())?;
-        let mut stream_reader = StreamReader::try_new_buffered(file, None)?;
-        // SAFETY: Spill writer strictly follows Arrow IPC specifications with validated schemas and buffers.
-        // Skip redundant validation during read to speedup read operation. This is safe as input guaranteed
-        // to be correct when written.
-        unsafe {
-            stream_reader = stream_reader.with_skip_validation(true);
-        }
-        Ok(Self { stream_reader })
+        Ok(Self {
+            inner: RecordBatchSpillReader::try_new(temp_file)?,
+        })
     }
 
     /// Get the schema of the spilled data
     pub fn schema(&self) -> SchemaRef {
-        self.stream_reader.schema()
+        self.inner.schema()
     }
 
     /// Read the next EvaluatedBatch from the spill file
@@ -242,9 +176,7 @@ impl SpillReader {
 
     /// Read the next raw RecordBatch from the spill file
     pub fn next_raw_batch(&mut self) -> Option<Result<RecordBatch>> {
-        self.stream_reader
-            .next()
-            .map(|result| result.map_err(|e| e.into()))
+        self.inner.next_batch()
     }
 }
 
@@ -343,6 +275,7 @@ pub(crate) fn spilled_schema_to_evaluated_schema(spilled_schema: &SchemaRef) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::arrow_utils::get_record_batch_memory_size;
     use arrow_array::{ArrayRef, BinaryArray, Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion_common::Result;
@@ -458,7 +391,7 @@ mod tests {
         let metrics_set = ExecutionPlanMetricsSet::new();
         let metrics = SpillMetrics::new(&metrics_set, 0);
 
-        let writer = SpillWriter::try_new(
+        let writer = EvaluatedBatchSpillWriter::try_new(
             env,
             schema,
             &sedona_type,
@@ -485,7 +418,7 @@ mod tests {
         let metrics_set = ExecutionPlanMetricsSet::new();
         let metrics = SpillMetrics::new(&metrics_set, 0);
 
-        let mut writer = SpillWriter::try_new(
+        let mut writer = EvaluatedBatchSpillWriter::try_new(
             env,
             schema,
             &sedona_type,
@@ -502,7 +435,7 @@ mod tests {
         let temp_file = writer.finish()?;
 
         // Read back the spilled data
-        let mut reader = SpillReader::try_new(&temp_file)?;
+        let mut reader = EvaluatedBatchSpillReader::try_new(&temp_file)?;
         let read_batch_result = reader.next_batch();
 
         assert!(read_batch_result.is_some());
@@ -526,7 +459,7 @@ mod tests {
         let metrics_set = ExecutionPlanMetricsSet::new();
         let metrics = SpillMetrics::new(&metrics_set, 0);
 
-        let mut writer = SpillWriter::try_new(
+        let mut writer = EvaluatedBatchSpillWriter::try_new(
             env,
             schema,
             &sedona_type,
@@ -541,7 +474,7 @@ mod tests {
         let temp_file = writer.finish()?;
 
         // Read back the spilled data
-        let mut reader = SpillReader::try_new(&temp_file)?;
+        let mut reader = EvaluatedBatchSpillReader::try_new(&temp_file)?;
         let read_batch = reader.next_batch().unwrap()?;
 
         // Verify distance is read back as array
@@ -567,7 +500,7 @@ mod tests {
         let metrics_set = ExecutionPlanMetricsSet::new();
         let metrics = SpillMetrics::new(&metrics_set, 0);
 
-        let mut writer = SpillWriter::try_new(
+        let mut writer = EvaluatedBatchSpillWriter::try_new(
             env,
             schema,
             &sedona_type,
@@ -582,7 +515,7 @@ mod tests {
         let temp_file = writer.finish()?;
 
         // Read back the spilled data
-        let mut reader = SpillReader::try_new(&temp_file)?;
+        let mut reader = EvaluatedBatchSpillReader::try_new(&temp_file)?;
         let read_batch = reader.next_batch().unwrap()?;
 
         // Verify nulls are preserved
@@ -611,7 +544,7 @@ mod tests {
         let metrics_set = ExecutionPlanMetricsSet::new();
         let metrics = SpillMetrics::new(&metrics_set, 0);
 
-        let mut writer = SpillWriter::try_new(
+        let mut writer = EvaluatedBatchSpillWriter::try_new(
             env,
             schema,
             &sedona_type,
@@ -632,7 +565,7 @@ mod tests {
         let temp_file = writer.finish()?;
 
         // Read back all batches
-        let mut reader = SpillReader::try_new(&temp_file)?;
+        let mut reader = EvaluatedBatchSpillReader::try_new(&temp_file)?;
 
         let read_batch1 = reader.next_batch().unwrap()?;
         assert_eq!(read_batch1.num_rows(), 3);
@@ -657,7 +590,7 @@ mod tests {
         let metrics_set = ExecutionPlanMetricsSet::new();
         let metrics = SpillMetrics::new(&metrics_set, 0);
 
-        let mut writer = SpillWriter::try_new(
+        let mut writer = EvaluatedBatchSpillWriter::try_new(
             env,
             schema,
             &sedona_type,
@@ -690,7 +623,7 @@ mod tests {
         let metrics_set = ExecutionPlanMetricsSet::new();
         let metrics = SpillMetrics::new(&metrics_set, 0);
 
-        let mut writer = SpillWriter::try_new(
+        let mut writer = EvaluatedBatchSpillWriter::try_new(
             env,
             schema,
             &sedona_type,
@@ -707,7 +640,7 @@ mod tests {
         let temp_file = writer.finish()?;
 
         // Read back and verify rects
-        let mut reader = SpillReader::try_new(&temp_file)?;
+        let mut reader = EvaluatedBatchSpillReader::try_new(&temp_file)?;
         let read_batch = reader.next_batch().unwrap()?;
 
         assert_eq!(read_batch.rects().len(), original_rects.len());
@@ -735,7 +668,7 @@ mod tests {
         let metrics_set = ExecutionPlanMetricsSet::new();
         let metrics = SpillMetrics::new(&metrics_set, 0);
 
-        let mut writer = SpillWriter::try_new(
+        let mut writer = EvaluatedBatchSpillWriter::try_new(
             env,
             schema,
             &sedona_type,
@@ -750,7 +683,7 @@ mod tests {
         let temp_file = writer.finish()?;
 
         // Read back and verify scalar distance is preserved
-        let mut reader = SpillReader::try_new(&temp_file)?;
+        let mut reader = EvaluatedBatchSpillReader::try_new(&temp_file)?;
         let read_batch = reader.next_batch().unwrap()?;
 
         match &read_batch.geom_array.distance {
@@ -771,7 +704,7 @@ mod tests {
         let metrics_set = ExecutionPlanMetricsSet::new();
         let metrics = SpillMetrics::new(&metrics_set, 0);
 
-        let mut writer = SpillWriter::try_new(
+        let mut writer = EvaluatedBatchSpillWriter::try_new(
             env,
             schema.clone(),
             &sedona_type,
@@ -799,7 +732,7 @@ mod tests {
         let temp_file = writer.finish()?;
 
         // Read back and verify
-        let mut reader = SpillReader::try_new(&temp_file)?;
+        let mut reader = EvaluatedBatchSpillReader::try_new(&temp_file)?;
         let read_batch = reader.next_batch().unwrap()?;
         assert_eq!(read_batch.num_rows(), 0);
 
@@ -821,7 +754,7 @@ mod tests {
         // Set threshold to be smaller than batch size, so it splits into at least 2 parts
         let threshold = batch_size / 2;
 
-        let mut writer = SpillWriter::try_new(
+        let mut writer = EvaluatedBatchSpillWriter::try_new(
             env,
             schema,
             &sedona_type,
@@ -835,7 +768,7 @@ mod tests {
         let temp_file = writer.finish()?;
 
         // Read back the spilled data
-        let mut reader = SpillReader::try_new(&temp_file)?;
+        let mut reader = EvaluatedBatchSpillReader::try_new(&temp_file)?;
 
         // We expect multiple batches
         let mut num_batches = 0;

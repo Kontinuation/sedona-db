@@ -26,7 +26,8 @@ use std::sync::Arc;
 
 use crate::{
     evaluated_batch::{
-        evaluated_batch_stream::SendableEvaluatedBatchStream, spill::SpillWriter, EvaluatedBatch,
+        evaluated_batch_stream::SendableEvaluatedBatchStream, spill::EvaluatedBatchSpillWriter,
+        EvaluatedBatch,
     },
     operand_evaluator::EvaluatedGeometryArray,
     partitioning::{
@@ -270,7 +271,7 @@ pub struct StreamRepartitioner {
     slots: PartitionSlots,
     /// Spill files for each spatial partition.
     /// The None and Multi partitions should be None when repartitioning the build side.
-    spill_registry: Vec<Option<SpillWriter>>,
+    spill_registry: Vec<Option<EvaluatedBatchSpillWriter>>,
     /// Geospatial statistics for each spatial partition.
     geo_stats_accumulators: Vec<AnalyzeAccumulator>,
     /// Number of rows in each spatial partition.
@@ -443,9 +444,9 @@ impl StreamRepartitioner {
         &mut self,
         slot_idx: usize,
         batch: &EvaluatedBatch,
-    ) -> Result<&mut SpillWriter> {
+    ) -> Result<&mut EvaluatedBatchSpillWriter> {
         if self.spill_registry[slot_idx].is_none() {
-            self.spill_registry[slot_idx] = Some(SpillWriter::try_new(
+            self.spill_registry[slot_idx] = Some(EvaluatedBatchSpillWriter::try_new(
                 Arc::clone(&self.runtime_env),
                 batch.schema(),
                 &batch.geom_array.sedona_type,
@@ -677,7 +678,8 @@ mod tests {
 
     use crate::{
         evaluated_batch::{
-            evaluated_batch_stream::in_mem::InMemoryEvaluatedBatchStream, spill::SpillReader,
+            evaluated_batch_stream::in_mem::InMemoryEvaluatedBatchStream,
+            spill::EvaluatedBatchSpillReader,
         },
         partitioning::flat::FlatPartitioner,
     };
@@ -735,7 +737,7 @@ mod tests {
     }
 
     fn read_ids(file: &RefCountedTempFile) -> Result<Vec<i32>> {
-        let mut reader = SpillReader::try_new(file)?;
+        let mut reader = EvaluatedBatchSpillReader::try_new(file)?;
         let mut ids = Vec::new();
         while let Some(batch) = reader.next_batch() {
             let batch = batch?;
@@ -753,7 +755,7 @@ mod tests {
     }
 
     fn read_batch_row_counts(file: &RefCountedTempFile) -> Result<Vec<usize>> {
-        let mut reader = SpillReader::try_new(file)?;
+        let mut reader = EvaluatedBatchSpillReader::try_new(file)?;
         let mut counts = Vec::new();
         while let Some(batch) = reader.next_batch() {
             let batch = batch?;

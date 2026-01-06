@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::cmp::Ordering;
-use std::fs::File;
-use std::io::BufReader;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -25,8 +22,6 @@ use arrow::array::{
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
 use datafusion::config::SpillCompression;
 use datafusion_common::{Result, ScalarValue};
 use datafusion_execution::disk_manager::RefCountedTempFile;
@@ -34,6 +29,8 @@ use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_plan::metrics::SpillMetrics;
 use parking_lot::Mutex;
 use sedona_common::sedona_internal_err;
+
+use crate::utils::spill::{RecordBatchSpillReader, RecordBatchSpillWriter};
 
 /// KNNResultsMerger handles the merging of KNN "nearest so far" results from multiple partitions.
 /// It maintains spill files to store intermediate results.
@@ -57,13 +54,10 @@ pub struct KNNResultsMerger {
 struct MergerState {
     /// File containing results from previous (0..N-1) partitions
     previous_file: Option<RefCountedTempFile>,
-    /// File to write results for current (0..N) partitions
-    current_file: Option<RefCountedTempFile>,
-
     /// Reader for previous file
-    previous_reader: Option<SpillReader>,
-    /// Writer for current file
-    current_writer: Option<StreamWriter<File>>,
+    previous_reader: Option<SpillRowReader>,
+    /// Spill writer for current (0..N) partitions
+    current_writer: Option<RecordBatchSpillWriter>,
 
     /// When the upstream batching (`max_batch_size`) splits a single probe row across
     /// multiple `ingest` calls, we must not emit the same probe index multiple times.
@@ -81,23 +75,40 @@ struct MergerState {
 #[derive(Debug, Clone)]
 struct Candidate {
     dist: f64,
-    data: ScalarValue, // Struct including row data
+    // Row data for this candidate.
+    //
+    // Performance note: we intentionally avoid materializing `ScalarValue` eagerly for every
+    // joined row. Many joins produce far more than K matches per probe index, but we only need
+    // the top-K (or ties) after sorting/pruning. We therefore keep a cheap reference to the
+    // backing `StructArray` + row index, and only convert to `ScalarValue` for the selected
+    // candidates when building output/spill batches.
+    row: CandidateRowRef,
 }
 
-struct SpillReader {
-    reader: StreamReader<BufReader<File>>,
+#[derive(Debug, Clone)]
+struct CandidateRowRef {
+    data: Arc<StructArray>,
+    row: usize,
+}
+
+impl CandidateRowRef {
+    fn to_scalar(&self) -> Result<ScalarValue> {
+        ScalarValue::try_from_array(self.data.as_ref(), self.row)
+    }
+}
+
+struct SpillRowReader {
+    reader: RecordBatchSpillReader,
     /// Current batch loaded from file
     current_batch: Option<RecordBatch>,
     /// Current index within the batch
     current_offset: usize,
 }
 
-impl SpillReader {
+impl SpillRowReader {
     fn new(file: &RefCountedTempFile) -> Result<Self> {
-        let f = File::open(file.path())?;
-        let reader = StreamReader::try_new(BufReader::new(f), None)?;
         Ok(Self {
-            reader,
+            reader: RecordBatchSpillReader::try_new(file)?,
             current_batch: None,
             current_offset: 0,
         })
@@ -146,11 +157,14 @@ impl SpillReader {
                     .map(|b| b.num_rows())
                     .unwrap_or(0)
         {
-            if let Some(batch_res) = self.reader.next() {
-                self.current_batch = Some(batch_res?);
-                self.current_offset = 0;
-            } else {
-                self.current_batch = None;
+            match self.reader.next_batch() {
+                None => {
+                    self.current_batch = None;
+                }
+                Some(batch_res) => {
+                    self.current_batch = Some(batch_res?);
+                    self.current_offset = 0;
+                }
             }
         }
         Ok(())
@@ -177,7 +191,6 @@ impl KNNResultsMerger {
             spill_metrics,
             state: Mutex::new(MergerState {
                 previous_file: None,
-                current_file: None,
                 previous_reader: None,
                 current_writer: None,
                 pending_idx: None,
@@ -190,7 +203,7 @@ impl KNNResultsMerger {
 
     pub fn is_single_partitioned(&self) -> bool {
         let state = self.state.lock();
-        state.previous_file.is_none() && state.current_file.is_none()
+        state.previous_file.is_none() && state.current_writer.is_none()
     }
 
     fn create_spill_schema(result_schema: SchemaRef) -> SchemaRef {
@@ -235,27 +248,27 @@ impl KNNResultsMerger {
         // Flush any buffered probe row into the current spill before rotating.
         // Note: rotate is only called when there *is* a next indexed partition.
         if state.current_writer.is_some() {
-            self.flush_pending(&mut *state, false, &mut Vec::new())?;
+            let mut ignored_output: Vec<RecordBatch> = Vec::new();
+            self.flush_pending(&mut *state, &mut ignored_output)?;
         }
 
-        // Drain any remaining rows from previous reader
-        while let Some(_) = state
-            .previous_reader
-            .as_mut()
-            .and_then(|r| r.peek_index().ok().flatten())
-        {
-            if let Some((_, row_batch)) = state.previous_reader.as_mut().unwrap().next_row()? {
+        // Drain any remaining rows from previous reader.
+        while let Some(reader) = state.previous_reader.as_mut() {
+            let Some(_) = reader.peek_index()? else {
+                break;
+            };
+            if let Some((_, row_batch)) = reader.next_row()? {
                 if let Some(writer) = &mut state.current_writer {
-                    writer.write(&row_batch)?;
+                    writer.write_batch(&row_batch)?;
                 }
             }
         }
 
-        if let Some(mut writer) = state.current_writer.take() {
-            writer.finish()?;
-        }
-
-        state.previous_file = state.current_file.take();
+        state.previous_file = state
+            .current_writer
+            .take()
+            .map(|w| w.finish())
+            .transpose()?;
         state.previous_reader = None;
         state.pending_idx = None;
         state.pending_candidates.clear();
@@ -263,20 +276,18 @@ impl KNNResultsMerger {
         state.pending_new_unfiltered.clear();
 
         if let Some(file) = &state.previous_file {
-            state.previous_reader = Some(SpillReader::new(file)?);
+            state.previous_reader = Some(SpillRowReader::new(file)?);
         }
 
         if !probing_last_index {
-            let file = self.runtime_env.disk_manager.create_tmp_file("knn_spill")?;
-            let f = File::create(file.path())?;
-
-            let mut opts = IpcWriteOptions::default();
-            opts = opts.try_with_compression(self.spill_compression.into())?;
-
-            let writer = StreamWriter::try_new_with_options(f, &self.spill_schema, opts)?;
-            state.current_file = Some(file);
-            state.current_writer = Some(writer);
-            self.spill_metrics.spill_file_count.add(1);
+            state.current_writer = Some(RecordBatchSpillWriter::try_new(
+                self.runtime_env.clone(),
+                self.spill_schema.clone(),
+                "knn_spill",
+                self.spill_compression,
+                self.spill_metrics.clone(),
+                None,
+            )?);
         }
 
         Ok(())
@@ -285,16 +296,14 @@ impl KNNResultsMerger {
     pub fn init_for_partition_0(&self, is_last: bool) -> Result<()> {
         let mut state = self.state.lock();
         if !is_last {
-            let file = self.runtime_env.disk_manager.create_tmp_file("knn_spill")?;
-            let f = File::create(file.path())?;
-
-            let mut opts = IpcWriteOptions::default();
-            opts = opts.try_with_compression(self.spill_compression.into())?;
-
-            let writer = StreamWriter::try_new_with_options(f, &self.spill_schema, opts)?;
-            state.current_file = Some(file);
-            state.current_writer = Some(writer);
-            self.spill_metrics.spill_file_count.add(1);
+            state.current_writer = Some(RecordBatchSpillWriter::try_new(
+                self.runtime_env.clone(),
+                self.spill_schema.clone(),
+                "knn_spill",
+                self.spill_compression,
+                self.spill_metrics.clone(),
+                None,
+            )?);
         }
         Ok(())
     }
@@ -333,7 +342,7 @@ impl KNNResultsMerger {
         }
 
         let mut state = self.state.lock();
-        let mut output_batches = Vec::new();
+        let mut output_batches: Vec<RecordBatch> = Vec::new();
 
         let mut filtered_cursor = 0;
         let num_filtered = filtered_probe_indices.len();
@@ -341,16 +350,19 @@ impl KNNResultsMerger {
         let mut unfiltered_cursor = 0;
         let num_unfiltered = unfiltered_probe_indices.len();
 
-        let joined_struct = StructArray::from(joined_batch.clone());
+        // Consume `joined_batch` once we know we're in the multi-partition path.
+        let joined_struct = Arc::new(StructArray::from(joined_batch));
 
         while unfiltered_cursor < num_unfiltered {
-            let batch_probe_idx = unfiltered_probe_indices[unfiltered_cursor] as usize;
-            let global_idx = offset_in_partition + batch_probe_idx;
+            // Probe indices are per-probe-batch. Use local probe idx for grouping, and only add
+            // the partition offset when interacting with spill/global state.
+            let local_probe_idx = unfiltered_probe_indices[unfiltered_cursor] as usize;
+            let global_idx = offset_in_partition + local_probe_idx;
 
             // If we moved past a buffered probe index, flush it now.
             if let Some(pending) = state.pending_idx {
                 if global_idx != pending {
-                    self.flush_pending(&mut state, false, &mut output_batches)?;
+                    self.flush_pending(&mut state, &mut output_batches)?;
                 }
             }
 
@@ -358,8 +370,7 @@ impl KNNResultsMerger {
 
             let unfiltered_start = unfiltered_cursor;
             while unfiltered_cursor < num_unfiltered
-                && (unfiltered_probe_indices[unfiltered_cursor] as usize + offset_in_partition)
-                    == global_idx
+                && unfiltered_probe_indices[unfiltered_cursor] as usize == local_probe_idx
             {
                 unfiltered_cursor += 1;
             }
@@ -367,8 +378,7 @@ impl KNNResultsMerger {
 
             let filtered_start = filtered_cursor;
             while filtered_cursor < num_filtered
-                && (filtered_probe_indices[filtered_cursor] as usize + offset_in_partition)
-                    == global_idx
+                && filtered_probe_indices[filtered_cursor] as usize == local_probe_idx
             {
                 filtered_cursor += 1;
             }
@@ -376,49 +386,28 @@ impl KNNResultsMerger {
 
             // Initialize pending state for this probe index if needed, and merge from previous.
             if state.pending_idx != Some(global_idx) {
-                state.pending_idx = Some(global_idx);
-                state.pending_candidates.clear();
-                state.pending_prev_unfiltered.clear();
-                state.pending_new_unfiltered.clear();
-
-                loop {
-                    let peek = match state.previous_reader.as_mut() {
-                        Some(r) => r.peek_index().ok().flatten(),
-                        None => None,
-                    };
-
-                    if peek == Some(global_idx) {
-                        let (_, row_batch) = {
-                            // Avoid holding a mutable borrow of `previous_reader` across the
-                            // subsequent mutations of other `state` fields.
-                            state.previous_reader.as_mut().unwrap().next_row()?.unwrap()
-                        };
-
-                        let mut pending_prev_unfiltered =
-                            std::mem::take(&mut state.pending_prev_unfiltered);
-                        self.extract_from_spill(
-                            &row_batch,
-                            &mut state.pending_candidates,
-                            &mut pending_prev_unfiltered,
-                        )?;
-                        state.pending_prev_unfiltered = pending_prev_unfiltered;
-                    } else {
-                        break;
-                    }
-                }
+                self.init_pending_for_index(&mut state, global_idx)?;
             }
 
             // Collect unfiltered distances for this probe index from the current partition.
+            state
+                .pending_new_unfiltered
+                .reserve(unfiltered_end - unfiltered_start);
             for i in unfiltered_start..unfiltered_end {
                 state.pending_new_unfiltered.push(unfiltered_distances[i]);
             }
 
             // Collect new (filtered) candidates for this probe index from the current joined batch.
+            state
+                .pending_candidates
+                .reserve(filtered_end.saturating_sub(filtered_start));
             for i in filtered_start..filtered_end {
-                let scalar = ScalarValue::try_from_array(&joined_struct, i)?;
                 state.pending_candidates.push(Candidate {
                     dist: filtered_distances[i],
-                    data: scalar,
+                    row: CandidateRowRef {
+                        data: joined_struct.clone(),
+                        row: i,
+                    },
                 });
             }
         }
@@ -428,13 +417,7 @@ impl KNNResultsMerger {
         // We instead flush it when we observe the next probe index, or when the probe batch ends
         // via `produce_last_batch()`.
 
-        if output_batches.is_empty() {
-            Ok(None)
-        } else {
-            let schema = output_batches[0].schema();
-            let batch = arrow::compute::concat_batches(&schema, &output_batches)?;
-            Ok(Some(batch))
-        }
+        Self::concat_output_batches(output_batches)
     }
 
     /// Flushes any pending buffered probe index at the end of a probe batch iterator.
@@ -451,28 +434,26 @@ impl KNNResultsMerger {
         }
 
         let mut state = self.state.lock();
-        let mut output_batches = Vec::new();
+        let mut output_batches: Vec<RecordBatch> = Vec::new();
 
         // Only flush the currently pending index; do not drain remaining spill rows here.
         // Draining would be incorrect because future probe batches (with larger global indices)
         // may still need to merge against those rows.
-        self.flush_pending(&mut state, false, &mut output_batches)?;
+        self.flush_pending(&mut state, &mut output_batches)?;
 
-        if output_batches.is_empty() {
-            Ok(None)
-        } else {
-            let schema = output_batches[0].schema();
-            let batch = arrow::compute::concat_batches(&schema, &output_batches)?;
-            Ok(Some(batch))
-        }
+        Self::concat_output_batches(output_batches)
     }
 
-    fn flush_pending(
-        &self,
-        state: &mut MergerState,
-        require_pending: bool,
-        output: &mut Vec<RecordBatch>,
-    ) -> Result<()> {
+    fn concat_output_batches(output_batches: Vec<RecordBatch>) -> Result<Option<RecordBatch>> {
+        if output_batches.is_empty() {
+            return Ok(None);
+        }
+        let schema = output_batches[0].schema();
+        let batch = arrow::compute::concat_batches(&schema, &output_batches)?;
+        Ok(Some(batch))
+    }
+
+    fn flush_pending(&self, state: &mut MergerState, output: &mut Vec<RecordBatch>) -> Result<()> {
         let Some(idx) = state.pending_idx else {
             return Ok(());
         };
@@ -483,7 +464,7 @@ impl KNNResultsMerger {
         state.pending_idx = None;
 
         // Sort by distance.
-        candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+        candidates.sort_by(|a, b| a.dist.total_cmp(&b.dist));
 
         let merged_unfiltered = self.merge_unfiltered_topk(&prev_unfiltered, &new_unfiltered);
         let threshold = if merged_unfiltered.len() >= self.k {
@@ -493,19 +474,18 @@ impl KNNResultsMerger {
         };
 
         // Select candidates according to threshold + tie-breaker behavior.
-        let selected = self.select_candidates(&candidates, threshold);
+        // This returns a prefix length into the sorted `candidates` slice.
+        let selected_len = self.selected_prefix_len(&candidates, threshold);
+        let selected = &candidates[..selected_len];
 
         if let Some(writer) = &mut state.current_writer {
-            let batch = self.build_spill_batch(idx, &selected, &merged_unfiltered)?;
-            writer.write(&batch)?;
+            let batch = self.build_spill_batch(idx, selected, &merged_unfiltered)?;
+            writer.write_batch(&batch)?;
         } else {
-            if let Some(batch) = self.build_result_batch(&selected)? {
+            if let Some(batch) = self.build_result_batch(selected)? {
                 output.push(batch);
             }
         }
-
-        // require_pending is only used to make intent explicit at call sites; currently no-op.
-        let _ = require_pending;
         Ok(())
     }
 
@@ -513,32 +493,36 @@ impl KNNResultsMerger {
         let mut all = Vec::with_capacity(prev.len() + new.len());
         all.extend_from_slice(prev);
         all.extend_from_slice(new);
-        all.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-        if all.len() > self.k {
+
+        // Keep only the K smallest distances, sorted.
+        // This avoids a full sort when prev+new is large.
+        if self.k > 0 && all.len() > self.k {
+            let kth = self.k - 1;
+            all.select_nth_unstable_by(kth, |a, b| a.total_cmp(b));
             all.truncate(self.k);
         }
+        all.sort_by(|a, b| a.total_cmp(b));
         all
     }
 
-    fn select_candidates(
-        &self,
-        candidates: &[Candidate],
-        threshold: Option<f64>,
-    ) -> Vec<Candidate> {
+    fn selected_prefix_len(&self, candidates: &[Candidate], threshold: Option<f64>) -> usize {
         if candidates.is_empty() {
-            return Vec::new();
+            return 0;
         }
 
-        let filtered: Vec<Candidate> = match threshold {
-            Some(t) => candidates.iter().filter(|c| c.dist <= t).cloned().collect(),
-            None => candidates.to_vec(),
+        // Candidates are already sorted by distance.
+        let mut end = match threshold {
+            Some(t) => {
+                // Include candidates with dist <= threshold.
+                candidates.partition_point(|c| c.dist <= t)
+            }
+            None => candidates.len(),
         };
 
         if !self.include_tie_breaker {
-            return filtered.into_iter().take(self.k).collect();
+            end = end.min(self.k);
         }
-
-        filtered
+        end
     }
 
     fn gap_fill(
@@ -547,25 +531,67 @@ impl KNNResultsMerger {
         until_idx: usize,
         output: &mut Vec<RecordBatch>,
     ) -> Result<()> {
-        while let Some(peek) = state
-            .previous_reader
-            .as_mut()
-            .and_then(|r| r.peek_index().ok().flatten())
-        {
-            if peek < until_idx {
-                let (_, row_batch) = state.previous_reader.as_mut().unwrap().next_row()?.unwrap();
-                if state.current_writer.is_some() {
-                    state.current_writer.as_mut().unwrap().write(&row_batch)?;
-                } else {
-                    let flat = self.flatten_spill_batch(&row_batch)?;
-                    if flat.num_rows() > 0 {
-                        output.push(flat);
-                    }
-                }
-            } else {
+        let Some(reader) = state.previous_reader.as_mut() else {
+            return Ok(());
+        };
+
+        loop {
+            let Some(peek) = reader.peek_index()? else {
+                break;
+            };
+            if peek >= until_idx {
                 break;
             }
+
+            let (_, row_batch) = reader.next_row()?.unwrap();
+            if let Some(writer) = &mut state.current_writer {
+                writer.write_batch(&row_batch)?;
+            } else {
+                let flat = self.flatten_spill_batch(&row_batch)?;
+                if flat.num_rows() > 0 {
+                    output.push(flat);
+                }
+            }
         }
+        Ok(())
+    }
+
+    fn init_pending_for_index(&self, state: &mut MergerState, global_idx: usize) -> Result<()> {
+        state.pending_idx = Some(global_idx);
+        state.pending_candidates.clear();
+        state.pending_prev_unfiltered.clear();
+        state.pending_new_unfiltered.clear();
+
+        self.merge_from_previous_for_index(state, global_idx)
+    }
+
+    fn merge_from_previous_for_index(
+        &self,
+        state: &mut MergerState,
+        global_idx: usize,
+    ) -> Result<()> {
+        // Drain all spill rows for this global index.
+        loop {
+            // Avoid holding a mutable borrow of `previous_reader` across the subsequent
+            // mutations of other `state` fields.
+            let row_batch = match state.previous_reader.as_mut() {
+                None => break,
+                Some(reader) => {
+                    if reader.peek_index()? != Some(global_idx) {
+                        break;
+                    }
+                    let (_, row_batch) = reader.next_row()?.unwrap();
+                    row_batch
+                }
+            };
+
+            self.extract_from_spill(
+                &row_batch,
+                &mut state.pending_candidates,
+                &mut state.pending_prev_unfiltered,
+            )?;
+        }
+
         Ok(())
     }
 
@@ -587,15 +613,21 @@ impl KNNResultsMerger {
                 .column(1)
                 .as_primitive::<arrow::datatypes::Float64Type>();
 
+            // Avoid allocating a fresh Arc per candidate; the struct array itself is cheap to
+            // clone (Arc-backed), so we wrap it once and clone the Arc.
+            let row_component = Arc::new(row_component.clone());
+
             let start = rows_col.value_offsets()[0] as usize;
             let end = rows_col.value_offsets()[1] as usize;
 
             for i in start..end {
                 let d = dist_component.value(i);
-                let scalar = ScalarValue::try_from_array(row_component, i)?;
                 candidates.push(Candidate {
                     dist: d,
-                    data: scalar,
+                    row: CandidateRowRef {
+                        data: row_component.clone(),
+                        row: i,
+                    },
                 });
             }
         }
@@ -624,7 +656,8 @@ impl KNNResultsMerger {
         let mut idx_builder = UInt64Builder::new();
         idx_builder.append_value(idx as u64);
 
-        // Build rows from scalars
+        // Build rows from selected candidates.
+        // We only materialize scalars for the selected set (<= K or ties).
         // inner struct: Struct<row, dist>
         let row_fields = self.result_schema.fields().clone();
         let combined_fields = vec![
@@ -632,12 +665,12 @@ impl KNNResultsMerger {
             Field::new("dist", DataType::Float64, false),
         ];
 
-        let mut dist_builder = Float64Builder::new();
-        let mut row_scalars = Vec::new();
+        let mut dist_builder = Float64Builder::with_capacity(candidates.len());
+        let mut row_scalars = Vec::with_capacity(candidates.len());
 
         for c in candidates {
             dist_builder.append_value(c.dist);
-            row_scalars.push(c.data.clone());
+            row_scalars.push(c.row.to_scalar()?);
         }
 
         let row_array = if row_scalars.is_empty() {
@@ -692,7 +725,10 @@ impl KNNResultsMerger {
         if candidates.is_empty() {
             return Ok(None);
         }
-        let scalars: Vec<ScalarValue> = candidates.iter().map(|c| c.data.clone()).collect();
+        let mut scalars = Vec::with_capacity(candidates.len());
+        for c in candidates {
+            scalars.push(c.row.to_scalar()?);
+        }
         let array = ScalarValue::iter_to_array(scalars.into_iter())?;
         let struct_arr = array.as_struct();
         Ok(Some(RecordBatch::try_new(
