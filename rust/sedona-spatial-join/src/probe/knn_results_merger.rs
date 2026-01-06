@@ -17,24 +17,23 @@
 
 use std::cmp::Ordering;
 use std::fs::File;
-use std::io::{BufReader, Seek, SeekFrom};
+use std::io::BufReader;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, Float64Array, Float64Builder, ListArray, ListBuilder, RecordBatch,
-    StructArray, StructBuilder,
+    Array, AsArray, Float64Builder, ListArray, RecordBatch, StructArray, UInt64Builder,
 };
-use arrow::compute::interleave;
+use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::ipc::reader::FileReader;
-use arrow::ipc::writer::FileWriter;
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
 use datafusion::config::SpillCompression;
-use datafusion_common::Result;
+use datafusion_common::{Result, ScalarValue};
+use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_plan::metrics::SpillMetrics;
 use parking_lot::Mutex;
 use sedona_common::sedona_internal_err;
-use tempfile::tempfile;
 
 /// KNNResultsMerger handles the merging of KNN "nearest so far" results from multiple partitions.
 /// It maintains spill files to store intermediate results.
@@ -57,20 +56,105 @@ pub struct KNNResultsMerger {
 
 struct MergerState {
     /// File containing results from previous (0..N-1) partitions
-    previous: Option<File>,
+    previous_file: Option<RefCountedTempFile>,
     /// File to write results for current (0..N) partitions
-    current: Option<File>,
-    /// Only used when writing to current
-    current_writer: Option<FileWriter<File>>,
-    /// Reader for previous file (re-created for each batch ingestion?)
-    previous_reader: Option<FileReader<BufReader<File>>>,
+    current_file: Option<RefCountedTempFile>,
+
+    /// Reader for previous file
+    previous_reader: Option<SpillReader>,
+    /// Writer for current file
+    current_writer: Option<StreamWriter<File>>,
+
+    /// When the upstream batching (`max_batch_size`) splits a single probe row across
+    /// multiple `ingest` calls, we must not emit the same probe index multiple times.
+    ///
+    /// We buffer the currently-being-accumulated probe row here until we are confident
+    /// it's complete for the current indexed partition.
+    pending_idx: Option<usize>,
+    pending_candidates: Vec<Candidate>,
+    /// Unfiltered distances from previous spill for `pending_idx` (top-K so far).
+    pending_prev_unfiltered: Vec<f64>,
+    /// Unfiltered distances seen for `pending_idx` from the current indexed partition.
+    pending_new_unfiltered: Vec<f64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Candidate {
     dist: f64,
-    source_idx: usize, // Index in the value array (0 for new, 1 for old)
-    row_idx: usize,    // Index within the source array
+    data: ScalarValue, // Struct including row data
+}
+
+struct SpillReader {
+    reader: StreamReader<BufReader<File>>,
+    /// Current batch loaded from file
+    current_batch: Option<RecordBatch>,
+    /// Current index within the batch
+    current_offset: usize,
+}
+
+impl SpillReader {
+    fn new(file: &RefCountedTempFile) -> Result<Self> {
+        let f = File::open(file.path())?;
+        let reader = StreamReader::try_new(BufReader::new(f), None)?;
+        Ok(Self {
+            reader,
+            current_batch: None,
+            current_offset: 0,
+        })
+    }
+
+    /// Peeks the index of the next available row in the spill file.
+    /// Returns None if EOF.
+    fn peek_index(&mut self) -> Result<Option<usize>> {
+        self.ensure_batch()?;
+        if let Some(batch) = &self.current_batch {
+            let index_col = batch
+                .column(0)
+                .as_primitive::<arrow::datatypes::UInt64Type>();
+            Ok(Some(index_col.value(self.current_offset) as usize))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Reads the next row from spill file.
+    /// Returns (index, row_batch) where row_batch is a slice of size 1.
+    fn next_row(&mut self) -> Result<Option<(usize, RecordBatch)>> {
+        self.ensure_batch()?;
+        if let Some(batch) = &self.current_batch {
+            let index_col = batch
+                .column(0)
+                .as_primitive::<arrow::datatypes::UInt64Type>();
+            let idx = index_col.value(self.current_offset) as usize;
+
+            // Slice the batch for 1 row
+            let row_batch = batch.slice(self.current_offset, 1);
+
+            self.current_offset += 1;
+            Ok(Some((idx, row_batch)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn ensure_batch(&mut self) -> Result<()> {
+        if self.current_batch.is_none()
+            || self.current_offset
+                >= self
+                    .current_batch
+                    .as_ref()
+                    .map(|b| b.num_rows())
+                    .unwrap_or(0)
+        {
+            if let Some(batch_res) = self.reader.next() {
+                self.current_batch = Some(batch_res?);
+                self.current_offset = 0;
+            } else {
+                self.current_batch = None;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl KNNResultsMerger {
@@ -92,25 +176,31 @@ impl KNNResultsMerger {
             spill_compression,
             spill_metrics,
             state: Mutex::new(MergerState {
-                previous: None,
-                current: None,
-                current_writer: None,
+                previous_file: None,
+                current_file: None,
                 previous_reader: None,
+                current_writer: None,
+                pending_idx: None,
+                pending_candidates: Vec::new(),
+                pending_prev_unfiltered: Vec::new(),
+                pending_new_unfiltered: Vec::new(),
             }),
         }
     }
 
     pub fn is_single_partitioned(&self) -> bool {
         let state = self.state.lock();
-        state.previous.is_none() && state.current.is_none()
+        state.previous_file.is_none() && state.current_file.is_none()
     }
 
     fn create_spill_schema(result_schema: SchemaRef) -> SchemaRef {
         // Schema:
+        // index: UInt64
         // rows: List<Struct<row: Struct<...>, dist: Float64>>
-        // unfiltered_dists: Float64
+        // unfiltered_dists: List<Float64> (top-K unfiltered distances so far)
 
-        // The inner "row" struct matches result_schema
+        let index_field = Field::new("index", DataType::UInt64, false);
+
         let row_field = Field::new(
             "row",
             DataType::Struct(result_schema.fields().clone()),
@@ -121,61 +211,90 @@ impl KNNResultsMerger {
         let struct_fields = vec![row_field, dist_field];
         let struct_type = DataType::Struct(struct_fields.into());
 
-        // The "rows" column is a List of that struct
         let rows_field = Field::new(
             "rows",
             DataType::List(Arc::new(Field::new("item", struct_type, true))),
-            false,
+            true,
         );
-        // "unfiltered_dists" tracks the k-th distance
-        let unfiltered_dists_field = Field::new("unfiltered_dists", DataType::Float64, true);
+        let unfiltered_dists_field = Field::new(
+            "unfiltered_dists",
+            DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
+            true,
+        );
 
-        Arc::new(Schema::new(vec![rows_field, unfiltered_dists_field]))
+        Arc::new(Schema::new(vec![
+            index_field,
+            rows_field,
+            unfiltered_dists_field,
+        ]))
     }
 
-    /// Rotate the spill files.
-    /// probing_last_index: true if we are about to probe the last partition.
     pub fn rotate(&self, probing_last_index: bool) -> Result<()> {
         let mut state = self.state.lock();
 
-        // 1. Close current writer if exists
+        // Flush any buffered probe row into the current spill before rotating.
+        // Note: rotate is only called when there *is* a next indexed partition.
+        if state.current_writer.is_some() {
+            self.flush_pending(&mut *state, false, &mut Vec::new())?;
+        }
+
+        // Drain any remaining rows from previous reader
+        while let Some(_) = state
+            .previous_reader
+            .as_mut()
+            .and_then(|r| r.peek_index().ok().flatten())
+        {
+            if let Some((_, row_batch)) = state.previous_reader.as_mut().unwrap().next_row()? {
+                if let Some(writer) = &mut state.current_writer {
+                    writer.write(&row_batch)?;
+                }
+            }
+        }
+
         if let Some(mut writer) = state.current_writer.take() {
             writer.finish()?;
         }
 
-        // 2. Determine new 'previous'
-        let new_previous = state.current.take();
-
-        // 3. Drop old 'previous' (file will be deleted if tempfile)
-        state.previous = new_previous;
+        state.previous_file = state.current_file.take();
         state.previous_reader = None;
+        state.pending_idx = None;
+        state.pending_candidates.clear();
+        state.pending_prev_unfiltered.clear();
+        state.pending_new_unfiltered.clear();
 
-        // 4. If previous exists, create reader
-        if let Some(file) = &state.previous {
-            let mut file_clone = file.try_clone()?;
-            file_clone.seek(SeekFrom::Start(0))?;
-            state.previous_reader = Some(FileReader::try_new(BufReader::new(file_clone), None)?);
+        if let Some(file) = &state.previous_file {
+            state.previous_reader = Some(SpillReader::new(file)?);
         }
 
-        // 5. Create new 'current' if not probing last index
         if !probing_last_index {
-            let file = tempfile()?;
-            let writer = FileWriter::try_new(file.try_clone()?, &self.spill_schema)?;
-            state.current = Some(file);
+            let file = self.runtime_env.disk_manager.create_tmp_file("knn_spill")?;
+            let f = File::create(file.path())?;
+
+            let mut opts = IpcWriteOptions::default();
+            opts = opts.try_with_compression(self.spill_compression.into())?;
+
+            let writer = StreamWriter::try_new_with_options(f, &self.spill_schema, opts)?;
+            state.current_file = Some(file);
             state.current_writer = Some(writer);
+            self.spill_metrics.spill_file_count.add(1);
         }
 
         Ok(())
     }
 
-    /// Prepare for the first partition (if not single partition)
     pub fn init_for_partition_0(&self, is_last: bool) -> Result<()> {
         let mut state = self.state.lock();
         if !is_last {
-            let file = tempfile()?;
-            let writer = FileWriter::try_new(file.try_clone()?, &self.spill_schema)?;
-            state.current = Some(file);
+            let file = self.runtime_env.disk_manager.create_tmp_file("knn_spill")?;
+            let f = File::create(file.path())?;
+
+            let mut opts = IpcWriteOptions::default();
+            opts = opts.try_with_compression(self.spill_compression.into())?;
+
+            let writer = StreamWriter::try_new_with_options(f, &self.spill_schema, opts)?;
+            state.current_file = Some(file);
             state.current_writer = Some(writer);
+            self.spill_metrics.spill_file_count.add(1);
         }
         Ok(())
     }
@@ -183,217 +302,410 @@ impl KNNResultsMerger {
     pub fn ingest(
         &self,
         joined_batch: RecordBatch,
-        distances: Option<&[f64]>,
-        probe_indices: &[u32],
+        filtered_distances: Option<&[f64]>,
+        filtered_probe_indices: &[u32],
         offset_in_partition: usize,
-        probe_batch_size: usize,
+        unfiltered_distances: &[f64],
+        unfiltered_probe_indices: &[u32],
     ) -> Result<Option<RecordBatch>> {
         if self.is_single_partitioned() {
             return Ok(Some(joined_batch));
         }
 
-        let prev_batch = {
-            let mut state = self.state.lock();
-            if let Some(reader) = &mut state.previous_reader {
-                if let Some(res) = reader.next() {
-                    Some(res?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+        let Some(filtered_distances) = filtered_distances else {
+            return sedona_internal_err!("distances missing for KNN join");
         };
 
-        let Some(distances) = distances else {
+        if filtered_distances.len() != filtered_probe_indices.len() {
             return sedona_internal_err!(
-                "distances should not be None when running multi-partitioned KNN join"
+                "filtered distances and probe indices length mismatch: {} vs {}",
+                filtered_distances.len(),
+                filtered_probe_indices.len()
             );
-        };
-        self.merge_and_process(
-            joined_batch,
-            distances,
-            probe_indices,
-            offset_in_partition,
-            probe_batch_size,
-            prev_batch,
-        )
-    }
-
-    fn merge_and_process(
-        &self,
-        batch: RecordBatch,
-        distances: &[f64],
-        probe_indices: &[u32],
-        offset_in_partition: usize,
-        probe_batch_size: usize,
-        prev_batch: Option<RecordBatch>,
-    ) -> Result<Option<RecordBatch>> {
-        // Prepare New Data Components
-        let new_row_struct = StructArray::from(batch);
-        let new_dist_array = Float64Array::from(distances.to_vec());
-
-        // Prepare Old Data Components
-        let (old_rows_list, old_row_struct, old_dist_array, _old_thresholds) =
-            if let Some(prev) = &prev_batch {
-                let rows_col = prev.column(0).as_list::<i32>();
-                let values_struct = rows_col.values().as_struct();
-
-                // Assume "rows" col structure: List<Struct<row: Struct, dist: f64>>
-                let old_row_component = values_struct.column(0).as_struct();
-                let old_dist_component = values_struct
-                    .column(1)
-                    .as_primitive::<arrow::datatypes::Float64Type>();
-                let input_thresholds = prev
-                    .column(1)
-                    .as_primitive::<arrow::datatypes::Float64Type>();
-
-                (
-                    Some(rows_col),
-                    Some(old_row_component),
-                    Some(old_dist_component),
-                    Some(input_thresholds),
-                )
-            } else {
-                (None, None, None, None)
-            };
-
-        // Group new results by probe index
-        let mut new_results_by_probe = vec![vec![]; probe_batch_size];
-        for (i, &probe_idx) in probe_indices.iter().enumerate() {
-            if (probe_idx as usize) < probe_batch_size {
-                new_results_by_probe[probe_idx as usize].push(i);
-            }
         }
 
-        // Output builders
-        let mut selection_indices: Vec<(usize, usize)> = Vec::new(); // (source_idx, row_idx)
-        let mut list_offsets: Vec<i32> = Vec::with_capacity(probe_batch_size + 1);
-        list_offsets.push(0);
-        let mut current_offset = 0;
-        let mut new_thresholds_builder = Float64Builder::new();
+        if unfiltered_distances.len() != unfiltered_probe_indices.len() {
+            return sedona_internal_err!(
+                "unfiltered distances and probe indices length mismatch: {} vs {}",
+                unfiltered_distances.len(),
+                unfiltered_probe_indices.len()
+            );
+        }
 
-        // Iterate per probe row
-        for i in 0..probe_batch_size {
-            let mut candidates: Vec<Candidate> = Vec::with_capacity(self.k * 2);
+        let mut state = self.state.lock();
+        let mut output_batches = Vec::new();
 
-            // 1. Add new candidates
-            for &row_idx in &new_results_by_probe[i] {
-                let d = distances[row_idx];
-                candidates.push(Candidate {
-                    dist: d,
-                    source_idx: 0,
-                    row_idx,
-                });
+        let mut filtered_cursor = 0;
+        let num_filtered = filtered_probe_indices.len();
+
+        let mut unfiltered_cursor = 0;
+        let num_unfiltered = unfiltered_probe_indices.len();
+
+        let joined_struct = StructArray::from(joined_batch.clone());
+
+        while unfiltered_cursor < num_unfiltered {
+            let batch_probe_idx = unfiltered_probe_indices[unfiltered_cursor] as usize;
+            let global_idx = offset_in_partition + batch_probe_idx;
+
+            // If we moved past a buffered probe index, flush it now.
+            if let Some(pending) = state.pending_idx {
+                if global_idx != pending {
+                    self.flush_pending(&mut state, false, &mut output_batches)?;
+                }
             }
 
-            // 2. Add old candidates
-            if let Some(list_arr) = old_rows_list {
-                if i < list_arr.len() {
-                    let start = list_arr.value_offsets()[i] as usize;
-                    let end = list_arr.value_offsets()[i + 1] as usize;
-                    if let Some(dists) = old_dist_array {
-                        for old_idx in start..end {
-                            let d = dists.value(old_idx);
-                            candidates.push(Candidate {
-                                dist: d,
-                                source_idx: 1,
-                                row_idx: old_idx,
-                            });
-                        }
+            self.gap_fill(&mut state, global_idx, &mut output_batches)?;
+
+            let unfiltered_start = unfiltered_cursor;
+            while unfiltered_cursor < num_unfiltered
+                && (unfiltered_probe_indices[unfiltered_cursor] as usize + offset_in_partition)
+                    == global_idx
+            {
+                unfiltered_cursor += 1;
+            }
+            let unfiltered_end = unfiltered_cursor;
+
+            let filtered_start = filtered_cursor;
+            while filtered_cursor < num_filtered
+                && (filtered_probe_indices[filtered_cursor] as usize + offset_in_partition)
+                    == global_idx
+            {
+                filtered_cursor += 1;
+            }
+            let filtered_end = filtered_cursor;
+
+            // Initialize pending state for this probe index if needed, and merge from previous.
+            if state.pending_idx != Some(global_idx) {
+                state.pending_idx = Some(global_idx);
+                state.pending_candidates.clear();
+                state.pending_prev_unfiltered.clear();
+                state.pending_new_unfiltered.clear();
+
+                loop {
+                    let peek = match state.previous_reader.as_mut() {
+                        Some(r) => r.peek_index().ok().flatten(),
+                        None => None,
+                    };
+
+                    if peek == Some(global_idx) {
+                        let (_, row_batch) = {
+                            // Avoid holding a mutable borrow of `previous_reader` across the
+                            // subsequent mutations of other `state` fields.
+                            state.previous_reader.as_mut().unwrap().next_row()?.unwrap()
+                        };
+
+                        let mut pending_prev_unfiltered =
+                            std::mem::take(&mut state.pending_prev_unfiltered);
+                        self.extract_from_spill(
+                            &row_batch,
+                            &mut state.pending_candidates,
+                            &mut pending_prev_unfiltered,
+                        )?;
+                        state.pending_prev_unfiltered = pending_prev_unfiltered;
+                    } else {
+                        break;
                     }
                 }
             }
 
-            // 3. Sort and keep top K
-            // We want K nearest, so smallest distance first.
-            candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
-            if candidates.len() > self.k {
-                candidates.truncate(self.k);
+            // Collect unfiltered distances for this probe index from the current partition.
+            for i in unfiltered_start..unfiltered_end {
+                state.pending_new_unfiltered.push(unfiltered_distances[i]);
             }
 
-            // 4. Record selections
-            for c in &candidates {
-                selection_indices.push((c.source_idx, c.row_idx));
-            }
-
-            current_offset += candidates.len() as i32;
-            list_offsets.push(current_offset);
-
-            // 5. Update threshold
-            if candidates.len() >= self.k {
-                new_thresholds_builder.append_value(candidates.last().unwrap().dist);
-            } else {
-                new_thresholds_builder.append_null(); // Less than K results found so far
+            // Collect new (filtered) candidates for this probe index from the current joined batch.
+            for i in filtered_start..filtered_end {
+                let scalar = ScalarValue::try_from_array(&joined_struct, i)?;
+                state.pending_candidates.push(Candidate {
+                    dist: filtered_distances[i],
+                    data: scalar,
+                });
             }
         }
 
-        // Apply Interleave to build combined arrays
-        let arrays_for_row_struct: Vec<&dyn Array> = vec![
-            &new_row_struct,
-            old_row_struct
-                .map(|x| x as &dyn Array)
-                .unwrap_or(&new_row_struct),
-        ];
-        let arrays_for_dist: Vec<&dyn Array> = vec![
-            &new_dist_array,
-            old_dist_array
-                .map(|x| x as &dyn Array)
-                .unwrap_or(&new_dist_array),
-        ];
+        // Do not flush the last buffered probe index here. The final probe index in a produced
+        // slice can be split across multiple `ingest` calls due to `max_batch_size`.
+        // We instead flush it when we observe the next probe index, or when the probe batch ends
+        // via `produce_last_batch()`.
 
-        let final_rows_struct = interleave(&arrays_for_row_struct, &selection_indices)?;
-        let final_dist_array = interleave(&arrays_for_dist, &selection_indices)?;
-
-        // If is_last_partition, we return the flattened result.
-        let mut state = self.state.lock();
-        if let Some(writer) = &mut state.current_writer {
-            // We define the ListArray for spill file.
-            // Struct<row, dist>
-            let result_fields = final_rows_struct.as_struct().fields().clone();
-
-            let combined_fields = vec![
-                Field::new("row", DataType::Struct(result_fields), false),
-                Field::new("dist", DataType::Float64, false),
-            ];
-
-            let combined_struct = StructArray::try_new(
-                combined_fields.into(),
-                vec![Arc::new(final_rows_struct), Arc::new(final_dist_array)],
-                None,
-            )?;
-
-            let list_field = Arc::new(Field::new(
-                "item",
-                combined_struct.data_type().clone(),
-                true,
-            ));
-            let list_array = ListArray::try_new(
-                list_field,
-                arrow::buffer::OffsetBuffer::new(list_offsets.into()),
-                Arc::new(combined_struct),
-                None,
-            )?;
-
-            let new_thresholds = new_thresholds_builder.finish();
-
-            let spill_batch = RecordBatch::try_new(
-                self.spill_schema.clone(),
-                vec![Arc::new(list_array), Arc::new(new_thresholds)],
-            )?;
-
-            // Write to current spill file without returning the result batch
-            writer.write(&spill_batch)?;
+        if output_batches.is_empty() {
             Ok(None)
         } else {
-            // We are probing the last partition. Return the result directly without writing
-            // them to the next spill file.
-
-            // final_rows_struct is a StructArray containing the final rows in order.
-            // We can convert it to RecordBatch directly.
-            let struct_arr = final_rows_struct.as_struct();
-            let batch = RecordBatch::from(struct_arr);
+            let schema = output_batches[0].schema();
+            let batch = arrow::compute::concat_batches(&schema, &output_batches)?;
             Ok(Some(batch))
         }
+    }
+
+    /// Flushes any pending buffered probe index at the end of a probe batch iterator.
+    ///
+    /// This is used to emit the final probe index that may have been kept buffered because
+    /// it could continue in the next produced slice.
+    ///
+    /// Returns `Ok(Some(batch))` at most once per pending buffered index; if there is nothing
+    /// pending (or results are being spilled to disk for non-final indexed partitions), returns
+    /// `Ok(None)`.
+    pub fn produce_last_batch(&self) -> Result<Option<RecordBatch>> {
+        if self.is_single_partitioned() {
+            return Ok(None);
+        }
+
+        let mut state = self.state.lock();
+        let mut output_batches = Vec::new();
+
+        // Only flush the currently pending index; do not drain remaining spill rows here.
+        // Draining would be incorrect because future probe batches (with larger global indices)
+        // may still need to merge against those rows.
+        self.flush_pending(&mut state, false, &mut output_batches)?;
+
+        if output_batches.is_empty() {
+            Ok(None)
+        } else {
+            let schema = output_batches[0].schema();
+            let batch = arrow::compute::concat_batches(&schema, &output_batches)?;
+            Ok(Some(batch))
+        }
+    }
+
+    fn flush_pending(
+        &self,
+        state: &mut MergerState,
+        require_pending: bool,
+        output: &mut Vec<RecordBatch>,
+    ) -> Result<()> {
+        let Some(idx) = state.pending_idx else {
+            return Ok(());
+        };
+
+        let mut candidates = std::mem::take(&mut state.pending_candidates);
+        let prev_unfiltered = std::mem::take(&mut state.pending_prev_unfiltered);
+        let new_unfiltered = std::mem::take(&mut state.pending_new_unfiltered);
+        state.pending_idx = None;
+
+        // Sort by distance.
+        candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+
+        let merged_unfiltered = self.merge_unfiltered_topk(&prev_unfiltered, &new_unfiltered);
+        let threshold = if merged_unfiltered.len() >= self.k {
+            Some(merged_unfiltered[self.k - 1])
+        } else {
+            None
+        };
+
+        // Select candidates according to threshold + tie-breaker behavior.
+        let selected = self.select_candidates(&candidates, threshold);
+
+        if let Some(writer) = &mut state.current_writer {
+            let batch = self.build_spill_batch(idx, &selected, &merged_unfiltered)?;
+            writer.write(&batch)?;
+        } else {
+            if let Some(batch) = self.build_result_batch(&selected)? {
+                output.push(batch);
+            }
+        }
+
+        // require_pending is only used to make intent explicit at call sites; currently no-op.
+        let _ = require_pending;
+        Ok(())
+    }
+
+    fn merge_unfiltered_topk(&self, prev: &[f64], new: &[f64]) -> Vec<f64> {
+        let mut all = Vec::with_capacity(prev.len() + new.len());
+        all.extend_from_slice(prev);
+        all.extend_from_slice(new);
+        all.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        if all.len() > self.k {
+            all.truncate(self.k);
+        }
+        all
+    }
+
+    fn select_candidates(
+        &self,
+        candidates: &[Candidate],
+        threshold: Option<f64>,
+    ) -> Vec<Candidate> {
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let filtered: Vec<Candidate> = match threshold {
+            Some(t) => candidates.iter().filter(|c| c.dist <= t).cloned().collect(),
+            None => candidates.to_vec(),
+        };
+
+        if !self.include_tie_breaker {
+            return filtered.into_iter().take(self.k).collect();
+        }
+
+        filtered
+    }
+
+    fn gap_fill(
+        &self,
+        state: &mut MergerState,
+        until_idx: usize,
+        output: &mut Vec<RecordBatch>,
+    ) -> Result<()> {
+        while let Some(peek) = state
+            .previous_reader
+            .as_mut()
+            .and_then(|r| r.peek_index().ok().flatten())
+        {
+            if peek < until_idx {
+                let (_, row_batch) = state.previous_reader.as_mut().unwrap().next_row()?.unwrap();
+                if state.current_writer.is_some() {
+                    state.current_writer.as_mut().unwrap().write(&row_batch)?;
+                } else {
+                    let flat = self.flatten_spill_batch(&row_batch)?;
+                    if flat.num_rows() > 0 {
+                        output.push(flat);
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn extract_from_spill(
+        &self,
+        batch: &RecordBatch,
+        candidates: &mut Vec<Candidate>,
+        unfiltered_dists: &mut Vec<f64>,
+    ) -> Result<()> {
+        // batch schema: [index, rows, unfiltered_dists]
+        // rows is List<Struct<row, dist>>
+        let rows_col = batch.column(1).as_list::<i32>();
+        if rows_col.is_null(0) {
+            // Still try to read unfiltered_dists even if rows are empty.
+        } else {
+            let values_struct = rows_col.values().as_struct(); // Struct<row, dist>
+            let row_component = values_struct.column(0).as_struct();
+            let dist_component = values_struct
+                .column(1)
+                .as_primitive::<arrow::datatypes::Float64Type>();
+
+            let start = rows_col.value_offsets()[0] as usize;
+            let end = rows_col.value_offsets()[1] as usize;
+
+            for i in start..end {
+                let d = dist_component.value(i);
+                let scalar = ScalarValue::try_from_array(row_component, i)?;
+                candidates.push(Candidate {
+                    dist: d,
+                    data: scalar,
+                });
+            }
+        }
+
+        // unfiltered_dists: List<Float64>
+        let unfiltered_col = batch.column(2).as_list::<i32>();
+        if !unfiltered_col.is_null(0) {
+            let values = unfiltered_col
+                .values()
+                .as_primitive::<arrow::datatypes::Float64Type>();
+            let start = unfiltered_col.value_offsets()[0] as usize;
+            let end = unfiltered_col.value_offsets()[1] as usize;
+            for i in start..end {
+                unfiltered_dists.push(values.value(i));
+            }
+        }
+        Ok(())
+    }
+
+    fn build_spill_batch(
+        &self,
+        idx: usize,
+        candidates: &[Candidate],
+        unfiltered_dists: &[f64],
+    ) -> Result<RecordBatch> {
+        let mut idx_builder = UInt64Builder::new();
+        idx_builder.append_value(idx as u64);
+
+        // Build rows from scalars
+        // inner struct: Struct<row, dist>
+        let row_fields = self.result_schema.fields().clone();
+        let combined_fields = vec![
+            Field::new("row", DataType::Struct(row_fields.clone()), false),
+            Field::new("dist", DataType::Float64, false),
+        ];
+
+        let mut dist_builder = Float64Builder::new();
+        let mut row_scalars = Vec::new();
+
+        for c in candidates {
+            dist_builder.append_value(c.dist);
+            row_scalars.push(c.data.clone());
+        }
+
+        let row_array = if row_scalars.is_empty() {
+            arrow::array::new_empty_array(&DataType::Struct(row_fields.into()))
+        } else {
+            ScalarValue::iter_to_array(row_scalars.into_iter())?
+        };
+
+        let combined_struct = StructArray::try_new(
+            combined_fields.into(),
+            vec![Arc::new(row_array), Arc::new(dist_builder.finish())],
+            None,
+        )?;
+
+        // Use ListArray::try_new instead of builder
+        let offsets = OffsetBuffer::<i32>::from_lengths(std::iter::once(combined_struct.len()));
+        let list_field = Arc::new(Field::new(
+            "item",
+            combined_struct.data_type().clone(),
+            true,
+        ));
+        let list_array = ListArray::try_new(list_field, offsets, Arc::new(combined_struct), None)?;
+
+        // Build unfiltered_dists list
+        let mut unfiltered_values = Float64Builder::with_capacity(unfiltered_dists.len());
+        for d in unfiltered_dists {
+            unfiltered_values.append_value(*d);
+        }
+        let unfiltered_values = unfiltered_values.finish();
+
+        let unfiltered_offsets =
+            OffsetBuffer::<i32>::from_lengths(std::iter::once(unfiltered_values.len()));
+        let unfiltered_field = Arc::new(Field::new("item", DataType::Float64, true));
+        let unfiltered_list = ListArray::try_new(
+            unfiltered_field,
+            unfiltered_offsets,
+            Arc::new(unfiltered_values),
+            None,
+        )?;
+
+        Ok(RecordBatch::try_new(
+            self.spill_schema.clone(),
+            vec![
+                Arc::new(idx_builder.finish()),
+                Arc::new(list_array),
+                Arc::new(unfiltered_list),
+            ],
+        )?)
+    }
+
+    fn build_result_batch(&self, candidates: &[Candidate]) -> Result<Option<RecordBatch>> {
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let scalars: Vec<ScalarValue> = candidates.iter().map(|c| c.data.clone()).collect();
+        let array = ScalarValue::iter_to_array(scalars.into_iter())?;
+        let struct_arr = array.as_struct();
+        Ok(Some(RecordBatch::try_new(
+            self.result_schema.clone(),
+            struct_arr.columns().to_vec(),
+        )?))
+    }
+
+    fn flatten_spill_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let mut candidates = Vec::new();
+        let mut unfiltered = Vec::new();
+        self.extract_from_spill(batch, &mut candidates, &mut unfiltered)?;
+        self.build_result_batch(&candidates)
+            .map(|opt| opt.unwrap_or_else(|| RecordBatch::new_empty(self.result_schema.clone())))
     }
 }

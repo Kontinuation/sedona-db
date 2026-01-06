@@ -211,6 +211,7 @@ impl SpatialIndex {
     /// # Returns
     ///
     /// * `JoinResultMetrics` containing the number of actual matches and candidates processed
+    #[allow(unused)]
     pub(crate) fn query_knn(
         &self,
         probe_wkb: &Wkb,

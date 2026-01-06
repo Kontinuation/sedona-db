@@ -1539,9 +1539,52 @@ mod tests {
         results
     }
 
+    fn compute_knn_ground_truth_with_filter(
+        left_partitions: &[Vec<RecordBatch>],
+        right_partitions: &[Vec<RecordBatch>],
+        k: usize,
+    ) -> Vec<(i32, i32, f64)> {
+        let left_data = extract_geoms_and_ids(left_partitions);
+        let right_data = extract_geoms_and_ids(right_partitions);
+
+        let mut results = Vec::new();
+
+        for (l_id, l_geom) in left_data {
+            let mut distances: Vec<(i32, f64)> = right_data
+                .iter()
+                .map(|(r_id, r_geom)| (*r_id, Euclidean.distance(&l_geom, r_geom)))
+                .collect();
+
+            // Sort by distance, then by ID for stability
+            distances.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+
+            // KNN semantics with post-filtering: pick top-K unfiltered, then apply join filter.
+            for i in 0..k.min(distances.len()) {
+                let (r_id, dist) = distances[i];
+
+                // Cross-side filter (depends on both sides) so it can't be pushed down pre-join.
+                // With post-filter semantics, this commonly yields < K rows for many probe rows.
+                if (l_id.rem_euclid(7)) == (r_id.rem_euclid(7)) {
+                    results.push((l_id, r_id, dist));
+                }
+            }
+        }
+
+        // Sort results by L.id, R.id
+        results.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        results
+    }
+
     #[rstest]
     #[tokio::test]
-    async fn test_knn_join_correctness(#[values(1, 2, 3, 4)] num_partitions: usize) -> Result<()> {
+    async fn test_knn_join_correctness(
+        #[values(1, 2, 3, 4)] num_partitions: usize,
+        #[values(10, 30, 1000)] max_batch_size: usize,
+    ) -> Result<()> {
         // Generate slightly larger data
         let ((left_schema, left_partitions), (right_schema, right_partitions)) =
             create_knn_test_data((0.1, 10.0), WKB_GEOMETRY)?;
@@ -1566,7 +1609,7 @@ mod tests {
             left_partitions.clone(),
             right_partitions.clone(),
             Some(options),
-            10,
+            max_batch_size,
             &sql,
         )
         .await?;
@@ -1595,6 +1638,90 @@ mod tests {
             .into_iter()
             .map(|(l, r, _)| (l, r))
             .collect::<Vec<_>>();
+
+        assert_eq!(actual_results, expected_results);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_knn_join_with_filter_correctness(
+        #[values(1, 2, 3, 4)] num_partitions: usize,
+        #[values(10, 30, 1000)] max_batch_size: usize,
+    ) -> Result<()> {
+        let ((left_schema, left_partitions), (right_schema, right_partitions)) =
+            create_knn_test_data((0.1, 10.0), WKB_GEOMETRY)?;
+
+        let options = SpatialJoinOptions {
+            debug: SpatialJoinDebugOptions {
+                num_spatial_partitions: NumSpatialPartitionsConfig::Fixed(num_partitions),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let k = 3;
+        let sql = format!(
+            "SELECT L.id AS l_id, R.id AS r_id FROM L JOIN R ON ST_KNN(L.geometry, R.geometry, {}, false) AND (L.id % 7) = (R.id % 7)",
+            k
+        );
+
+        let batches = run_spatial_join_query(
+            &left_schema,
+            &right_schema,
+            left_partitions.clone(),
+            right_partitions.clone(),
+            Some(options),
+            max_batch_size,
+            &sql,
+        )
+        .await?;
+
+        let mut actual_results = Vec::new();
+        let combined_batch = arrow::compute::concat_batches(&batches.schema(), &[batches])?;
+        let l_ids = combined_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap();
+        let r_ids = combined_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap();
+
+        for i in 0..combined_batch.num_rows() {
+            actual_results.push((l_ids.value(i), r_ids.value(i)));
+        }
+        actual_results.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        // Prove the test actually exercises the "< K rows after filtering" case.
+        // Build a list of all probe-side IDs and count how many results each has.
+        let all_left_ids: Vec<i32> = extract_geoms_and_ids(&left_partitions)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let mut per_left_counts: std::collections::HashMap<i32, usize> =
+            std::collections::HashMap::new();
+        for (l_id, _) in &actual_results {
+            *per_left_counts.entry(*l_id).or_default() += 1;
+        }
+        let min_count = all_left_ids
+            .iter()
+            .map(|l_id| *per_left_counts.get(l_id).unwrap_or(&0))
+            .min()
+            .unwrap_or(0);
+        assert!(
+            min_count < k,
+            "expected at least one probe row to produce < K rows after filtering; min_count={min_count}, k={k}"
+        );
+
+        let expected_results =
+            compute_knn_ground_truth_with_filter(&left_partitions, &right_partitions, k)
+                .into_iter()
+                .map(|(l, r, _)| (l, r))
+                .collect::<Vec<_>>();
 
         assert_eq!(actual_results, expected_results);
 
