@@ -175,6 +175,7 @@ impl SpatialJoinExec {
         let cache = Self::compute_properties(
             &left,
             &right,
+            &on,
             Arc::clone(&join_schema),
             *join_type,
             projection.as_ref(),
@@ -242,9 +243,11 @@ impl SpatialJoinExec {
     ///
     /// When converted from HashJoin, we preserve HashJoin's equivalence properties by extracting
     /// equality conditions from the filter.
+    #[allow(clippy::too_many_arguments)]
     fn compute_properties(
         left: &Arc<dyn ExecutionPlan>,
         right: &Arc<dyn ExecutionPlan>,
+        on: &SpatialPredicate,
         schema: SchemaRef,
         join_type: JoinType,
         projection: Option<&Vec<usize>>,
@@ -271,7 +274,13 @@ impl SpatialJoinExec {
 
         // Use symmetric partitioning (like HashJoin) when converted from HashJoin
         // Otherwise use asymmetric partitioning (like NestedLoopJoin)
-        let mut output_partitioning = if converted_from_hash_join {
+        let mut output_partitioning = if let SpatialPredicate::KNearestNeighbors(knn) = on {
+            match knn.probe_side {
+                JoinSide::Left => left.output_partitioning().clone(),
+                JoinSide::Right => right.output_partitioning().clone(),
+                _ => asymmetric_join_output_partitioning(left, right, &join_type)?,
+            }
+        } else if converted_from_hash_join {
             // Replicate HashJoin's symmetric partitioning logic
             // HashJoin preserves partitioning from both sides for inner joins
             // and from one side for outer joins
@@ -629,6 +638,7 @@ impl SpatialJoinExec {
 
 #[cfg(test)]
 mod tests {
+    use arrow_array::Array;
     use arrow_array::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
@@ -638,12 +648,17 @@ mod tests {
     };
     use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion_physical_plan::joins::NestedLoopJoinExec;
+    use geo::Distance;
+    use geo::Euclidean;
     use geo_types::{Coord, Rect};
     use rstest::rstest;
+    use sedona_geo::to_geo::item_to_geometry;
     use sedona_geometry::types::GeometryTypeId;
     use sedona_schema::datatypes::{SedonaType, WKB_GEOGRAPHY, WKB_GEOMETRY};
     use sedona_testing::datagen::RandomPartitionedDataBuilder;
+    use std::cmp::Ordering;
     use tokio::sync::OnceCell;
+    use wkb::reader::read_wkb;
 
     use crate::register_spatial_join_optimizer;
     use sedona_common::{
@@ -703,6 +718,40 @@ mod tests {
         left_data.1.push(vec![]);
         right_data.1.insert(0, vec![]);
         right_data.1.push(vec![]);
+
+        Ok((left_data, right_data))
+    }
+
+    /// Creates test data for KNN join (Point-Point)
+    fn create_knn_test_data(
+        size_range: (f64, f64),
+        sedona_type: SedonaType,
+    ) -> Result<(TestPartitions, TestPartitions)> {
+        let bounds = Rect::new(Coord { x: 0.0, y: 0.0 }, Coord { x: 100.0, y: 100.0 });
+
+        let left_data = RandomPartitionedDataBuilder::new()
+            .seed(1)
+            .num_partitions(2)
+            .batches_per_partition(2)
+            .rows_per_batch(30)
+            .geometry_type(GeometryTypeId::Point)
+            .sedona_type(sedona_type.clone())
+            .bounds(bounds)
+            .size_range(size_range)
+            .null_rate(0.1)
+            .build()?;
+
+        let right_data = RandomPartitionedDataBuilder::new()
+            .seed(2)
+            .num_partitions(4)
+            .batches_per_partition(4)
+            .rows_per_batch(30)
+            .geometry_type(GeometryTypeId::Point)
+            .sedona_type(sedona_type)
+            .bounds(bounds)
+            .size_range(size_range)
+            .null_rate(0.1)
+            .build()?;
 
         Ok((left_data, right_data))
     }
@@ -1408,6 +1457,159 @@ mod tests {
         let mark_batch = run_and_sort(Arc::new(mark_exec), &ctx).await?;
         let mark_nlj_batch = run_and_sort(Arc::new(mark_nlj), &ctx_no_opt).await?;
         assert_eq!(mark_batch, mark_nlj_batch);
+
+        Ok(())
+    }
+
+    fn extract_geoms_and_ids(partitions: &[Vec<RecordBatch>]) -> Vec<(i32, geo::Geometry<f64>)> {
+        let mut result = Vec::new();
+        for partition in partitions {
+            for batch in partition {
+                let id_idx = batch.schema().index_of("id").expect("Id column not found");
+                let ids = batch
+                    .column(id_idx)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int32Array>()
+                    .expect("Column 'id' should be Int32");
+
+                let geom_idx = batch
+                    .schema()
+                    .index_of("geometry")
+                    .expect("Geometry column not found");
+                let geoms_col = batch.column(geom_idx);
+                let geoms_binary = geoms_col
+                    .as_any()
+                    .downcast_ref::<arrow_array::BinaryArray>();
+                let geoms_binary_view = geoms_col
+                    .as_any()
+                    .downcast_ref::<arrow_array::BinaryViewArray>();
+
+                if geoms_binary.is_none() && geoms_binary_view.is_none() {
+                    panic!(
+                        "Column 'geometry' should be Binary or BinaryView. Schema: {:?}",
+                        batch.schema()
+                    );
+                }
+
+                for i in 0..batch.num_rows() {
+                    if ids.is_null(i) {
+                        continue;
+                    }
+                    let id = ids.value(i);
+
+                    let geom_bytes = if let Some(arr) = geoms_binary {
+                        if arr.is_null(i) {
+                            continue;
+                        }
+                        arr.value(i)
+                    } else {
+                        let arr = geoms_binary_view.unwrap();
+                        if arr.is_null(i) {
+                            continue;
+                        }
+                        arr.value(i)
+                    };
+
+                    let geom_wkb = read_wkb(&mut &*geom_bytes).expect("Failed to parse WKB");
+                    let geom = item_to_geometry(geom_wkb).expect("Failed to parse WKB");
+                    result.push((id, geom));
+                }
+            }
+        }
+        result
+    }
+
+    fn compute_knn_ground_truth(
+        left_partitions: &[Vec<RecordBatch>],
+        right_partitions: &[Vec<RecordBatch>],
+        k: usize,
+    ) -> Vec<(i32, i32, f64)> {
+        let left_data = extract_geoms_and_ids(left_partitions);
+        let right_data = extract_geoms_and_ids(right_partitions);
+
+        let mut results = Vec::new();
+
+        for (l_id, l_geom) in left_data {
+            let mut distances: Vec<(i32, f64)> = right_data
+                .iter()
+                .map(|(r_id, r_geom)| (*r_id, Euclidean.distance(&l_geom, r_geom)))
+                .collect();
+
+            // Sort by distance, then by ID for stability
+            distances.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+
+            for i in 0..k.min(distances.len()) {
+                results.push((l_id, distances[i].0, distances[i].1));
+            }
+        }
+
+        // Sort results by L.id, R.id
+        results.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        results
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_knn_join_correctness(#[values(1, 2, 3, 4)] num_partitions: usize) -> Result<()> {
+        // Generate slightly larger data
+        let ((left_schema, left_partitions), (right_schema, right_partitions)) =
+            create_knn_test_data((0.1, 10.0), WKB_GEOMETRY)?;
+
+        // Use single partition to verify algorithm correctness first, avoiding partitioning issues
+        let options = SpatialJoinOptions {
+            debug: SpatialJoinDebugOptions {
+                num_spatial_partitions: NumSpatialPartitionsConfig::Fixed(num_partitions),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let k = 3;
+        let sql = format!(
+            "SELECT L.id, R.id, ST_Distance(L.geometry, R.geometry) FROM L JOIN R ON ST_KNN(L.geometry, R.geometry, {}, false) ORDER BY L.id, R.id",
+            k
+        );
+
+        let batches = run_spatial_join_query(
+            &left_schema,
+            &right_schema,
+            left_partitions.clone(),
+            right_partitions.clone(),
+            Some(options),
+            10,
+            &sql,
+        )
+        .await?;
+
+        // Collect actual results
+        let mut actual_results = Vec::new();
+        let combined_batch = arrow::compute::concat_batches(&batches.schema(), &[batches])?;
+        let l_ids = combined_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap();
+        let r_ids = combined_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap();
+
+        for i in 0..combined_batch.num_rows() {
+            actual_results.push((l_ids.value(i), r_ids.value(i)));
+        }
+        actual_results.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        // Compute ground truth
+        let expected_results = compute_knn_ground_truth(&left_partitions, &right_partitions, k)
+            .into_iter()
+            .map(|(l, r, _)| (l, r))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual_results, expected_results);
 
         Ok(())
     }

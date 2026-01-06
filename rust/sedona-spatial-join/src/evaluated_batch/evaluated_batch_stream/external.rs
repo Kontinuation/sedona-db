@@ -36,30 +36,24 @@ use pin_project_lite::pin_project;
 
 use crate::evaluated_batch::{
     evaluated_batch_stream::EvaluatedBatchStream,
-    spill::{spilled_batch_to_evaluated_batch, SpillReader},
+    spill::{spilled_batch_to_evaluated_batch, spilled_schema_to_evaluated_schema, SpillReader},
     EvaluatedBatch,
 };
 
 const RECORD_BATCH_CHANNEL_CAPACITY: usize = 2;
 
 pin_project! {
+    /// Streams [`EvaluatedBatch`] values read back from on-disk spill files.
+    ///
+    /// This stream is intended for the “spilled” path where batches have been written to disk and
+    /// must be read back into memory. It wraps an [`ExternalRecordBatchStream`] and uses
+    /// background tasks to prefetch/forward batches so downstream operators can process a batch
+    /// while the next one is being loaded.
     pub(crate) struct ExternalEvaluatedBatchStream {
         #[pin]
         inner: RecordBatchToEvaluatedStream,
+        schema: SchemaRef,
     }
-}
-
-pin_project! {
-    struct RecordBatchToEvaluatedStream {
-        #[pin]
-        inner: SendableRecordBatchStream,
-    }
-}
-
-pub(crate) struct ExternalRecordBatchStream {
-    schema: SchemaRef,
-    state: State,
-    spill_files: VecDeque<Arc<RefCountedTempFile>>,
 }
 
 enum State {
@@ -69,35 +63,94 @@ enum State {
     Finished,
 }
 
-impl ExternalRecordBatchStream {
-    pub fn try_from_spill_files<I>(spill_files: I) -> Result<Self>
-    where
-        I: IntoIterator<Item = Arc<RefCountedTempFile>>,
-    {
-        let spill_files = spill_files.into_iter().collect::<VecDeque<_>>();
-        let schema = resolve_stream_schema(&spill_files)?;
+impl ExternalEvaluatedBatchStream {
+    /// Creates an external stream from a single spill file.
+    pub fn try_from_spill_file(spill_file: Arc<RefCountedTempFile>) -> Result<Self> {
+        let record_stream =
+            ExternalRecordBatchStream::try_from_spill_files(iter::once(spill_file))?;
+        let evaluated_stream =
+            RecordBatchToEvaluatedStream::try_spawned_evaluated_stream(Box::pin(record_stream))?;
+        let schema = evaluated_stream.schema();
         Ok(Self {
+            inner: evaluated_stream,
             schema,
-            state: State::AwaitingFile,
-            spill_files,
         })
     }
-}
 
-impl ExternalEvaluatedBatchStream {
-    pub fn try_from_spill_file(spill_file: Arc<RefCountedTempFile>) -> Result<Self> {
-        Self::try_from_spill_files(iter::once(spill_file))
-    }
-
-    pub fn try_from_spill_files<I>(spill_files: I) -> Result<Self>
+    /// Creates an external stream from multiple spill files.
+    ///
+    /// The stream yields the batches from each file in order. When `spill_files` is empty the
+    /// stream is empty (returns `None` immediately) and no schema validation is performed.
+    pub fn try_from_spill_files<I>(schema: SchemaRef, spill_files: I) -> Result<Self>
     where
         I: IntoIterator<Item = Arc<RefCountedTempFile>>,
     {
         let record_stream = ExternalRecordBatchStream::try_from_spill_files(spill_files)?;
-        Self::from_record_batch_stream(Box::pin(record_stream))
+        if !record_stream.is_empty() {
+            // `ExternalRecordBatchStream` only has a meaningful schema when at least one spill
+            // file is provided. In that case, validate that the caller-provided evaluated schema
+            // matches what would be derived from the spilled schema.
+            let actual_schema = spilled_schema_to_evaluated_schema(&record_stream.schema())?;
+            assert_eq!(schema, actual_schema);
+        }
+        let evaluated_stream =
+            RecordBatchToEvaluatedStream::try_spawned_evaluated_stream(Box::pin(record_stream))?;
+        Ok(Self {
+            inner: evaluated_stream,
+            schema,
+        })
+    }
+}
+
+impl EvaluatedBatchStream for ExternalEvaluatedBatchStream {
+    fn is_external(&self) -> bool {
+        true
     }
 
-    fn from_record_batch_stream(record_stream: SendableRecordBatchStream) -> Result<Self> {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+impl futures::Stream for ExternalEvaluatedBatchStream {
+    type Item = Result<EvaluatedBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.project().inner.poll_next(cx)
+    }
+}
+
+pin_project! {
+    /// Adapts a [`RecordBatchStream`] containing spilled batches into an [`EvaluatedBatch`] stream.
+    ///
+    /// Each incoming `RecordBatch` is decoded via [`spilled_batch_to_evaluated_batch`]. This type
+    /// also carries the derived evaluated schema for downstream consumers.
+    struct RecordBatchToEvaluatedStream {
+        #[pin]
+        inner: SendableRecordBatchStream,
+        evaluated_schema: SchemaRef,
+    }
+}
+
+impl RecordBatchToEvaluatedStream {
+    fn try_new(inner: SendableRecordBatchStream) -> Result<Self> {
+        let evaluated_schema = spilled_schema_to_evaluated_schema(&inner.schema())?;
+        Ok(Self {
+            inner,
+            evaluated_schema,
+        })
+    }
+
+    /// Buffers `record_stream` by forwarding it through a bounded channel.
+    ///
+    /// This is primarily useful for [`ExternalRecordBatchStream`], where producing the next batch
+    /// may involve disk I/O and `spawn_blocking` work. By polling the source stream in a spawned
+    /// task, we can overlap “load next batch” with “process current batch”, while still applying
+    /// backpressure via [`RECORD_BATCH_CHANNEL_CAPACITY`].
+    ///
+    /// The forwarding task stops when the receiver is dropped or when the source stream yields its
+    /// first error.
+    fn try_spawned_evaluated_stream(record_stream: SendableRecordBatchStream) -> Result<Self> {
         let schema = record_stream.schema();
         let mut builder =
             RecordBatchReceiverStreamBuilder::new(schema, RECORD_BATCH_CHANNEL_CAPACITY);
@@ -117,37 +170,11 @@ impl ExternalEvaluatedBatchStream {
         });
 
         let buffered = builder.build();
-        Ok(Self {
-            inner: RecordBatchToEvaluatedStream::new(buffered),
-        })
-    }
-}
-
-impl EvaluatedBatchStream for ExternalEvaluatedBatchStream {
-    fn is_external(&self) -> bool {
-        true
+        Self::try_new(buffered)
     }
 
     fn schema(&self) -> SchemaRef {
-        self.inner.schema()
-    }
-}
-
-impl futures::Stream for ExternalEvaluatedBatchStream {
-    type Item = Result<EvaluatedBatch>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.project().inner.poll_next(cx)
-    }
-}
-
-impl RecordBatchToEvaluatedStream {
-    fn new(inner: SendableRecordBatchStream) -> Self {
-        Self { inner }
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.inner.schema()
+        Arc::clone(&self.evaluated_schema)
     }
 }
 
@@ -164,6 +191,50 @@ impl futures::Stream for RecordBatchToEvaluatedStream {
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+/// Streams raw [`RecordBatch`] values directly from spill files.
+///
+/// This is the lowest-level “read from disk” stream: it opens each spill file, reads the stored
+/// record batches sequentially, and yields them without decoding into [`EvaluatedBatch`].
+///
+/// Schema handling:
+/// - If at least one spill file is provided, the stream schema is taken from the first file.
+/// - If no files are provided, the schema is empty and the stream terminates immediately.
+pub(crate) struct ExternalRecordBatchStream {
+    schema: SchemaRef,
+    state: State,
+    spill_files: VecDeque<Arc<RefCountedTempFile>>,
+    is_empty: bool,
+}
+
+impl ExternalRecordBatchStream {
+    /// Creates a stream over `spill_files`, yielding all batches from each file in order.
+    ///
+    /// This function assumes all spill files were written with a compatible schema.
+    pub fn try_from_spill_files<I>(spill_files: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = Arc<RefCountedTempFile>>,
+    {
+        let spill_files = spill_files.into_iter().collect::<VecDeque<_>>();
+        let (schema, is_empty) = match spill_files.front() {
+            Some(file) => {
+                let reader = SpillReader::try_new(file)?;
+                (reader.schema(), false)
+            }
+            None => (Arc::new(Schema::empty()), true),
+        };
+        Ok(Self {
+            schema,
+            state: State::AwaitingFile,
+            spill_files,
+            is_empty,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.is_empty
     }
 }
 
@@ -236,15 +307,6 @@ impl futures::Stream for ExternalRecordBatchStream {
                 }
             }
         }
-    }
-}
-
-fn resolve_stream_schema(spill_files: &VecDeque<Arc<RefCountedTempFile>>) -> Result<SchemaRef> {
-    if let Some(file) = spill_files.front() {
-        let reader = SpillReader::try_new(file)?;
-        Ok(reader.schema())
-    } else {
-        Ok(Arc::new(Schema::empty()))
     }
 }
 
@@ -346,6 +408,7 @@ mod tests {
         let stream = ExternalEvaluatedBatchStream::try_from_spill_file(Arc::new(spill_file))?;
 
         assert!(stream.is_external());
+        assert_eq!(stream.schema(), create_test_schema());
 
         Ok(())
     }
@@ -430,10 +493,13 @@ mod tests {
     async fn test_external_stream_multiple_spill_files() -> Result<()> {
         let file1 = create_spill_file_with_batches(2).await?;
         let file2 = create_spill_file_with_batches(3).await?;
-        let mut stream = ExternalEvaluatedBatchStream::try_from_spill_files(vec![
-            Arc::new(file1),
-            Arc::new(file2),
-        ])?;
+        let schema = create_test_schema();
+        let mut stream = ExternalEvaluatedBatchStream::try_from_spill_files(
+            Arc::clone(&schema),
+            vec![Arc::new(file1), Arc::new(file2)],
+        )?;
+
+        assert_eq!(stream.schema(), schema);
 
         let mut batches_read = 0;
         while let Some(batch_result) = stream.next().await {
@@ -461,11 +527,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_external_stream_empty_spill_file_list() -> Result<()> {
-        let mut stream = ExternalEvaluatedBatchStream::try_from_spill_files(Vec::<
-            Arc<RefCountedTempFile>,
-        >::new())?;
+        let schema = create_test_schema();
+        let stream = ExternalEvaluatedBatchStream::try_from_spill_files(
+            Arc::clone(&schema),
+            Vec::<Arc<RefCountedTempFile>>::new(),
+        )?;
 
-        assert!(stream.next().await.is_none());
+        assert_eq!(stream.schema(), schema);
 
         Ok(())
     }

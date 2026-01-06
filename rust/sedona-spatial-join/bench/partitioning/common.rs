@@ -20,6 +20,7 @@
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use sedona_geometry::{bounding_box::BoundingBox, interval::IntervalTrait};
 
+#[allow(unused)]
 pub const GRID_DIM: usize = 4; // 4x4 grid => 16 partitions like typical workloads
 pub const QUERY_BATCH_SIZE: usize = 1_024;
 pub const RNG_SEED: u64 = 0x5ED0_4A7E;
@@ -28,6 +29,7 @@ pub fn default_extent() -> BoundingBox {
     BoundingBox::xy((0.0, 10_000.0), (0.0, 10_000.0))
 }
 
+#[allow(unused)]
 pub fn grid_partitions(extent: &BoundingBox, cells_per_axis: usize) -> Vec<BoundingBox> {
     let min_x = extent.x().lo();
     let max_x = extent.x().hi();

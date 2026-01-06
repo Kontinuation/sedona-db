@@ -18,6 +18,7 @@
 use std::ops::DerefMut;
 use std::sync::Arc;
 
+use arrow_schema::SchemaRef;
 use datafusion::config::SpillCompression;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::runtime_env::RuntimeEnv;
@@ -49,6 +50,7 @@ pub(crate) struct PartitionedProbeStreamProvider {
     state: Arc<Mutex<ProbeStreamState>>,
     runtime_env: Arc<RuntimeEnv>,
     options: ProbeStreamOptions,
+    schema: SchemaRef,
     metrics: ProbeStreamMetrics,
 }
 
@@ -71,10 +73,12 @@ impl PartitionedProbeStreamProvider {
         source: SendableEvaluatedBatchStream,
         metrics: ProbeStreamMetrics,
     ) -> Self {
+        let schema = source.schema();
         Self {
             state: Arc::new(Mutex::new(ProbeStreamState::Pending { source })),
             runtime_env,
             options,
+            schema,
             metrics,
         }
     }
@@ -102,6 +106,7 @@ impl PartitionedProbeStreamProvider {
             return self.non_partitioned_first_pass_stream();
         }
 
+        let schema = Arc::clone(&self.schema);
         let mut state_guard = self.state.lock();
         match std::mem::replace(&mut *state_guard, ProbeStreamState::FirstPass) {
             ProbeStreamState::Pending { source } => {
@@ -148,7 +153,7 @@ impl PartitionedProbeStreamProvider {
                                 .and_then(|_| check_empty(SpatialPartition::None))
                             {
                                 Ok(_) => ProbeStreamState::SubsequentPass {
-                                    manifest: ProbePartitionManifest::new(spills),
+                                    manifest: ProbePartitionManifest::new(schema, spills),
                                 },
                                 Err(err) => ProbeStreamState::Failed(Arc::new(err)),
                             }
@@ -242,12 +247,16 @@ impl PartitionedProbeStreamProvider {
 }
 
 pub struct ProbePartitionManifest {
+    schema: SchemaRef,
     slots: SpilledPartitions,
 }
 
 impl ProbePartitionManifest {
-    fn new(spills: SpilledPartitions) -> Self {
-        Self { slots: spills }
+    fn new(schema: SchemaRef, spills: SpilledPartitions) -> Self {
+        Self {
+            schema,
+            slots: spills,
+        }
     }
 
     fn get_partition_row_count(&self, partition: SpatialPartition) -> Result<usize> {
@@ -266,13 +275,19 @@ impl ProbePartitionManifest {
             SpatialPartition::Regular(_) => {
                 let spilled = self.slots.take_spilled_partition(partition)?;
                 Ok(Box::pin(
-                    ExternalEvaluatedBatchStream::try_from_spill_files(spilled.into_spill_files())?,
+                    ExternalEvaluatedBatchStream::try_from_spill_files(
+                        Arc::clone(&self.schema),
+                        spilled.into_spill_files(),
+                    )?,
                 ))
             }
             SpatialPartition::Multi => {
                 let spilled = self.slots.get_spilled_partition(partition)?;
                 Ok(Box::pin(
-                    ExternalEvaluatedBatchStream::try_from_spill_files(spilled.into_spill_files())?,
+                    ExternalEvaluatedBatchStream::try_from_spill_files(
+                        Arc::clone(&self.schema),
+                        spilled.into_spill_files(),
+                    )?,
                 ))
             }
         }

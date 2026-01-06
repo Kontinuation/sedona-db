@@ -38,8 +38,10 @@ use crate::{
         BuildSideBatchesCollector, CollectBuildSideMetrics, SpatialJoinBuildMetrics,
     },
     partitioning::{
+        broadcast::BroadcastPartitioner,
         flat::FlatPartitioner,
         kdb::KDBPartitioner,
+        round_robin::RoundRobinPartitioner,
         stream_repartitioner::{
             repartition_evaluated_batches, SpilledPartition, SpilledPartitions,
         },
@@ -194,53 +196,63 @@ pub(crate) async fn prepare_spatial_join_components(
             probe_stream_options,
         })
     } else {
-        // TODO: implement spatial partitioned spatial join for KNN joins
-        if matches!(spatial_predicate, SpatialPredicate::KNearestNeighbors(_)) {
-            return sedona_internal_err!(
-                "KNN spatial predicate is not supported for multi-partition spatial join"
-            );
-        }
+        let build_partitioner: Arc<dyn SpatialPartitioner> =
+            if matches!(spatial_predicate, SpatialPredicate::KNearestNeighbors(_)) {
+                // Spatial partitioning does not work well for KNN joins, so we simply use round-robin
+                // partitioning to spread the indexed data evenly to make each index fit in memory, and
+                // the probe side will be broadcasted to all partitions by partitioning all of them to
+                // the Multi partition.
+                Arc::new(RoundRobinPartitioner::new(num_partitions))
+            } else {
+                // Use spatial partitioners to partition the build side and the probe side, this will
+                // reduce the amount of work needed for probing each partitioned index.
+                // The KDB partitioner is built using the collected bounding box samples.
+                let mut bbox_samples = BoundingBoxSamples::empty();
+                let mut geo_stats = GeoStatistics::empty();
+                for partition in &mut build_partitions {
+                    let samples = mem::take(&mut partition.bbox_samples);
+                    bbox_samples = bbox_samples.combine(samples, &mut rng);
+                    geo_stats.merge(&partition.geo_statistics);
+                }
 
-        let mut bbox_samples = BoundingBoxSamples::empty();
-        let mut geo_stats = GeoStatistics::empty();
-        for partition in &mut build_partitions {
-            let samples = mem::take(&mut partition.bbox_samples);
-            bbox_samples = bbox_samples.combine(samples, &mut rng);
-            geo_stats.merge(&partition.geo_statistics);
-        }
+                let extent = geo_stats
+                    .bbox()
+                    .cloned()
+                    .unwrap_or(BoundingBox::xy((0, 0), (0, 0)));
+                let extent = if extent.is_empty() {
+                    BoundingBox::xy((0, 0), (0, 0))
+                } else {
+                    extent
+                };
+                let mut samples = bbox_samples.take_samples();
+                let max_items_per_node = 1.max(samples.len() / num_partitions);
+                let max_levels = num_partitions;
 
-        let extent = geo_stats
-            .bbox()
-            .cloned()
-            .unwrap_or(BoundingBox::xy((0, 0), (0, 0)));
-        let extent = if extent.is_empty() {
-            BoundingBox::xy((0, 0), (0, 0))
-        } else {
-            extent
-        };
-        let mut samples = bbox_samples.take_samples();
-        let max_items_per_node = 1.max(samples.len() / num_partitions);
-        let max_levels = num_partitions;
+                log::info!(
+                    "Number of samples: {}, max_items_per_node: {}, max_levels: {}",
+                    samples.len(),
+                    max_items_per_node,
+                    max_levels
+                );
+                rng.shuffle(&mut samples);
+                let kdb_partitioner = KDBPartitioner::build(
+                    samples.into_iter(),
+                    max_items_per_node,
+                    max_levels,
+                    extent,
+                )?;
+                log::info!(
+                    "Built KDB spatial partitioner with {} partitions",
+                    num_partitions
+                );
+                let mut kdb_dbg_str = String::new();
+                if kdb_partitioner.debug_print(&mut kdb_dbg_str).is_ok() {
+                    log::info!("KDB partitioner debug info:\n{}", kdb_dbg_str);
+                }
 
-        log::info!(
-            "Number of samples: {}, max_items_per_node: {}, max_levels: {}",
-            samples.len(),
-            max_items_per_node,
-            max_levels
-        );
-        rng.shuffle(&mut samples);
-        let kdb_partitioner =
-            KDBPartitioner::build(samples.into_iter(), max_items_per_node, max_levels, extent)?;
-        log::info!(
-            "Built KDB spatial partitioner with {} partitions",
-            num_partitions
-        );
-        let mut kdb_dbg_str = String::new();
-        if kdb_partitioner.debug_print(&mut kdb_dbg_str).is_ok() {
-            log::info!("KDB partitioner debug info:\n{}", kdb_dbg_str);
-        }
+                Arc::new(kdb_partitioner)
+            };
 
-        let build_partitioner: Arc<dyn SpatialPartitioner> = Arc::new(kdb_partitioner);
         let num_partitions = build_partitioner.num_regular_partitions();
         log::info!("Actual number of spatial partitions: {}", num_partitions);
 
@@ -280,18 +292,10 @@ pub(crate) async fn prepare_spatial_join_components(
             partitioned_spill_files_vec.push(result?);
         }
 
-        log::info!("Per-index-partition spilled partitions collected.");
-        for (k, spilled_partitions) in partitioned_spill_files_vec.iter().enumerate() {
-            let mut s = String::new();
-            if spilled_partitions.debug_print(&mut s).is_ok() {
-                log::info!("Build partition {} spilled partitions:\n{}", k, s);
-            }
-        }
-
         let merged_spilled_partitions = merge_spilled_partitions(partitioned_spill_files_vec)?;
-        let mut s = String::new();
-        if merged_spilled_partitions.debug_print(&mut s).is_ok() {
-            log::info!("Build side spatial partitions:\n{}", s);
+        let mut dbg_str = String::new();
+        if merged_spilled_partitions.debug_print(&mut dbg_str).is_ok() {
+            log::info!("Build side spatial partitions:\n{}", dbg_str);
         }
 
         // Sanity check: Multi and None partitions must be empty. All the geometries in the build side
@@ -306,18 +310,23 @@ pub(crate) async fn prepare_spatial_join_components(
             }
         }
 
-        // Build a flat partitioner using these partitions
-        let mut partition_bounds = Vec::with_capacity(num_partitions);
-        for k in 0..num_partitions {
-            let partition = SpatialPartition::Regular(k as u32);
-            let partition_bound = merged_spilled_partitions
-                .spilled_partition(partition)?
-                .bounding_box()
-                .cloned()
-                .unwrap_or(BoundingBox::empty());
-            partition_bounds.push(partition_bound);
-        }
-        let probe_partitioner = Arc::new(FlatPartitioner::try_new(partition_bounds)?);
+        let probe_partitioner: Arc<dyn SpatialPartitioner> =
+            if matches!(spatial_predicate, SpatialPredicate::KNearestNeighbors(_)) {
+                Arc::new(BroadcastPartitioner::new(num_partitions))
+            } else {
+                // Build a flat partitioner using these partitions
+                let mut partition_bounds = Vec::with_capacity(num_partitions);
+                for k in 0..num_partitions {
+                    let partition = SpatialPartition::Regular(k as u32);
+                    let partition_bound = merged_spilled_partitions
+                        .spilled_partition(partition)?
+                        .bounding_box()
+                        .cloned()
+                        .unwrap_or(BoundingBox::empty());
+                    partition_bounds.push(partition_bound);
+                }
+                Arc::new(FlatPartitioner::try_new(partition_bounds)?)
+            };
 
         let partitioned_index_provider = PartitionedIndexProvider::new_multi_partition(
             build_schema,

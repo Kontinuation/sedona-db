@@ -59,7 +59,7 @@ use sedona_common::option::SpatialJoinOptions;
 pub(crate) struct SpatialJoinStream {
     /// The partition id of the probe side stream
     probe_partition_id: usize,
-    /// Input schema
+    /// Schema of joined results
     schema: Arc<Schema>,
     /// join filter
     filter: Option<JoinFilter>,

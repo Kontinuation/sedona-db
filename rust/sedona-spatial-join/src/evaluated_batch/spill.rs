@@ -31,6 +31,7 @@ use datafusion_common::{DataFusionError, Result, ScalarValue};
 use datafusion_execution::{disk_manager::RefCountedTempFile, runtime_env::RuntimeEnv};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_plan::metrics::SpillMetrics;
+use sedona_common::sedona_internal_err;
 use sedona_schema::datatypes::SedonaType;
 
 use crate::{
@@ -322,6 +323,21 @@ pub(crate) fn spilled_batch_to_evaluated_batch(
     geom_array.distance = distance;
 
     Ok(EvaluatedBatch { batch, geom_array })
+}
+
+pub(crate) fn spilled_schema_to_evaluated_schema(spilled_schema: &SchemaRef) -> Result<SchemaRef> {
+    if spilled_schema.fields().is_empty() {
+        return Ok(SchemaRef::new(Schema::empty()));
+    }
+
+    let data_field = spilled_schema.field(0);
+    let inner_fields = match data_field.data_type() {
+        DataType::Struct(fields) => fields.clone(),
+        _ => {
+            return sedona_internal_err!("Invalid schema of spilled file: {:?}", spilled_schema);
+        }
+    };
+    Ok(SchemaRef::new(Schema::new(inner_fields)))
 }
 
 #[cfg(test)]

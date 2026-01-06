@@ -318,8 +318,7 @@ impl PartitionedIndexProvider {
             let tx = tx.clone();
             join_set.spawn(async move {
                 let result = async {
-                    let mut stream =
-                        ExternalEvaluatedBatchStream::try_from_spill_files(vec![spill_file])?;
+                    let mut stream = ExternalEvaluatedBatchStream::try_from_spill_file(spill_file)?;
                     while let Some(batch) = stream.next().await {
                         let indexed_batch = batch?;
                         if tx.send(Ok(indexed_batch)).await.is_err() {
