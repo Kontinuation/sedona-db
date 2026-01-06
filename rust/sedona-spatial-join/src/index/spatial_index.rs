@@ -219,6 +219,25 @@ impl SpatialIndex {
         include_tie_breakers: bool,
         build_batch_positions: &mut Vec<(i32, i32)>,
     ) -> Result<QueryResultMetrics> {
+        self.query_knn_with_distance(
+            probe_wkb,
+            k,
+            use_spheroid,
+            include_tie_breakers,
+            build_batch_positions,
+            None,
+        )
+    }
+
+    pub(crate) fn query_knn_with_distance(
+        &self,
+        probe_wkb: &Wkb,
+        k: u32,
+        use_spheroid: bool,
+        include_tie_breakers: bool,
+        build_batch_positions: &mut Vec<(i32, i32)>,
+        mut distances: Option<&mut Vec<f64>>,
+    ) -> Result<QueryResultMetrics> {
         if k == 0 {
             return Ok(QueryResultMetrics {
                 count: 0,
@@ -386,6 +405,17 @@ impl SpatialIndex {
         for &result_idx in &final_results {
             if (result_idx as usize) < self.data_id_to_batch_pos.len() {
                 build_batch_positions.push(self.data_id_to_batch_pos[result_idx as usize]);
+
+                if let Some(dists) = distances.as_mut() {
+                    let mut dist = f64::NAN;
+                    if let Some(item_geom) = geometry_accessor.get_geometry(result_idx as usize) {
+                        dist = distance_metric
+                            .distance_to_geometry(&probe_geom, item_geom)
+                            .to_f64()
+                            .unwrap_or(f64::NAN);
+                    }
+                    dists.push(dist);
+                }
             }
         }
 

@@ -4,146 +4,76 @@
 The current implementation of partitioned KNN join introduces significant complexity into `SpatialJoinStream` (in `stream.rs`). It adds multiple KNN-specific fields (spill files, writers, schemas) and modifies the state machine logic directly, violating the Single Responsibility Principle. The goal is to encapsulate KNN-specific logic (spilling, merging, result generation) into a dedicated abstraction, keeping `stream.rs` clean and focused on the high-level join orchestration.
 
 ## 2. Proposed Solution
-We will introduce a `ProbeStreamProvider` abstraction (implemented as an enum) that unifies the handling of probe streams for both standard spatial joins and KNN joins. 
 
-- **Standard Spatial Join**: Uses `PartitionedProbeStreamProvider` (existing).
-- **KNN Join**: Uses a new `KNNProbeStreamProvider` (to be created).
+We will introduce a `KNNResultsMerger` abstraction that handles KNN query results spilling and merging for KNN joins.
 
-`SpatialJoinStream` will interact with this provider interface, delegating the details of stream fetching, result processing, and spilling to the provider.
+`SpatialJoinStream` will have a `Arc<KNNResultsMerger>` member.
 
-## 3. Detailed Design
+We will use a Broadcast partitioner when running KNN join, which means that all the probe side data will be processed for each indexed partition. `KNNResultsMerger`'s
+duty is to merge the results of probing each index partition to form the final results.
 
-### 3.1. `ProbeStreamProvider` Enum
-We will define an enum `ProbeStreamProvider` in `src/probe/mod.rs` or `src/stream.rs` (or a new module) that wraps the two implementations.
+The spill files `KNNResultsMerger` manages contains currently k-nearest-so-far results. It should have a schema like this:
 
-```rust
-pub(crate) enum ProbeStreamProvider {
-    Standard(PartitionedProbeStreamProvider),
-    Knn(KNNProbeStreamProvider),
-}
+```
+Struct([
+    Field("rows",
+        Array(
+            Struct([
+                Field("row": Struct(<the schema of the final KNN join result>)),
+                Field("dist": Float64)
+            ])
+        )
+    ),
+    Field("unfiltered_dists", Array(Float64))
+])
 ```
 
-This enum will expose the following interface methods:
+Basically, each row in the spill file is an array of k-nearest-so-far results we have seen. We call it "k-nearest-so-far" because we have only processed the
+previous K-1 indexed partitions (assuming the current indexed partition is K). The records in the current indexed partition may be more near than what have seen
+in the previous K-1 partitions. Certainly, after processing all the indexed partitions, we'll get the final k-nearest results.
 
-1.  **`stream_for`**: Returns the probe stream for a given partition.
-    ```rust
-    fn stream_for(&self, partition: SpatialPartition) -> Result<SendableEvaluatedBatchStream>;
-    ```
-    - *Standard*: Delegates to `PartitionedProbeStreamProvider::stream_for`.
-    - *KNN*: Handles the logic to force `SpatialPartition::Multi` (or `Regular(0)` for single-partition) regardless of the requested partition, as KNN needs to probe all rows against every index partition.
+Each `KNNResultsMerger` should maintain 2 spill files:
 
-2.  **`prepare_for_partition`**: Called when `SpatialJoinStream` moves to a new build (index) partition.
-    ```rust
-    fn prepare_for_partition(&mut self, partition_id: usize) -> Result<()>;
-    ```
-    - *Standard*: No-op.
-    - *KNN*: Rotates spill files. The `next` spill file from the previous round becomes the `prev` input stream for the current round. Creates a new `next` spill file for the current round.
+- `previous`: The k-nearest-so-far results for K-1 partitions, it is read only for current round.
+- `current`: The spill files to be written for k-nearest-so-far results for K partitions.
 
-3.  **`process_batch_result`**: Processes a result batch produced by the `SpatialJoinBatchIterator`.
-    ```rust
-    fn process_batch_result(
-        &mut self, 
-        batch: RecordBatch, 
-        probe_indices: Option<Vec<u32>>,
-        is_last_partition: bool
-    ) -> Result<Option<RecordBatch>>;
-    ```
-    - *Standard*: Returns `Ok(Some(batch))`. The stream immediately yields this batch.
-    - *KNN*: 
-        - Accumulates the batch and `probe_indices`.
-        - If the probe batch is complete (logic handled internally or via flag), it performs the **Merge & Spill** operation:
-            - Merges current results with results from `prev` spill file (if any).
-            - Keeps top-K for each probe row.
-            - If `!is_last_partition`: Writes the refined results to `next` spill file. Returns `Ok(None)`.
-            - If `is_last_partition`: Returns `Ok(Some(final_batch))`.
+Once we processed a indexed partition, we rotate the spill files: `current` is now `previous`, and we create a new file for writting `current`.
 
-### 3.2. `KNNProbeStreamProvider`
-A new struct `KNNProbeStreamProvider` will be created (likely in `src/probe/knn_stream_provider.rs`). It will encapsulate all the fields previously added to `SpatialJoinStream`:
+## 3. Coarse Directions to Implementation
 
-- `knn_spill_file`, `knn_next_spill_file`
-- `knn_prev_stream`, `knn_next_writer`
-- `knn_schema`
-- `knn_current_probe_batch_results`
-- `partitioned_provider`: The underlying `PartitionedProbeStreamProvider` to fetch raw probe batches.
+### Changing the query_knn method of `SpatialIndex`
 
-### 3.3. `SpatialJoinStream` Refactoring
+`SpatialIndex::query_knn` does not expose the actual distances computed for the k nearest neighbors. We need to add a new output parameter for this.
+This could be something like `Option<&mut Vec<f64>>` or something. When it is none, it will skip exposing the computed distances. This will eliminate unnecessary
+computations for single-indexed-partition KNN join.
 
-1.  **Field Cleanup**: Remove all `knn_*` fields. Replace `probe_stream_provider` (currently `Option<PartitionedProbeStreamProvider>`) with `Option<ProbeStreamProvider>`.
-2.  **State Machine**:
-    - **`WaitBuildIndex` / `PrepareForNextPartition`**: Call `provider.prepare_for_partition(partition_id)`.
-    - **`FetchProbeBatch`**: Call `provider.stream_for(...)`.
-    - **`ProcessProbeBatch`**: 
-        - When `iterator.next_batch()` returns a result, call `provider.process_batch_result(...)`.
-        - If it returns `Some(batch)`, yield it.
-        - If it returns `None`, continue (loop).
-    - **Remove `YieldKnnResults`**: Since `process_batch_result` returns the final batch during the last partition processing, we don't need a separate state to drain a spill file.
+### Passing the `KNNResultsMerger` to `SpatialJoinBatchIterator`.
 
-### 3.4. `SpatialJoinBatchIterator` Modification
-We need to slightly modify `SpatialJoinBatchIterator::next_batch` to return `Result<Option<(RecordBatch, Option<Vec<u32>>)>>`.
-- The `Option<Vec<u32>>` will contain the probe indices (row IDs) corresponding to the matched rows.
-- This is necessary for KNN to group matches by probe row during the merge phase.
-- For Standard join, this can be `None`.
+`SpatialJoinBatchIterator` will hold a reference to `KNNResultsMerger` (could be an Arc of it), and it will feed the locally joined batch into `KNNResultsMerger`
+to either write the merged k-nearest-so-far into the current spill file, or produce the k-nearest results to the caller.
 
-## 4. Interaction Flow (KNN Scenario)
+`KNNResultsMerger` needs to have a state for understanding if we are probing the last indexed partition, and also have a method `ingest` or something (you can come up with a better name) for ingesting local result and return a `Option<RecordBatch>`:
 
-1.  **Initialization**: `SpatialJoinStream` creates `KNNProbeStreamProvider`.
-2.  **Partition 0**:
-    - `prepare_for_partition(0)`: Provider initializes first spill file (if needed).
-    - `stream_for(...)`: Provider returns probe stream (all rows).
-    - `ProcessProbeBatch`: 
-        - Iterator produces matches.
-        - `process_batch_result(..., is_last=false)`: Provider merges (no prev spill), keeps top-K, writes to Spill 1. Returns `None`.
-3.  **Partition 1**:
-    - `prepare_for_partition(1)`: Provider rotates: Spill 1 -> Prev Input. Creates Spill 2.
-    - `stream_for(...)`: Provider returns probe stream again.
-    - `ProcessProbeBatch`:
-        - Iterator produces matches.
-        - `process_batch_result(..., is_last=false)`: Provider merges with Spill 1, keeps top-K, writes to Spill 2. Returns `None`.
-4.  **Last Partition (N)**:
-    - `prepare_for_partition(N)`: Provider rotates: Spill N-1 -> Prev Input.
-    - `stream_for(...)`: Provider returns probe stream.
-    - `ProcessProbeBatch`:
-        - Iterator produces matches.
-        - `process_batch_result(..., is_last=true)`: Provider merges with Spill N-1, keeps top-K. **Returns `Some(final_batch)`**.
-    - `SpatialJoinStream` yields the batch.
+- When we are not probing the last indexed partition, write merged results into `current` spill file and return `None`
+- When we are probing the last indexed partition, directly return merged result as `Some`.
 
-## 5. Benefits
-- **Clean `stream.rs`**: No KNN specific fields or complex state transitions.
-- **Encapsulation**: KNN logic is isolated.
-- **Extensibility**: `ProbeStreamProvider` pattern can support other join types or strategies in the future.
-- **Efficiency**: Reuses existing `PartitionedProbeStreamProvider` for data fetching.
+`KNNResultsMerger` also needs to have a `rotate(probing_last_index: bool)` method for rotating the `previous` and `current`. If we are probing the last index,
+we can simply skip creating `current`.
 
-## 6. Multi-Partitioned KNN Join Design
+There's a special case: when we run a fully in-memory KNN join where the first indexed partition is the last one, the `previous` and `current` spill files in
+`KNNResultsMerger` are all `None`. `KNNResultsMerger::ingest` could simply return the incoming batch as is. This gracefully mimics the behavior of fully in memory
+KNN join.
 
-### 6.1. Partitioning Strategy
-- **Indexed Side (Build Side)**: The object data is partitioned (e.g., using round-robin partitioning) into $N$ partitions. Each partition is indexed independently using a spatial index (e.g., R-Tree).
-- **Probe Side (Query Side)**: The query data is treated as a single logical stream (Multi-partition). It is not spatially partitioned to match the build side. Instead, the entire probe stream is processed against *each* of the $N$ build partitions sequentially.
+### Filtering of KNN join results
 
-### 6.2. Execution Flow
-The join is executed as a loop over the build partitions:
+Please note that there's a filtering before assembling the KNN join results in `SpatialJoinBatchIterator::produce_result_batch`. If we don't do any special handling for it. partitioned KNN join could yield more results than single partitioned KNN join.
 
-1.  **Initialization**: The `SpatialJoinStream` initializes the `KNNProbeStreamProvider`.
-2.  **Iteration**: For each build partition $P_i$ (where $i$ ranges from $0$ to $N-1$):
-    - **Load Index**: The spatial index for $P_i$ is built or loaded.
-    - **Stream Probe Data**: The probe stream is fetched. For the first partition ($i=0$), this comes from the original input. For subsequent partitions ($i>0$), this comes from the spill file generated in the previous iteration ($i-1$).
-    - **Local KNN Search**: Each probe row performs a KNN search against the index of $P_i$.
-    - **Merge & Refine**:
-        - The local top-$K$ matches from $P_i$ are merged with the current global top-$K$ matches (carried over from previous iterations).
-        - The merged list is sorted by distance, and only the top $K$ are retained.
-    - **Spill**: The updated top-$K$ matches are written to a new spill file (the "next" spill).
-3.  **Finalization**:
-    - After processing the last partition ($P_{N-1}$), the results in the final spill file represent the true global top-$K$ neighbors for each probe row.
-    - These results are yielded as the output of the join.
+This is where `unfiltered_dists` field comes into play. We prune rows with `dist > unfiltered_dists` before producing the actual results.
 
-### 6.3. Spilling and Merging Mechanism
-To handle memory constraints and ensure correctness across partitions:
+## 4. Important Things to Note
 
-- **Spill Files**: Two spill files are maintained: `current_input` and `next_output`.
-- **Rotation**: At the end of each partition iteration, `next_output` becomes `current_input` for the next iteration, and a new `next_output` is created.
-- **Merge Logic**:
-    - Input: A stream of `(ProbeRow, CurrentTopKMatches)` from the previous iteration.
-    - Process: `ProbeRow` queries the current index partition to find `LocalMatches`.
-    - Output: `Merge(CurrentTopKMatches, LocalMatches) -> NewTopKMatches`.
-    - The `NewTopKMatches` are written to the output spill file.
-
-This design ensures that we find the correct global nearest neighbors by exhaustively searching all partitions, while keeping memory usage bounded by spilling intermediate states.
+1. We don't need to write spill file for the last indexed partition, we can simply return the k-nearest-results as the final join result
+2. KNN joins are all inner joins. Any existing code for producing unmatched results for outer joins does not need to be adapted to support KNN join.
+3. The `KNNResultsMerger` needs to handle the single partition case gracefully: if there's only one indexed probe partition (fully in-memory spatial join), we should
+   effectively return the batch to ingest as is.
+4. `KNNResultsMerger` should be implemented in its own file. It can be in the `src/probe` directory.

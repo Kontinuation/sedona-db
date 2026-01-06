@@ -37,12 +37,11 @@ use parking_lot::Mutex;
 use crate::{
     prepare::{prepare_spatial_join_components, SpatialJoinComponents},
     spatial_predicate::{KNNPredicate, SpatialPredicate},
-    stream::{SpatialJoinProbeMetrics, SpatialJoinStream},
+    stream::SpatialJoinStream,
     utils::{
         join_utils::{asymmetric_join_output_partitioning, boundedness_from_children},
         once_fut::OnceAsync,
     },
-    SedonaOptions,
 };
 
 /// Type alias for build and probe execution plans
@@ -169,6 +168,11 @@ impl SpatialJoinExec {
         let left_schema = left.schema();
         let right_schema = right.schema();
         check_join_is_valid(&left_schema, &right_schema, &[])?;
+        if matches!(on, SpatialPredicate::KNearestNeighbors(_)) && *join_type != JoinType::Inner {
+            return Err(DataFusionError::Plan(String::from(
+                "Only inner join is supported for KNN join",
+            )));
+        }
         let (join_schema, column_indices) =
             build_join_schema(&left_schema, &right_schema, join_type);
         let join_schema = Arc::new(join_schema);
@@ -443,13 +447,6 @@ impl ExecutionPlan for SpatialJoinExec {
             _ => {
                 // Regular spatial join logic - standard left=build, right=probe semantics
                 let session_config = context.session_config();
-                let target_output_batch_size = session_config.batch_size();
-                let sedona_options = session_config
-                    .options()
-                    .extensions
-                    .get::<SedonaOptions>()
-                    .cloned()
-                    .unwrap_or_default();
 
                 // Regular join semantics: left is build, right is probe
                 let (build_plan, probe_plan) = (&self.left, &self.right);
@@ -494,7 +491,6 @@ impl ExecutionPlan for SpatialJoinExec {
                     None => self.column_indices.clone(),
                 };
 
-                let join_metrics = SpatialJoinProbeMetrics::new(partition, &self.metrics);
                 let probe_stream = probe_plan.execute(partition, Arc::clone(&context))?;
 
                 // For regular joins: probe is right side (index 1)
@@ -510,10 +506,9 @@ impl ExecutionPlan for SpatialJoinExec {
                     probe_stream,
                     column_indices_after_projection,
                     probe_side_ordered,
-                    join_metrics,
+                    session_config,
                     context.runtime_env(),
-                    sedona_options.spatial_join,
-                    target_output_batch_size,
+                    &self.metrics,
                     once_fut_spatial_join_components,
                     Arc::clone(&self.once_async_spatial_join_components),
                 )))
@@ -530,13 +525,6 @@ impl SpatialJoinExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let session_config = context.session_config();
-        let target_output_batch_size = session_config.batch_size();
-        let sedona_options = session_config
-            .options()
-            .extensions
-            .get::<SedonaOptions>()
-            .cloned()
-            .unwrap_or_default();
 
         // Extract KNN predicate for type safety
         let knn_pred = match &self.on {
@@ -605,7 +593,6 @@ impl SpatialJoinExec {
             }
         }
 
-        let join_metrics = SpatialJoinProbeMetrics::new(partition, &self.metrics);
         let probe_stream = probe_plan.execute(partition, Arc::clone(&context))?;
 
         // Determine if probe side ordering is maintained for KNN
@@ -626,10 +613,9 @@ impl SpatialJoinExec {
             probe_stream,
             column_indices_after_projection,
             probe_side_ordered,
-            join_metrics,
+            session_config,
             context.runtime_env(),
-            sedona_options.spatial_join,
-            target_output_batch_size,
+            &self.metrics,
             once_fut_spatial_join_components,
             Arc::clone(&self.once_async_spatial_join_components),
         )))
@@ -652,6 +638,7 @@ mod tests {
     use geo::Euclidean;
     use geo_types::{Coord, Rect};
     use rstest::rstest;
+    use sedona_common::SedonaOptions;
     use sedona_geo::to_geo::item_to_geometry;
     use sedona_geometry::types::GeometryTypeId;
     use sedona_schema::datatypes::{SedonaType, WKB_GEOGRAPHY, WKB_GEOMETRY};
