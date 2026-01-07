@@ -64,12 +64,41 @@ struct MergerState {
     ///
     /// We buffer the currently-being-accumulated probe row here until we are confident
     /// it's complete for the current indexed partition.
-    pending_idx: Option<usize>,
-    pending_candidates: Vec<Candidate>,
-    /// Unfiltered distances from previous spill for `pending_idx` (top-K so far).
-    pending_prev_unfiltered: Vec<f64>,
-    /// Unfiltered distances seen for `pending_idx` from the current indexed partition.
-    pending_new_unfiltered: Vec<f64>,
+    pending: PendingProbe,
+}
+
+struct PendingProbe {
+    idx: Option<usize>,
+    candidates: Vec<Candidate>,
+    /// Unfiltered distances from previous spill for `idx` (top-K so far).
+    prev_unfiltered: Vec<f64>,
+    /// Unfiltered distances seen for `idx` from the current indexed partition.
+    new_unfiltered: Vec<f64>,
+}
+
+impl PendingProbe {
+    fn new() -> Self {
+        Self {
+            idx: None,
+            candidates: Vec::new(),
+            prev_unfiltered: Vec::new(),
+            new_unfiltered: Vec::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.idx = None;
+        self.candidates.clear();
+        self.prev_unfiltered.clear();
+        self.new_unfiltered.clear();
+    }
+
+    fn init_for_index(&mut self, idx: usize) {
+        self.idx = Some(idx);
+        self.candidates.clear();
+        self.prev_unfiltered.clear();
+        self.new_unfiltered.clear();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -193,10 +222,7 @@ impl KNNResultsMerger {
                 previous_file: None,
                 previous_reader: None,
                 current_writer: None,
-                pending_idx: None,
-                pending_candidates: Vec::new(),
-                pending_prev_unfiltered: Vec::new(),
-                pending_new_unfiltered: Vec::new(),
+                pending: PendingProbe::new(),
             }),
         }
     }
@@ -270,10 +296,7 @@ impl KNNResultsMerger {
             .map(|w| w.finish())
             .transpose()?;
         state.previous_reader = None;
-        state.pending_idx = None;
-        state.pending_candidates.clear();
-        state.pending_prev_unfiltered.clear();
-        state.pending_new_unfiltered.clear();
+        state.pending.reset();
 
         if let Some(file) = &state.previous_file {
             state.previous_reader = Some(SpillRowReader::new(file)?);
@@ -353,14 +376,32 @@ impl KNNResultsMerger {
         // Consume `joined_batch` once we know we're in the multi-partition path.
         let joined_struct = Arc::new(StructArray::from(joined_batch));
 
+        // The input indices are expected to be grouped by probe index (non-decreasing).
+        // If this invariant changes upstream, the merge logic in this file would be incorrect.
+        debug_assert!(
+            unfiltered_probe_indices.windows(2).all(|w| w[0] <= w[1]),
+            "unfiltered_probe_indices must be non-decreasing"
+        );
+        debug_assert!(
+            filtered_probe_indices.windows(2).all(|w| w[0] <= w[1]),
+            "filtered_probe_indices must be non-decreasing"
+        );
+
         while unfiltered_cursor < num_unfiltered {
             // Probe indices are per-probe-batch. Use local probe idx for grouping, and only add
             // the partition offset when interacting with spill/global state.
             let local_probe_idx = unfiltered_probe_indices[unfiltered_cursor] as usize;
             let global_idx = offset_in_partition + local_probe_idx;
 
+            if let Some(pending_idx) = state.pending.idx {
+                debug_assert!(
+                    global_idx >= pending_idx,
+                    "probe indices must be non-decreasing within a partition"
+                );
+            }
+
             // If we moved past a buffered probe index, flush it now.
-            if let Some(pending) = state.pending_idx {
+            if let Some(pending) = state.pending.idx {
                 if global_idx != pending {
                     self.flush_pending(&mut state, &mut output_batches)?;
                 }
@@ -385,24 +426,26 @@ impl KNNResultsMerger {
             let filtered_end = filtered_cursor;
 
             // Initialize pending state for this probe index if needed, and merge from previous.
-            if state.pending_idx != Some(global_idx) {
+            if state.pending.idx != Some(global_idx) {
                 self.init_pending_for_index(&mut state, global_idx)?;
             }
 
             // Collect unfiltered distances for this probe index from the current partition.
             state
-                .pending_new_unfiltered
+                .pending
+                .new_unfiltered
                 .reserve(unfiltered_end - unfiltered_start);
             for i in unfiltered_start..unfiltered_end {
-                state.pending_new_unfiltered.push(unfiltered_distances[i]);
+                state.pending.new_unfiltered.push(unfiltered_distances[i]);
             }
 
             // Collect new (filtered) candidates for this probe index from the current joined batch.
             state
-                .pending_candidates
+                .pending
+                .candidates
                 .reserve(filtered_end.saturating_sub(filtered_start));
             for i in filtered_start..filtered_end {
-                state.pending_candidates.push(Candidate {
+                state.pending.candidates.push(Candidate {
                     dist: filtered_distances[i],
                     row: CandidateRowRef {
                         data: joined_struct.clone(),
@@ -454,14 +497,15 @@ impl KNNResultsMerger {
     }
 
     fn flush_pending(&self, state: &mut MergerState, output: &mut Vec<RecordBatch>) -> Result<()> {
-        let Some(idx) = state.pending_idx else {
+        let Some(idx) = state.pending.idx else {
             return Ok(());
         };
 
-        let mut candidates = std::mem::take(&mut state.pending_candidates);
-        let prev_unfiltered = std::mem::take(&mut state.pending_prev_unfiltered);
-        let new_unfiltered = std::mem::take(&mut state.pending_new_unfiltered);
-        state.pending_idx = None;
+        // Work on the buffered vectors in-place to preserve capacity.
+        let pending = &mut state.pending;
+        let candidates = &mut pending.candidates;
+        let prev_unfiltered = &pending.prev_unfiltered;
+        let new_unfiltered = &pending.new_unfiltered;
 
         // Sort by distance.
         candidates.sort_by(|a, b| a.dist.total_cmp(&b.dist));
@@ -475,7 +519,7 @@ impl KNNResultsMerger {
 
         // Select candidates according to threshold + tie-breaker behavior.
         // This returns a prefix length into the sorted `candidates` slice.
-        let selected_len = self.selected_prefix_len(&candidates, threshold);
+        let selected_len = self.selected_prefix_len(candidates, threshold);
         let selected = &candidates[..selected_len];
 
         if let Some(writer) = &mut state.current_writer {
@@ -486,6 +530,8 @@ impl KNNResultsMerger {
                 output.push(batch);
             }
         }
+
+        pending.reset();
         Ok(())
     }
 
@@ -557,10 +603,7 @@ impl KNNResultsMerger {
     }
 
     fn init_pending_for_index(&self, state: &mut MergerState, global_idx: usize) -> Result<()> {
-        state.pending_idx = Some(global_idx);
-        state.pending_candidates.clear();
-        state.pending_prev_unfiltered.clear();
-        state.pending_new_unfiltered.clear();
+        state.pending.init_for_index(global_idx);
 
         self.merge_from_previous_for_index(state, global_idx)
     }
@@ -587,8 +630,8 @@ impl KNNResultsMerger {
 
             self.extract_from_spill(
                 &row_batch,
-                &mut state.pending_candidates,
-                &mut state.pending_prev_unfiltered,
+                &mut state.pending.candidates,
+                &mut state.pending.prev_unfiltered,
             )?;
         }
 
