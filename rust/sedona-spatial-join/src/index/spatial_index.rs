@@ -518,7 +518,6 @@ impl SpatialIndex {
                     let cloned_evaluated_batch = Arc::clone(evaluated_batch);
                     let chunk = chunk.to_vec();
                     let index_ref = self.clone();
-                    let mut local_positions: Vec<(i32, i32)> = Vec::with_capacity(chunk.len());
                     join_set.spawn(async move {
                         let Some(probe_wkb) = cloned_evaluated_batch.wkb(row_idx) else {
                             return (
@@ -529,6 +528,7 @@ impl SpatialIndex {
                                 ),
                             );
                         };
+                        let mut local_positions: Vec<(i32, i32)> = Vec::with_capacity(chunk.len());
                         let res =
                             index_ref.refine(probe_wkb, &chunk, &distance, &mut local_positions);
                         (i, res.map(|r| (r, local_positions)))

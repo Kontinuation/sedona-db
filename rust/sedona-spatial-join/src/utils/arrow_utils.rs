@@ -17,8 +17,10 @@
 
 use std::sync::Arc;
 
-use arrow::array::{make_array, Array, ArrayData, BinaryViewArray, RecordBatch, StringViewArray};
+use arrow::array::{Array, ArrayData, BinaryViewArray, ListArray, RecordBatch, StringViewArray};
+use arrow_array::make_array;
 use arrow_array::ArrayRef;
+use arrow_array::StructArray;
 use arrow_schema::{ArrowError, DataType};
 use datafusion_common::Result;
 
@@ -80,7 +82,51 @@ fn compact_array(array: ArrayRef) -> Result<(ArrayRef, bool)> {
         return Ok((array, false));
     }
 
-    // For nested arrays (Struct/List/Map/Dictionary/etc.), recurse into children via ArrayData.
+    // Avoid ArrayData -> ArrayRef roundtrips for commonly used data types,
+    // including StructArray and ListArray.
+
+    if let Some(struct_array) = array.as_any().downcast_ref::<StructArray>() {
+        let mut mutated = false;
+        let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(struct_array.num_columns());
+        for col in struct_array.columns() {
+            let (new_col, col_mutated) = compact_array(Arc::clone(col))?;
+            mutated |= col_mutated;
+            new_columns.push(new_col);
+        }
+
+        if !mutated {
+            return Ok((array, false));
+        }
+
+        let rebuilt = StructArray::new(
+            struct_array.fields().clone(),
+            new_columns,
+            struct_array.nulls().cloned(),
+        );
+        return Ok((Arc::new(rebuilt), true));
+    }
+
+    if let Some(list_array) = array.as_any().downcast_ref::<ListArray>() {
+        let (new_values, mutated) = compact_array(list_array.values().clone())?;
+        if !mutated {
+            return Ok((array, false));
+        }
+
+        let DataType::List(field) = list_array.data_type() else {
+            // Defensive: this downcast should only succeed for DataType::List.
+            return Ok((array, false));
+        };
+
+        let rebuilt = ListArray::new(
+            Arc::clone(field),
+            list_array.offsets().clone(),
+            new_values,
+            list_array.nulls().cloned(),
+        );
+        return Ok((Arc::new(rebuilt), true));
+    }
+
+    // For nested arrays (Map/Dictionary/etc.), recurse into children via ArrayData.
     let data = array.to_data();
     if data.child_data().is_empty() {
         return Ok((array, false));

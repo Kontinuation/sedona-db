@@ -15,15 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::{HashMap, VecDeque};
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, AsArray, Float64Builder, ListArray, RecordBatch, StructArray, UInt64Builder,
+    Array, AsArray, Float64Array, ListArray, RecordBatch, StructArray, UInt64Array,
 };
 use arrow::buffer::OffsetBuffer;
+use arrow::compute::interleave_record_batch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow_select::interleave::interleave as arrow_interleave;
 use datafusion::config::SpillCompression;
-use datafusion_common::{Result, ScalarValue};
+use datafusion_common::Result;
 use datafusion_execution::disk_manager::RefCountedTempFile;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_plan::metrics::SpillMetrics;
@@ -33,11 +37,22 @@ use sedona_common::sedona_internal_err;
 use crate::utils::arrow_utils::compact_batch;
 use crate::utils::spill::{RecordBatchSpillReader, RecordBatchSpillWriter};
 
+fn used_source_mask(len: usize, indices: &[(usize, usize)]) -> Vec<bool> {
+    let mut used = vec![false; len];
+    for (src_i, _) in indices {
+        debug_assert!(*src_i < len);
+        used[*src_i] = true;
+    }
+    used
+}
+
 /// KNNResultsMerger handles the merging of KNN "nearest so far" results from multiple partitions.
 /// It maintains spill files to store intermediate results.
 pub struct KNNResultsMerger {
     k: usize,
     include_tie_breaker: bool,
+    target_batch_size: usize,
+    target_spilled_batch_size: usize,
     /// Schema of the final result (without distance)
     result_schema: SchemaRef,
     /// Schema for the intermediate spill files
@@ -66,6 +81,580 @@ struct MergerState {
     /// We buffer the currently-being-accumulated probe row here until we are confident
     /// it's complete for the current indexed partition.
     pending: PendingProbe,
+
+    /// Builds spill rows (probe-index rows) without materializing a RecordBatch per probe index.
+    spill_builder: SpillRowBuilder,
+
+    /// Stages spill batches (from spill_builder and gap-fill carry-over) and flushes using
+    /// Arrow interleave instead of concat.
+    spill_stage: SpillBatchStage,
+
+    /// Builds final output rows and emits batches using record-batch interleave.
+    output_builder: OutputRowBuilder,
+}
+
+/// FIFO staging area for spill batches that flushes using Arrow record-batch interleave.
+///
+/// This replaces `concat_batches` on a potentially huge list of tiny batches.
+struct SpillBatchStage {
+    batches: VecDeque<RecordBatch>,
+    num_rows: usize,
+}
+
+impl SpillBatchStage {
+    fn new() -> Self {
+        Self {
+            batches: VecDeque::new(),
+            num_rows: 0,
+        }
+    }
+
+    fn push_batch(&mut self, batch: RecordBatch, target_rows: usize) {
+        let n = batch.num_rows();
+        if n == 0 {
+            return;
+        }
+
+        if n <= target_rows {
+            self.num_rows += n;
+            self.batches.push_back(batch);
+            return;
+        }
+
+        // Split oversized batches so the flush loop can always assemble ~target_rows chunks.
+        let mut start = 0;
+        while start < n {
+            let len = target_rows.min(n - start);
+            self.num_rows += len;
+            self.batches.push_back(batch.slice(start, len));
+            start += len;
+        }
+    }
+
+    fn maybe_flush(
+        &mut self,
+        writer: &mut RecordBatchSpillWriter,
+        spill_schema: &SchemaRef,
+        target_rows: usize,
+    ) -> Result<()> {
+        while self.num_rows >= target_rows {
+            let chunk = self.take_chunk(target_rows);
+            let batch = interleave_concat_record_batches(spill_schema, &chunk)?;
+            let batch = compact_batch(batch)?;
+            writer.write_batch(&batch)?;
+        }
+        Ok(())
+    }
+
+    fn flush_all(
+        &mut self,
+        writer: &mut RecordBatchSpillWriter,
+        spill_schema: &SchemaRef,
+        target_rows: usize,
+    ) -> Result<()> {
+        while self.num_rows > 0 {
+            let take = self.num_rows.min(target_rows.max(1));
+            let chunk = self.take_chunk(take);
+            let batch = interleave_concat_record_batches(spill_schema, &chunk)?;
+            let batch = compact_batch(batch)?;
+            writer.write_batch(&batch)?;
+        }
+        Ok(())
+    }
+
+    fn take_chunk(&mut self, target_rows: usize) -> Vec<RecordBatch> {
+        debug_assert!(target_rows > 0);
+        debug_assert!(self.num_rows >= target_rows);
+
+        let mut remaining = target_rows;
+        let mut out: Vec<RecordBatch> = Vec::new();
+
+        while remaining > 0 {
+            let batch = self
+                .batches
+                .pop_front()
+                .expect("spill stage should not be empty");
+            let n = batch.num_rows();
+
+            if n <= remaining {
+                out.push(batch);
+                self.num_rows -= n;
+                remaining -= n;
+            } else {
+                let head = batch.slice(0, remaining);
+                let tail = batch.slice(remaining, n - remaining);
+                out.push(head);
+                self.batches.push_front(tail);
+                self.num_rows -= remaining;
+                remaining = 0;
+            }
+        }
+
+        out
+    }
+}
+
+fn interleave_concat_record_batches(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+) -> Result<RecordBatch> {
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(schema.clone()));
+    }
+    if batches.len() == 1 {
+        return Ok(batches[0].clone());
+    }
+
+    let refs: Vec<&RecordBatch> = batches.iter().collect();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let mut indices: Vec<(usize, usize)> = Vec::with_capacity(total_rows);
+    for (bi, b) in batches.iter().enumerate() {
+        for ri in 0..b.num_rows() {
+            indices.push((bi, ri));
+        }
+    }
+    let batch = interleave_record_batch(&refs, &indices)?;
+    debug_assert_eq!(batch.num_rows(), total_rows);
+    debug_assert_eq!(batch.schema().as_ref(), schema.as_ref());
+    Ok(batch)
+}
+
+/// Builder for spill rows (one row per probe index) that materializes a spill RecordBatch in one go.
+///
+/// Uses array interleave for the nested `row` StructArray to avoid scalar materialization.
+struct SpillRowBuilder {
+    probe_indices: Vec<u64>,
+
+    // rows: List<Struct<row, dist>>
+    rows_offsets: Vec<i32>,
+    row_sources: Vec<Arc<StructArray>>,
+    row_source_map: HashMap<usize, usize>,
+    rows_value_indices: Vec<(usize, usize)>,
+    rows_dist_values: Vec<f64>,
+
+    // unfiltered_dists: List<Float64>
+    unfiltered_offsets: Vec<i32>,
+    unfiltered_values: Vec<f64>,
+}
+
+impl SpillRowBuilder {
+    fn split_prefix<T>(values: &mut Vec<T>, take: usize) -> Vec<T> {
+        let remaining = values.split_off(take);
+        std::mem::replace(values, remaining)
+    }
+
+    fn split_list_offsets(offsets: &mut Vec<i32>, take_rows: usize) -> Vec<i32> {
+        debug_assert!(take_rows < offsets.len());
+        let taken = offsets[..=take_rows].to_vec();
+        let base = offsets[take_rows];
+        *offsets = offsets[take_rows..].iter().map(|o| *o - base).collect();
+        taken
+    }
+
+    fn new() -> Self {
+        Self {
+            probe_indices: Vec::new(),
+            rows_offsets: vec![0],
+            row_sources: Vec::new(),
+            row_source_map: HashMap::new(),
+            rows_value_indices: Vec::new(),
+            rows_dist_values: Vec::new(),
+            unfiltered_offsets: vec![0],
+            unfiltered_values: Vec::new(),
+        }
+    }
+
+    fn len_rows(&self) -> usize {
+        self.probe_indices.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.probe_indices.is_empty()
+    }
+
+    fn reset(&mut self) {
+        self.probe_indices.clear();
+        self.rows_offsets.clear();
+        self.rows_offsets.push(0);
+        self.row_sources.clear();
+        self.row_source_map.clear();
+        self.rows_value_indices.clear();
+        self.rows_dist_values.clear();
+        self.unfiltered_offsets.clear();
+        self.unfiltered_offsets.push(0);
+        self.unfiltered_values.clear();
+    }
+
+    fn register_row_source(&mut self, source: &Arc<StructArray>) -> usize {
+        let key = Arc::as_ptr(source) as usize;
+        if let Some(existing) = self.row_source_map.get(&key) {
+            return *existing;
+        }
+        let idx = self.row_sources.len();
+        self.row_sources.push(source.clone());
+        self.row_source_map.insert(key, idx);
+        idx
+    }
+
+    fn compact_row_sources(&mut self) {
+        if self.rows_value_indices.is_empty() {
+            self.row_sources.clear();
+            self.row_source_map.clear();
+            return;
+        }
+
+        let used = used_source_mask(self.row_sources.len(), &self.rows_value_indices);
+
+        // Old source index -> new source index.
+        let mut remap = vec![usize::MAX; self.row_sources.len()];
+        let mut new_sources = Vec::with_capacity(self.row_sources.len());
+        let mut new_map = HashMap::with_capacity(self.row_source_map.len());
+
+        for (old_i, src) in self.row_sources.iter().enumerate() {
+            if !used[old_i] {
+                continue;
+            }
+
+            let new_i = new_sources.len();
+            new_sources.push(src.clone());
+            remap[old_i] = new_i;
+            let key = Arc::as_ptr(src) as usize;
+            new_map.insert(key, new_i);
+        }
+
+        for (src_i, _) in &mut self.rows_value_indices {
+            *src_i = remap[*src_i];
+            debug_assert_ne!(*src_i, usize::MAX);
+        }
+
+        self.row_sources = new_sources;
+        self.row_source_map = new_map;
+    }
+
+    fn push_row(
+        &mut self,
+        idx: usize,
+        candidates: &[Candidate],
+        unfiltered_dists: &[f64],
+    ) -> Result<()> {
+        self.probe_indices.push(idx as u64);
+
+        let prev = *self
+            .rows_offsets
+            .last()
+            .expect("rows_offsets must have at least one element") as usize;
+        let new_total = prev + candidates.len();
+        let new_total_i32: i32 = if new_total <= i32::MAX as usize {
+            new_total as i32
+        } else {
+            return sedona_internal_err!("spill rows list too large");
+        };
+        self.rows_offsets.push(new_total_i32);
+
+        self.rows_value_indices.reserve(candidates.len());
+        self.rows_dist_values.reserve(candidates.len());
+        for c in candidates {
+            let src_i = self.register_row_source(&c.row.data);
+            self.rows_value_indices.push((src_i, c.row.row));
+            self.rows_dist_values.push(c.dist);
+        }
+
+        let prev_u = *self
+            .unfiltered_offsets
+            .last()
+            .expect("unfiltered_offsets must have at least one element")
+            as usize;
+        let new_u_total = prev_u + unfiltered_dists.len();
+        let new_u_total_i32: i32 = if new_u_total <= i32::MAX as usize {
+            new_u_total as i32
+        } else {
+            return sedona_internal_err!("spill unfiltered list too large");
+        };
+        self.unfiltered_offsets.push(new_u_total_i32);
+        self.unfiltered_values.extend_from_slice(unfiltered_dists);
+
+        Ok(())
+    }
+
+    fn take_batch(
+        &mut self,
+        spill_schema: &SchemaRef,
+        result_schema: &SchemaRef,
+        max_rows: usize,
+    ) -> Result<Option<RecordBatch>> {
+        if self.probe_indices.is_empty() {
+            return Ok(None);
+        }
+        let take_rows = self.probe_indices.len().min(max_rows.max(1));
+
+        // Determine value ranges for the two list columns.
+        let rows_values_end = self.rows_offsets[take_rows] as usize;
+        let unfiltered_values_end = self.unfiltered_offsets[take_rows] as usize;
+
+        // Split the row-wise vectors.
+        let take_indices = Self::split_prefix(&mut self.probe_indices, take_rows);
+
+        // Split list offsets and normalize remaining offsets to start at 0.
+        let take_rows_offsets = Self::split_list_offsets(&mut self.rows_offsets, take_rows);
+        let take_unfiltered_offsets =
+            Self::split_list_offsets(&mut self.unfiltered_offsets, take_rows);
+
+        // Split value vectors.
+        let take_rows_value_indices =
+            Self::split_prefix(&mut self.rows_value_indices, rows_values_end);
+        let take_rows_dist_values = Self::split_prefix(&mut self.rows_dist_values, rows_values_end);
+        let take_unfiltered_values =
+            Self::split_prefix(&mut self.unfiltered_values, unfiltered_values_end);
+
+        // Build the spill record batch for the taken prefix.
+        let batch = build_spill_batch_from_parts(
+            spill_schema,
+            result_schema,
+            &take_indices,
+            &self.row_sources,
+            &take_rows_value_indices,
+            &take_rows_dist_values,
+            &take_rows_offsets,
+            &take_unfiltered_values,
+            &take_unfiltered_offsets,
+        )?;
+
+        // Drop any unreferenced sources as early as possible, so memory is bounded by the
+        // remaining staged indices (not by historical sources encountered).
+        self.compact_row_sources();
+        Ok(Some(batch))
+    }
+}
+
+fn build_spill_batch_from_parts(
+    spill_schema: &SchemaRef,
+    result_schema: &SchemaRef,
+    probe_indices: &[u64],
+    row_sources: &[Arc<StructArray>],
+    rows_value_indices: &[(usize, usize)],
+    rows_dist_values: &[f64],
+    rows_offsets: &[i32],
+    unfiltered_values: &[f64],
+    unfiltered_offsets: &[i32],
+) -> Result<RecordBatch> {
+    // index column
+    let index_arr = UInt64Array::from(probe_indices.to_vec());
+
+    // rows column: List<Struct<row: Struct<result_schema>, dist: Float64>>
+    let row_arrays: Vec<&dyn Array> = row_sources
+        .iter()
+        .map(|s| s.as_ref() as &dyn Array)
+        .collect();
+    let interleaved_rows: Arc<dyn Array> = if rows_value_indices.is_empty() {
+        arrow::array::new_empty_array(&DataType::Struct(result_schema.fields().clone()))
+    } else {
+        arrow_interleave(&row_arrays, rows_value_indices)?
+    };
+
+    let dist_arr = Float64Array::from(rows_dist_values.to_vec());
+
+    let row_field = Field::new(
+        "row",
+        DataType::Struct(result_schema.fields().clone()),
+        false,
+    );
+    let dist_field = Field::new("dist", DataType::Float64, false);
+    let value_fields = vec![row_field, dist_field];
+
+    let values_struct = StructArray::try_new(
+        value_fields.into(),
+        vec![interleaved_rows, Arc::new(dist_arr)],
+        None,
+    )?;
+
+    let list_offsets = OffsetBuffer::<i32>::new(rows_offsets.to_vec().into());
+    let list_field = Arc::new(Field::new("item", values_struct.data_type().clone(), true));
+    let rows_list = ListArray::try_new(list_field, list_offsets, Arc::new(values_struct), None)?;
+
+    // unfiltered_dists column: List<Float64>
+    let unfiltered_values_arr = Float64Array::from(unfiltered_values.to_vec());
+    let unfiltered_offsets_buf = OffsetBuffer::<i32>::new(unfiltered_offsets.to_vec().into());
+    let unfiltered_field = Arc::new(Field::new("item", DataType::Float64, true));
+    let unfiltered_list = ListArray::try_new(
+        unfiltered_field,
+        unfiltered_offsets_buf,
+        Arc::new(unfiltered_values_arr),
+        None,
+    )?;
+
+    Ok(RecordBatch::try_new(
+        spill_schema.clone(),
+        vec![
+            Arc::new(index_arr),
+            Arc::new(rows_list),
+            Arc::new(unfiltered_list),
+        ],
+    )?)
+}
+
+/// Builder for final output rows that uses record-batch interleave to avoid scalar materialization.
+struct OutputRowBuilder {
+    sources: Vec<RecordBatch>,
+    // Keep the underlying StructArray allocations alive so Arc pointers used as keys in
+    // `source_map` cannot be re-used after drop (which would corrupt indices).
+    source_ids: Vec<Arc<StructArray>>,
+    source_map: HashMap<usize, usize>,
+    indices: Vec<(usize, usize)>,
+}
+
+impl OutputRowBuilder {
+    fn new() -> Self {
+        Self {
+            sources: Vec::new(),
+            source_ids: Vec::new(),
+            source_map: HashMap::new(),
+            indices: Vec::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.sources.clear();
+        self.source_ids.clear();
+        self.source_map.clear();
+        self.indices.clear();
+    }
+
+    fn clear_sources(&mut self) {
+        self.sources.clear();
+        self.source_ids.clear();
+        self.source_map.clear();
+    }
+
+    fn compact_sources(&mut self) {
+        if self.indices.is_empty() {
+            self.clear_sources();
+            return;
+        }
+
+        let used = used_source_mask(self.sources.len(), &self.indices);
+
+        let mut remap = vec![usize::MAX; self.sources.len()];
+        let mut new_sources = Vec::with_capacity(self.sources.len());
+        let mut new_ids = Vec::with_capacity(self.source_ids.len());
+        let mut new_map = HashMap::with_capacity(self.source_map.len());
+
+        for i in 0..self.sources.len() {
+            if !used[i] {
+                continue;
+            }
+            let new_i = new_sources.len();
+            new_sources.push(self.sources[i].clone());
+            new_ids.push(self.source_ids[i].clone());
+            remap[i] = new_i;
+            let key = Arc::as_ptr(&new_ids[new_i]) as usize;
+            new_map.insert(key, new_i);
+        }
+
+        for (src_i, _) in &mut self.indices {
+            *src_i = remap[*src_i];
+            debug_assert_ne!(*src_i, usize::MAX);
+        }
+
+        self.sources = new_sources;
+        self.source_ids = new_ids;
+        self.source_map = new_map;
+    }
+
+    fn register_source(&mut self, schema: &SchemaRef, source: &Arc<StructArray>) -> Result<usize> {
+        let key = Arc::as_ptr(source) as usize;
+        if let Some(existing) = self.source_map.get(&key) {
+            return Ok(*existing);
+        }
+
+        // Important: `StructArray` can have a non-zero offset. `StructArray::column(i)` returns an
+        // offset-aware child array, while `columns()` may expose the raw children.
+        let mut cols = Vec::with_capacity(source.num_columns());
+        let struct_len = source.len();
+        for i in 0..source.num_columns() {
+            let col = source.column(i).clone();
+            debug_assert_eq!(col.len(), struct_len);
+            cols.push(col);
+        }
+        let batch = RecordBatch::try_new(schema.clone(), cols)?;
+        debug_assert_eq!(batch.num_rows(), source.len());
+        let idx = self.sources.len();
+        self.sources.push(batch);
+        self.source_ids.push(source.clone());
+        self.source_map.insert(key, idx);
+        Ok(idx)
+    }
+
+    fn push_candidates(&mut self, schema: &SchemaRef, candidates: &[Candidate]) -> Result<()> {
+        self.indices.reserve(candidates.len());
+        for c in candidates {
+            debug_assert!(c.row.row < c.row.data.len());
+            let src_i = self.register_source(schema, &c.row.data)?;
+            self.indices.push((src_i, c.row.row));
+        }
+        Ok(())
+    }
+
+    fn push_spill_batch(&mut self, schema: &SchemaRef, batch: &RecordBatch) -> Result<()> {
+        // batch schema: [index, rows, unfiltered_dists]
+        // rows is List<Struct<row, dist>>
+        let rows_col = batch.column(1).as_list::<i32>();
+        let values_struct = rows_col.values().as_struct(); // Struct<row, dist>
+        let row_component = Arc::new(values_struct.column(0).as_struct().clone());
+        let row_offsets = rows_col.value_offsets();
+
+        // Register the row-component source once.
+        let src_i = self.register_source(schema, &row_component)?;
+        let value_len = row_component.len();
+
+        for row in 0..batch.num_rows() {
+            if rows_col.is_null(row) {
+                continue;
+            }
+            let start = row_offsets[row] as usize;
+            let end = row_offsets[row + 1] as usize;
+            debug_assert!(end <= value_len);
+            self.indices.reserve(end - start);
+            for i in start..end {
+                self.indices.push((src_i, i));
+            }
+        }
+        Ok(())
+    }
+
+    fn take_ready(
+        &mut self,
+        schema: &SchemaRef,
+        target_rows: usize,
+    ) -> Result<Option<RecordBatch>> {
+        if self.indices.len() < target_rows {
+            return Ok(None);
+        }
+        self.take_any_up_to(schema, target_rows)
+    }
+
+    fn take_any_up_to(
+        &mut self,
+        schema: &SchemaRef,
+        max_rows: usize,
+    ) -> Result<Option<RecordBatch>> {
+        if self.indices.is_empty() {
+            return Ok(None);
+        }
+        let take = self.indices.len().min(max_rows.max(1));
+        let taken: Vec<(usize, usize)> = self.indices.drain(..take).collect();
+
+        let refs: Vec<&RecordBatch> = self.sources.iter().collect();
+
+        let batch = interleave_record_batch(&refs, &taken)?;
+        let batch = compact_batch(batch)?;
+        debug_assert_eq!(batch.schema().as_ref(), schema.as_ref());
+
+        // Drop any unreferenced sources immediately, so retained memory is bounded by the
+        // remaining staged indices.
+        self.compact_sources();
+
+        Ok(Some(batch))
+    }
 }
 
 struct PendingProbe {
@@ -110,8 +699,8 @@ struct Candidate {
     // Performance note: we intentionally avoid materializing `ScalarValue` eagerly for every
     // joined row. Many joins produce far more than K matches per probe index, but we only need
     // the top-K (or ties) after sorting/pruning. We therefore keep a cheap reference to the
-    // backing `StructArray` + row index, and only convert to `ScalarValue` for the selected
-    // candidates when building output/spill batches.
+    // backing `StructArray` + row index, and use Arrow interleave to materialize output/spill
+    // batches when needed.
     row: CandidateRowRef,
 }
 
@@ -122,9 +711,7 @@ struct CandidateRowRef {
 }
 
 impl CandidateRowRef {
-    fn to_scalar(&self) -> Result<ScalarValue> {
-        ScalarValue::try_from_array(self.data.as_ref(), self.row)
-    }
+    // Intentionally no ScalarValue materialization here.
 }
 
 struct SpillRowReader {
@@ -159,23 +746,31 @@ impl SpillRowReader {
     }
 
     /// Reads the next row from spill file.
-    /// Returns (index, row_batch) where row_batch is a slice of size 1.
-    fn next_row(&mut self) -> Result<Option<(usize, RecordBatch)>> {
+    /// Returns a batch slice containing consecutive rows with index < `until_idx`.
+    /// Advances the internal cursor past the returned rows.
+    fn take_prefix_before(&mut self, until_idx: usize) -> Result<Option<RecordBatch>> {
         self.ensure_batch()?;
-        if let Some(batch) = &self.current_batch {
-            let index_col = batch
-                .column(0)
-                .as_primitive::<arrow::datatypes::UInt64Type>();
-            let idx = index_col.value(self.current_offset) as usize;
+        let Some(batch) = &self.current_batch else {
+            return Ok(None);
+        };
 
-            // Slice the batch for 1 row
-            let row_batch = batch.slice(self.current_offset, 1);
+        let index_col = batch
+            .column(0)
+            .as_primitive::<arrow::datatypes::UInt64Type>();
+        let values = index_col.values().as_ref();
 
-            self.current_offset += 1;
-            Ok(Some((idx, row_batch)))
-        } else {
-            Ok(None)
+        let start = self.current_offset;
+        let slice = &values[start..batch.num_rows()];
+        let rel_end = slice.partition_point(|v| (*v as usize) < until_idx);
+        let end = start + rel_end;
+
+        if end == start {
+            return Ok(None);
         }
+
+        let out = batch.slice(start, end - start);
+        self.current_offset = end;
+        Ok(Some(out))
     }
 
     fn ensure_batch(&mut self) -> Result<()> {
@@ -205,15 +800,19 @@ impl KNNResultsMerger {
     pub fn new(
         k: usize,
         include_tie_breaker: bool,
+        target_batch_size: usize,
         runtime_env: Arc<RuntimeEnv>,
         spill_compression: SpillCompression,
         result_schema: SchemaRef,
         spill_metrics: SpillMetrics,
     ) -> Self {
         let spill_schema = Self::create_spill_schema(result_schema.clone());
+        let target_spilled_batch_size = target_batch_size.div_ceil(k).max(1);
         Self {
             k,
             include_tie_breaker,
+            target_batch_size,
+            target_spilled_batch_size,
             result_schema,
             spill_schema,
             runtime_env,
@@ -224,6 +823,9 @@ impl KNNResultsMerger {
                 previous_reader: None,
                 current_writer: None,
                 pending: PendingProbe::new(),
+                spill_builder: SpillRowBuilder::new(),
+                spill_stage: SpillBatchStage::new(),
+                output_builder: OutputRowBuilder::new(),
             }),
         }
     }
@@ -272,22 +874,45 @@ impl KNNResultsMerger {
     pub fn rotate(&self, probing_last_index: bool) -> Result<()> {
         let mut state = self.state.lock();
 
-        // Flush any buffered probe row into the current spill before rotating.
-        // Note: rotate is only called when there *is* a next indexed partition.
+        // Flush any buffered probe row into spill builder.
         if state.current_writer.is_some() {
-            let mut ignored_output: Vec<RecordBatch> = Vec::new();
-            self.flush_pending(&mut *state, &mut ignored_output)?;
-        }
+            self.flush_pending(&mut *state)?;
 
-        // Drain any remaining rows from previous reader.
-        while let Some(reader) = state.previous_reader.as_mut() {
-            let Some(_) = reader.peek_index()? else {
-                break;
-            };
-            if let Some((_, row_batch)) = reader.next_row()? {
-                if let Some(writer) = &mut state.current_writer {
-                    let row_batch = compact_batch(row_batch)?;
-                    writer.write_batch(&row_batch)?;
+            // Preserve ordering: move any builder contents into staged spill batches.
+            self.stage_all_spill_builder(&mut *state)?;
+
+            // Drain remaining spill rows from previous reader.
+            while let Some(batch) = match state.previous_reader.as_mut() {
+                None => None,
+                Some(reader) => reader.take_prefix_before(usize::MAX)?,
+            } {
+                let MergerState {
+                    spill_stage,
+                    current_writer,
+                    ..
+                } = &mut *state;
+                spill_stage.push_batch(batch, self.target_spilled_batch_size);
+                if let Some(writer) = current_writer.as_mut() {
+                    spill_stage.maybe_flush(
+                        writer,
+                        &self.spill_schema,
+                        self.target_spilled_batch_size,
+                    )?;
+                }
+            }
+
+            {
+                let MergerState {
+                    spill_stage,
+                    current_writer,
+                    ..
+                } = &mut *state;
+                if let Some(writer) = current_writer.as_mut() {
+                    spill_stage.flush_all(
+                        writer,
+                        &self.spill_schema,
+                        self.target_spilled_batch_size,
+                    )?;
                 }
             }
         }
@@ -299,6 +924,9 @@ impl KNNResultsMerger {
             .transpose()?;
         state.previous_reader = None;
         state.pending.reset();
+        state.spill_builder.reset();
+        state.spill_stage = SpillBatchStage::new();
+        state.output_builder.reset();
 
         if let Some(file) = &state.previous_file {
             state.previous_reader = Some(SpillRowReader::new(file)?);
@@ -367,8 +995,6 @@ impl KNNResultsMerger {
         }
 
         let mut state = self.state.lock();
-        let mut output_batches: Vec<RecordBatch> = Vec::new();
-
         let mut filtered_cursor = 0;
         let num_filtered = filtered_probe_indices.len();
 
@@ -405,11 +1031,11 @@ impl KNNResultsMerger {
             // If we moved past a buffered probe index, flush it now.
             if let Some(pending) = state.pending.idx {
                 if global_idx != pending {
-                    self.flush_pending(&mut state, &mut output_batches)?;
+                    self.flush_pending(&mut state)?;
                 }
             }
 
-            self.gap_fill(&mut state, global_idx, &mut output_batches)?;
+            self.gap_fill(&mut state, global_idx)?;
 
             let unfiltered_start = unfiltered_cursor;
             while unfiltered_cursor < num_unfiltered
@@ -462,7 +1088,14 @@ impl KNNResultsMerger {
         // We instead flush it when we observe the next probe index, or when the probe batch ends
         // via `produce_last_batch()`.
 
-        Self::concat_output_batches(output_batches)
+        // If we are in the final partition (no spill writer), emit output in ~target_batch_size chunks.
+        if state.current_writer.is_none() {
+            state
+                .output_builder
+                .take_ready(&self.result_schema, self.target_batch_size)
+        } else {
+            Ok(None)
+        }
     }
 
     /// Flushes any pending buffered probe index at the end of a probe batch iterator.
@@ -473,32 +1106,46 @@ impl KNNResultsMerger {
     /// Returns `Ok(Some(batch))` at most once per pending buffered index; if there is nothing
     /// pending (or results are being spilled to disk for non-final indexed partitions), returns
     /// `Ok(None)`.
-    pub fn produce_last_batch(&self) -> Result<Option<RecordBatch>> {
+    pub fn produce_batch_until(
+        &self,
+        end_global_idx_exclusive: usize,
+    ) -> Result<Option<RecordBatch>> {
         if self.is_single_partitioned() {
             return Ok(None);
         }
 
         let mut state = self.state.lock();
-        let mut output_batches: Vec<RecordBatch> = Vec::new();
 
-        // Only flush the currently pending index; do not drain remaining spill rows here.
-        // Draining would be incorrect because future probe batches (with larger global indices)
-        // may still need to merge against those rows.
-        self.flush_pending(&mut state, &mut output_batches)?;
-
-        Self::concat_output_batches(output_batches)
-    }
-
-    fn concat_output_batches(output_batches: Vec<RecordBatch>) -> Result<Option<RecordBatch>> {
-        if output_batches.is_empty() {
-            return Ok(None);
+        // If we already have buffered output ready, emit it first.
+        if state.current_writer.is_none() {
+            if let Some(batch) = state
+                .output_builder
+                .take_ready(&self.result_schema, self.target_batch_size)?
+            {
+                return Ok(Some(batch));
+            }
         }
-        let schema = output_batches[0].schema();
-        let batch = arrow::compute::concat_batches(&schema, &output_batches)?;
-        Ok(Some(batch))
+
+        // Only flush the currently pending index. We must not drain spill rows beyond the
+        // caller-provided probe-row range end, since future probe batches (with larger global
+        // indices) may still need to merge against those rows.
+        self.flush_pending(&mut state)?;
+
+        if state.current_writer.is_none() {
+            // Drain any remaining spill rows that belong to the current probe-row range.
+            // This is required when the last indexed partition has few/no matches for some
+            // probe rows: those results must still be emitted from the previous spill file.
+            self.gap_fill(&mut state, end_global_idx_exclusive)?;
+            // Final flush: allow returning a smaller tail batch.
+            state
+                .output_builder
+                .take_any_up_to(&self.result_schema, self.target_batch_size)
+        } else {
+            Ok(None)
+        }
     }
 
-    fn flush_pending(&self, state: &mut MergerState, output: &mut Vec<RecordBatch>) -> Result<()> {
+    fn flush_pending(&self, state: &mut MergerState) -> Result<()> {
         let Some(idx) = state.pending.idx else {
             return Ok(());
         };
@@ -524,14 +1171,39 @@ impl KNNResultsMerger {
         let selected_len = self.selected_prefix_len(candidates, threshold);
         let selected = &candidates[..selected_len];
 
-        if let Some(writer) = &mut state.current_writer {
-            let batch = self.build_spill_batch(idx, selected, &merged_unfiltered)?;
-            let batch = compact_batch(batch)?;
-            writer.write_batch(&batch)?;
-        } else {
-            if let Some(batch) = self.build_result_batch(selected)? {
-                output.push(batch);
+        if state.current_writer.is_some() {
+            let MergerState {
+                current_writer,
+                spill_builder,
+                spill_stage,
+                ..
+            } = state;
+            let writer = current_writer
+                .as_mut()
+                .expect("current_writer must be present in spill mode");
+
+            spill_builder.push_row(idx, selected, &merged_unfiltered)?;
+
+            // When enough probe rows are buffered, materialize a spill batch and stage/flush it.
+            while spill_builder.len_rows() >= self.target_spilled_batch_size {
+                if let Some(batch) = spill_builder.take_batch(
+                    &self.spill_schema,
+                    &self.result_schema,
+                    self.target_spilled_batch_size,
+                )? {
+                    spill_stage.push_batch(batch, self.target_spilled_batch_size);
+                    spill_stage.maybe_flush(
+                        writer,
+                        &self.spill_schema,
+                        self.target_spilled_batch_size,
+                    )?;
+                }
             }
+        } else {
+            // Final partition: buffer flat output rows and let caller pull in target-sized chunks.
+            state
+                .output_builder
+                .push_candidates(&self.result_schema, selected)?;
         }
 
         pending.reset();
@@ -574,34 +1246,80 @@ impl KNNResultsMerger {
         end
     }
 
-    fn gap_fill(
-        &self,
-        state: &mut MergerState,
-        until_idx: usize,
-        output: &mut Vec<RecordBatch>,
-    ) -> Result<()> {
-        let Some(reader) = state.previous_reader.as_mut() else {
+    fn gap_fill(&self, state: &mut MergerState, until_idx: usize) -> Result<()> {
+        if state.previous_reader.is_none() {
             return Ok(());
         };
 
         loop {
-            let Some(peek) = reader.peek_index()? else {
-                break;
+            let peek_opt = {
+                let reader = state
+                    .previous_reader
+                    .as_mut()
+                    .expect("previous_reader must be present");
+                reader.peek_index()?
+            };
+            let peek = match peek_opt {
+                Some(v) => v,
+                None => break,
             };
             if peek >= until_idx {
                 break;
             }
 
-            let (_, row_batch) = reader.next_row()?.unwrap();
-            if let Some(writer) = &mut state.current_writer {
-                let row_batch = compact_batch(row_batch)?;
-                writer.write_batch(&row_batch)?;
-            } else {
-                let flat = self.flatten_spill_batch(&row_batch)?;
-                if flat.num_rows() > 0 {
-                    output.push(flat);
+            // Pull as many rows as possible in a single batch slice.
+            let batch_opt = {
+                let reader = state
+                    .previous_reader
+                    .as_mut()
+                    .expect("previous_reader must be present");
+                reader.take_prefix_before(until_idx)?
+            };
+            let batch = match batch_opt {
+                Some(b) => b,
+                None => break,
+            };
+
+            if state.current_writer.is_some() {
+                // Preserve ordering: stage any builder contents before staging gap-fill carry-over.
+                self.stage_all_spill_builder(state)?;
+
+                let MergerState {
+                    spill_stage,
+                    current_writer,
+                    ..
+                } = state;
+                spill_stage.push_batch(batch, self.target_spilled_batch_size);
+                if let Some(writer) = current_writer.as_mut() {
+                    spill_stage.maybe_flush(
+                        writer,
+                        &self.spill_schema,
+                        self.target_spilled_batch_size,
+                    )?;
                 }
+            } else {
+                // Final partition: flatten spill rows into output builder using interleave.
+                state
+                    .output_builder
+                    .push_spill_batch(&self.result_schema, &batch)?;
             }
+        }
+        Ok(())
+    }
+
+    fn stage_all_spill_builder(&self, state: &mut MergerState) -> Result<()> {
+        if state.spill_builder.is_empty() {
+            return Ok(());
+        }
+        // Materialize whatever is currently buffered so that later staged batches preserve order.
+        if let Some(batch) =
+            state
+                .spill_builder
+                .take_batch(&self.spill_schema, &self.result_schema, usize::MAX)?
+        {
+            state
+                .spill_stage
+                .push_batch(batch, self.target_spilled_batch_size);
         }
         Ok(())
     }
@@ -617,23 +1335,41 @@ impl KNNResultsMerger {
         state: &mut MergerState,
         global_idx: usize,
     ) -> Result<()> {
-        // Drain all spill rows for this global index.
+        // Drain all spill rows for this global index, working in-batch (no 1-row slicing).
         loop {
-            // Avoid holding a mutable borrow of `previous_reader` across the subsequent
-            // mutations of other `state` fields.
-            let row_batch = match state.previous_reader.as_mut() {
-                None => break,
-                Some(reader) => {
-                    if reader.peek_index()? != Some(global_idx) {
-                        break;
-                    }
-                    let (_, row_batch) = reader.next_row()?.unwrap();
-                    row_batch
-                }
+            let Some(reader) = state.previous_reader.as_mut() else {
+                break;
             };
 
-            self.extract_from_spill(
-                &row_batch,
+            reader.ensure_batch()?;
+            let Some(batch) = reader.current_batch.as_ref() else {
+                break;
+            };
+
+            let index_col = batch
+                .column(0)
+                .as_primitive::<arrow::datatypes::UInt64Type>();
+            let values = index_col.values().as_ref();
+
+            if reader.current_offset >= batch.num_rows() {
+                // ensure_batch() should have advanced, but be defensive.
+                break;
+            }
+
+            let current = values[reader.current_offset] as usize;
+            if current != global_idx {
+                break;
+            }
+
+            let start = reader.current_offset;
+            let slice = &values[start..batch.num_rows()];
+            let rel_end = slice.partition_point(|v| (*v as usize) == global_idx);
+            let end = start + rel_end;
+            reader.current_offset = end;
+
+            self.extract_from_spill_range(
+                batch,
+                start..end,
                 &mut state.pending.candidates,
                 &mut state.pending.prev_unfiltered,
             )?;
@@ -642,31 +1378,33 @@ impl KNNResultsMerger {
         Ok(())
     }
 
-    fn extract_from_spill(
+    fn extract_from_spill_range(
         &self,
         batch: &RecordBatch,
+        row_range: Range<usize>,
         candidates: &mut Vec<Candidate>,
         unfiltered_dists: &mut Vec<f64>,
     ) -> Result<()> {
         // batch schema: [index, rows, unfiltered_dists]
         // rows is List<Struct<row, dist>>
         let rows_col = batch.column(1).as_list::<i32>();
-        if rows_col.is_null(0) {
-            // Still try to read unfiltered_dists even if rows are empty.
-        } else {
-            let values_struct = rows_col.values().as_struct(); // Struct<row, dist>
-            let row_component = values_struct.column(0).as_struct();
-            let dist_component = values_struct
-                .column(1)
-                .as_primitive::<arrow::datatypes::Float64Type>();
+        let values_struct = rows_col.values().as_struct(); // Struct<row, dist>
+        let row_component = values_struct.column(0).as_struct();
+        let dist_component = values_struct
+            .column(1)
+            .as_primitive::<arrow::datatypes::Float64Type>();
 
-            // Avoid allocating a fresh Arc per candidate; the struct array itself is cheap to
-            // clone (Arc-backed), so we wrap it once and clone the Arc.
-            let row_component = Arc::new(row_component.clone());
+        // Avoid allocating a fresh Arc per candidate; the struct array itself is cheap to
+        // clone (Arc-backed), so we wrap it once and clone the Arc.
+        let row_component = Arc::new(row_component.clone());
+        let row_offsets = rows_col.value_offsets();
 
-            let start = rows_col.value_offsets()[0] as usize;
-            let end = rows_col.value_offsets()[1] as usize;
-
+        for row in row_range.clone() {
+            if rows_col.is_null(row) {
+                continue;
+            }
+            let start = row_offsets[row] as usize;
+            let end = row_offsets[row + 1] as usize;
             for i in start..end {
                 let d = dist_component.value(i);
                 candidates.push(Candidate {
@@ -681,114 +1419,26 @@ impl KNNResultsMerger {
 
         // unfiltered_dists: List<Float64>
         let unfiltered_col = batch.column(2).as_list::<i32>();
-        if !unfiltered_col.is_null(0) {
-            let values = unfiltered_col
-                .values()
-                .as_primitive::<arrow::datatypes::Float64Type>();
-            let start = unfiltered_col.value_offsets()[0] as usize;
-            let end = unfiltered_col.value_offsets()[1] as usize;
+        let unfiltered_offsets = unfiltered_col.value_offsets();
+        let unfiltered_values = unfiltered_col
+            .values()
+            .as_primitive::<arrow::datatypes::Float64Type>();
+
+        for row in row_range {
+            if unfiltered_col.is_null(row) {
+                continue;
+            }
+            let start = unfiltered_offsets[row] as usize;
+            let end = unfiltered_offsets[row + 1] as usize;
             for i in start..end {
-                unfiltered_dists.push(values.value(i));
+                unfiltered_dists.push(unfiltered_values.value(i));
             }
         }
+
         Ok(())
     }
 
-    fn build_spill_batch(
-        &self,
-        idx: usize,
-        candidates: &[Candidate],
-        unfiltered_dists: &[f64],
-    ) -> Result<RecordBatch> {
-        let mut idx_builder = UInt64Builder::new();
-        idx_builder.append_value(idx as u64);
-
-        // Build rows from selected candidates.
-        // We only materialize scalars for the selected set (<= K or ties).
-        // inner struct: Struct<row, dist>
-        let row_fields = self.result_schema.fields().clone();
-        let combined_fields = vec![
-            Field::new("row", DataType::Struct(row_fields.clone()), false),
-            Field::new("dist", DataType::Float64, false),
-        ];
-
-        let mut dist_builder = Float64Builder::with_capacity(candidates.len());
-        let mut row_scalars = Vec::with_capacity(candidates.len());
-
-        for c in candidates {
-            dist_builder.append_value(c.dist);
-            row_scalars.push(c.row.to_scalar()?);
-        }
-
-        let row_array = if row_scalars.is_empty() {
-            arrow::array::new_empty_array(&DataType::Struct(row_fields.into()))
-        } else {
-            ScalarValue::iter_to_array(row_scalars.into_iter())?
-        };
-
-        let combined_struct = StructArray::try_new(
-            combined_fields.into(),
-            vec![Arc::new(row_array), Arc::new(dist_builder.finish())],
-            None,
-        )?;
-
-        // Use ListArray::try_new instead of builder
-        let offsets = OffsetBuffer::<i32>::from_lengths(std::iter::once(combined_struct.len()));
-        let list_field = Arc::new(Field::new(
-            "item",
-            combined_struct.data_type().clone(),
-            true,
-        ));
-        let list_array = ListArray::try_new(list_field, offsets, Arc::new(combined_struct), None)?;
-
-        // Build unfiltered_dists list
-        let mut unfiltered_values = Float64Builder::with_capacity(unfiltered_dists.len());
-        for d in unfiltered_dists {
-            unfiltered_values.append_value(*d);
-        }
-        let unfiltered_values = unfiltered_values.finish();
-
-        let unfiltered_offsets =
-            OffsetBuffer::<i32>::from_lengths(std::iter::once(unfiltered_values.len()));
-        let unfiltered_field = Arc::new(Field::new("item", DataType::Float64, true));
-        let unfiltered_list = ListArray::try_new(
-            unfiltered_field,
-            unfiltered_offsets,
-            Arc::new(unfiltered_values),
-            None,
-        )?;
-
-        Ok(RecordBatch::try_new(
-            self.spill_schema.clone(),
-            vec![
-                Arc::new(idx_builder.finish()),
-                Arc::new(list_array),
-                Arc::new(unfiltered_list),
-            ],
-        )?)
-    }
-
-    fn build_result_batch(&self, candidates: &[Candidate]) -> Result<Option<RecordBatch>> {
-        if candidates.is_empty() {
-            return Ok(None);
-        }
-        let mut scalars = Vec::with_capacity(candidates.len());
-        for c in candidates {
-            scalars.push(c.row.to_scalar()?);
-        }
-        let array = ScalarValue::iter_to_array(scalars.into_iter())?;
-        let struct_arr = array.as_struct();
-        Ok(Some(RecordBatch::try_new(
-            self.result_schema.clone(),
-            struct_arr.columns().to_vec(),
-        )?))
-    }
-
-    fn flatten_spill_batch(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let mut candidates = Vec::new();
-        let mut unfiltered = Vec::new();
-        self.extract_from_spill(batch, &mut candidates, &mut unfiltered)?;
-        self.build_result_batch(&candidates)
-            .map(|opt| opt.unwrap_or_else(|| RecordBatch::new_empty(self.result_schema.clone())))
-    }
+    // Note: build_spill_batch/build_result_batch/flatten_spill_batch were intentionally removed.
+    // The new implementation buffers rows and uses Arrow interleave to materialize batches,
+    // avoiding scalar materialization and concat of tiny RecordBatches.
 }

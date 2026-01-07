@@ -149,6 +149,7 @@ impl SpatialJoinStream {
             Some(Arc::new(KNNResultsMerger::new(
                 knn.k as usize,
                 sedona_options.spatial_join.knn_include_tie_breakers,
+                target_output_batch_size,
                 Arc::clone(&runtime_env),
                 spill_compression,
                 schema.clone(),
@@ -896,10 +897,11 @@ pub(crate) struct SpatialJoinBatchIterator {
 }
 
 struct ProbeProgress {
-    /// Index of the probe row to be probed by `probe()`
+    /// Index of the probe row to be probed by [SpatialJoinBatchIterator::probe_range] or
+    /// [SpatialJoinBatchIterator::probe_knn].
     current_probe_idx: usize,
     /// Index of the lastly produced probe row. There are three cases:
-    /// - -1 means nothing was produced yet
+    /// - -1 means nothing was produced yet.
     /// - >=num_rows means we have produced all probe rows. The iterator is complete.
     /// - within [0, num_rows) means we have produced up to this probe index (inclusive)].
     ///   The value is largest probe row index that has matching build rows so far.
@@ -909,6 +911,7 @@ struct ProbeProgress {
     /// Current accumulated probe indices. Should have the same length as `build_batch_positions`
     probe_indices: Vec<u32>,
     /// Accumulated comparable (e.g. squared) distances of the KNN results. Only used for KNN join.
+    /// Should have the same length as `build_batch_positions` if present.
     distances: Option<Vec<f64>>,
     /// Cursor of the position in the `build_batch_positions` and `probe_indices` vectors
     /// for tracking the progress of producing joined batches
@@ -1279,7 +1282,8 @@ impl SpatialJoinBatchIterator {
         // For partitioned KNN joins, flush any pending buffered probe index first.
         // If this produces a batch, return it and let the caller poll again.
         if let Some(merger) = &self.knn_results_merger {
-            if let Some(batch) = merger.produce_last_batch()? {
+            let end_offset_in_partition = self.offset_in_partition + num_rows;
+            if let Some(batch) = merger.produce_batch_until(end_offset_in_partition)? {
                 if batch.num_rows() > 0 {
                     return Ok(Some(batch));
                 }
