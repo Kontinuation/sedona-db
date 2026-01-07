@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayData, BinaryViewArray, RecordBatch, StringViewArray};
+use arrow::array::{make_array, Array, ArrayData, BinaryViewArray, RecordBatch, StringViewArray};
 use arrow_array::ArrayRef;
 use arrow_schema::{ArrowError, DataType};
 use datafusion_common::Result;
@@ -55,15 +55,9 @@ pub(crate) fn compact_batch(batch: RecordBatch) -> Result<RecordBatch> {
     let mut arr_mutated = false;
 
     for array in batch.columns() {
-        if let Some(view_array) = array.as_any().downcast_ref::<StringViewArray>() {
-            new_columns.push(Arc::new(view_array.gc()));
-            arr_mutated = true;
-        } else if let Some(view_array) = array.as_any().downcast_ref::<BinaryViewArray>() {
-            new_columns.push(Arc::new(view_array.gc()));
-            arr_mutated = true;
-        } else {
-            new_columns.push(Arc::clone(array));
-        }
+        let (new_array, mutated) = compact_array(Arc::clone(array))?;
+        new_columns.push(new_array);
+        arr_mutated |= mutated;
     }
 
     if arr_mutated {
@@ -71,6 +65,45 @@ pub(crate) fn compact_batch(batch: RecordBatch) -> Result<RecordBatch> {
     } else {
         Ok(batch)
     }
+}
+
+fn compact_array(array: ArrayRef) -> Result<(ArrayRef, bool)> {
+    if let Some(view_array) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Ok((Arc::new(view_array.gc()), true));
+    }
+    if let Some(view_array) = array.as_any().downcast_ref::<BinaryViewArray>() {
+        return Ok((Arc::new(view_array.gc()), true));
+    }
+
+    // Fast path for non-nested arrays
+    if !array.data_type().is_nested() {
+        return Ok((array, false));
+    }
+
+    // For nested arrays (Struct/List/Map/Dictionary/etc.), recurse into children via ArrayData.
+    let data = array.to_data();
+    if data.child_data().is_empty() {
+        return Ok((array, false));
+    }
+
+    let mut mutated = false;
+    let mut new_child_data = Vec::with_capacity(data.child_data().len());
+    for child in data.child_data().iter() {
+        let child_array = make_array(child.clone());
+        let (new_child_array, child_mutated) = compact_array(child_array)?;
+        mutated |= child_mutated;
+        new_child_data.push(new_child_array.to_data());
+    }
+
+    if !mutated {
+        return Ok((array, false));
+    }
+
+    // Rebuild this array with identical buffers/nulls but replaced child_data.
+    let mut builder = data.into_builder();
+    builder = builder.child_data(new_child_data);
+    let new_data = builder.build()?;
+    Ok((make_array(new_data), true))
 }
 
 /// Estimate the in-memory size of a given RecordBatch. This function estimates the
@@ -147,6 +180,7 @@ fn get_binary_view_value_size(array_data: &ArrayData) -> Result<usize, ArrowErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{builder::StringViewBuilder, BooleanArray};
     use arrow_array::{BinaryViewArray, StringViewArray, StructArray};
     use arrow_schema::{DataType, Field};
     use std::sync::Arc;
@@ -215,5 +249,52 @@ mod tests {
         // Data used: 51 ("Long string...")
         // Total: 83
         assert_eq!(size, 83);
+    }
+
+    #[test]
+    fn test_compact_batch_recurses_into_struct() {
+        let n = 256;
+        let long = "x".repeat(2048);
+
+        let mut builder = StringViewBuilder::with_capacity(n);
+        for i in 0..n {
+            builder.append_value(&format!("batch0_{i}_{long}"));
+        }
+        let string_view_array: ArrayRef = Arc::new(builder.finish());
+        let boolean_array: ArrayRef = Arc::new(BooleanArray::from(vec![true; n]));
+        let struct_fields = vec![
+            Arc::new(Field::new("a", DataType::Utf8View, false)),
+            Arc::new(Field::new("b", DataType::Boolean, false)),
+        ];
+        let struct_array = StructArray::from(vec![
+            (
+                Arc::clone(&struct_fields[0]),
+                Arc::clone(&string_view_array),
+            ),
+            (Arc::clone(&struct_fields[1]), Arc::clone(&boolean_array)),
+        ]);
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(struct_fields.into()),
+            false,
+        )]));
+        let batch0 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(struct_array) as ArrayRef],
+        )
+        .unwrap();
+        let sliced = batch0.slice(0, 1);
+
+        let before = sliced.get_array_memory_size();
+        let compacted = compact_batch(sliced.clone()).unwrap();
+        let after = compacted.get_array_memory_size();
+
+        assert_eq!(sliced.schema(), compacted.schema());
+        assert_eq!(sliced.num_rows(), compacted.num_rows());
+        assert!(
+            after < before,
+            "expected compaction to reduce memory: before={before}, after={after}"
+        );
     }
 }

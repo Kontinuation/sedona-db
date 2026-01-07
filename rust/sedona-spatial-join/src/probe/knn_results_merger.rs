@@ -30,6 +30,7 @@ use datafusion_physical_plan::metrics::SpillMetrics;
 use parking_lot::Mutex;
 use sedona_common::sedona_internal_err;
 
+use crate::utils::arrow_utils::compact_batch;
 use crate::utils::spill::{RecordBatchSpillReader, RecordBatchSpillWriter};
 
 /// KNNResultsMerger handles the merging of KNN "nearest so far" results from multiple partitions.
@@ -285,6 +286,7 @@ impl KNNResultsMerger {
             };
             if let Some((_, row_batch)) = reader.next_row()? {
                 if let Some(writer) = &mut state.current_writer {
+                    let row_batch = compact_batch(row_batch)?;
                     writer.write_batch(&row_batch)?;
                 }
             }
@@ -524,6 +526,7 @@ impl KNNResultsMerger {
 
         if let Some(writer) = &mut state.current_writer {
             let batch = self.build_spill_batch(idx, selected, &merged_unfiltered)?;
+            let batch = compact_batch(batch)?;
             writer.write_batch(&batch)?;
         } else {
             if let Some(batch) = self.build_result_batch(selected)? {
@@ -591,6 +594,7 @@ impl KNNResultsMerger {
 
             let (_, row_batch) = reader.next_row()?.unwrap();
             if let Some(writer) = &mut state.current_writer {
+                let row_batch = compact_batch(row_batch)?;
                 writer.write_batch(&row_batch)?;
             } else {
                 let flat = self.flatten_spill_batch(&row_batch)?;
