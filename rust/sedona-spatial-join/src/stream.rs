@@ -109,8 +109,11 @@ pub(crate) struct SpatialJoinStream {
     /// This is used for outer joins to ensure that we only emit unmatched rows from the Multi
     /// partition once, after all regular partitions have been processed.
     visited_multi_probe_side: Option<Arc<Mutex<BooleanBufferBuilder>>>,
-    /// KNN results merger. Only used for KNN join.
-    knn_results_merger: Option<Arc<KNNResultsMerger>>,
+    /// KNN results merger. Only used for KNN join. This value is Some when this spatial join stream
+    /// is for KNN join, except when in the [SpatialJoinStreamState::ProcessProbeBatch] state.
+    /// The `knn_results_merger` will be moved into the [SpatialJoinBatchIterator] when processing
+    /// a probe batch, and moved back to here when the iterator is complete.
+    knn_results_merger: Option<Box<KNNResultsMerger>>,
     /// Current offset in the probe side partition
     probe_offset: usize,
 }
@@ -146,7 +149,7 @@ impl SpatialJoinStream {
         let probe_stream_schema = probe_stream.schema();
         let join_metrics = SpatialJoinProbeMetrics::new(probe_partition_id, metrics);
         let knn_results_merger = if let SpatialPredicate::KNearestNeighbors(knn) = &on {
-            Some(Arc::new(KNNResultsMerger::new(
+            Some(Box::new(KNNResultsMerger::new(
                 knn.k as usize,
                 sedona_options.spatial_join.knn_include_tie_breakers,
                 target_output_batch_size,
@@ -233,7 +236,7 @@ pub(crate) enum SpatialJoinStreamState {
     /// off building the index (`true`) or simply wait for someone else to build it (`false`).
     WaitBuildIndex(u32, bool),
     /// Indicates that build-side has been collected, and stream is ready for
-    /// fetching probe-side
+    /// fetching probe-side batches
     FetchProbeBatch(PartitionDescriptor),
     /// Indicates that we're processing a probe batch using the batch iterator
     ProcessProbeBatch(
@@ -418,7 +421,7 @@ impl SpatialJoinStream {
             return Poll::Ready(Ok(StatefulStreamResult::Continue));
         }
 
-        if let Some(merger) = &self.knn_results_merger {
+        if let Some(merger) = self.knn_results_merger.as_deref_mut() {
             merger.init_for_partition_0(num_partitions == 1)?;
         }
 
@@ -563,7 +566,7 @@ impl SpatialJoinStream {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
         // Extract the necessary data first to avoid borrowing conflicts
-        let (partition_desc, mut iterator, batch_opt, is_complete) = {
+        let (partition_desc, mut iterator, batch_opt) = {
             let _timer = self.join_metrics.join_time.timer();
             match &mut self.state {
                 SpatialJoinStreamState::ProcessProbeBatch(desc, future) => {
@@ -575,8 +578,7 @@ impl SpatialJoinStream {
                                     return Poll::Ready(Err(e));
                                 }
                             };
-                            let is_complete = iterator.is_complete();
-                            (*desc, iterator, batch_opt, is_complete)
+                            (*desc, iterator, batch_opt)
                         }
                         Poll::Pending => return Poll::Pending,
                     }
@@ -585,15 +587,17 @@ impl SpatialJoinStream {
             }
         };
 
-        let result = match batch_opt {
+        match batch_opt {
             Some(batch) => {
                 self.join_metrics.output_batches.add(1);
                 self.join_metrics.output_rows.add(batch.num_rows());
 
                 // Check if iterator is complete
-                if is_complete {
+                if iterator.is_complete() {
+                    self.knn_results_merger = iterator.take_knn_results_merger();
                     self.state = SpatialJoinStreamState::FetchProbeBatch(partition_desc);
                 } else {
+                    // Iterator is not complete, continue processing the current probe batch
                     let future = async move {
                         let result = iterator.next_batch().await;
                         (iterator, result)
@@ -601,16 +605,15 @@ impl SpatialJoinStream {
                     .boxed();
                     self.state = SpatialJoinStreamState::ProcessProbeBatch(partition_desc, future);
                 }
-                batch
+                Poll::Ready(Ok(StatefulStreamResult::Ready(Some(batch))))
             }
             None => {
-                // Iterator finished, move to next probe batch
+                // Iterator finished, move to the next probe batch
+                self.knn_results_merger = iterator.take_knn_results_merger();
                 self.state = SpatialJoinStreamState::FetchProbeBatch(partition_desc);
-                return Poll::Ready(Ok(StatefulStreamResult::Continue));
+                Poll::Ready(Ok(StatefulStreamResult::Continue))
             }
-        };
-
-        Poll::Ready(Ok(StatefulStreamResult::Ready(Some(result))))
+        }
     }
 
     fn setup_unmatched_build_batch_processing(
@@ -744,7 +747,7 @@ impl SpatialJoinStream {
 
         let next_partition_id = current_partition_id + 1;
 
-        if let Some(merger) = &self.knn_results_merger {
+        if let Some(merger) = self.knn_results_merger.as_deref_mut() {
             if next_partition_id < num_regular_partitions {
                 merger.rotate(next_partition_id == num_regular_partitions - 1)?;
             }
@@ -765,7 +768,7 @@ impl SpatialJoinStream {
     }
 
     fn create_spatial_join_iterator(
-        &self,
+        &mut self,
         partition_desc: PartitionDescriptor,
         probe_evaluated_batch: EvaluatedBatch,
         probe_offset: usize,
@@ -808,6 +811,10 @@ impl SpatialJoinStream {
             _ => JoinSide::Left,
         };
 
+        // Move out the knn_results_merger to the iterator, we'll move it back when the iterator is complete
+        // by calling `SpatialJoinBatchIterator::take_knn_results_merger`.
+        let knn_results_merger = std::mem::take(&mut self.knn_results_merger);
+
         let iterator = SpatialJoinBatchIterator::new(SpatialJoinBatchIteratorParams {
             schema: self.schema.clone(),
             filter: self.filter.clone(),
@@ -824,7 +831,7 @@ impl SpatialJoinStream {
             probe_offset,
             produce_unmatched_probe_rows: is_last_build_partition,
             probe_evaluated_batch: Arc::new(probe_evaluated_batch),
-            knn_results_merger: self.knn_results_merger.clone(),
+            knn_results_merger,
         })?;
         Ok(Box::new(iterator))
     }
@@ -892,8 +899,6 @@ pub(crate) struct SpatialJoinBatchIterator {
     produce_unmatched_probe_rows: bool,
     /// Progress of probing
     progress: Option<ProbeProgress>,
-    /// KNN results merger. Only used for KNN join.
-    knn_results_merger: Option<Arc<KNNResultsMerger>>,
 }
 
 struct ProbeProgress {
@@ -916,6 +921,9 @@ struct ProbeProgress {
     /// Cursor of the position in the `build_batch_positions` and `probe_indices` vectors
     /// for tracking the progress of producing joined batches
     pos: usize,
+
+    /// KNN results merger. Only used for KNN join.
+    knn_results_merger: Option<Box<KNNResultsMerger>>,
 }
 
 /// Type alias for a tuple of build and probe indices slices
@@ -1017,7 +1025,7 @@ pub(crate) struct SpatialJoinBatchIteratorParams {
     pub visited_probe_side: Option<Arc<Mutex<BooleanBufferBuilder>>>,
     pub probe_offset: usize,
     pub produce_unmatched_probe_rows: bool,
-    pub knn_results_merger: Option<Arc<KNNResultsMerger>>,
+    pub knn_results_merger: Option<Box<KNNResultsMerger>>,
 }
 
 impl SpatialJoinBatchIterator {
@@ -1051,8 +1059,8 @@ impl SpatialJoinBatchIterator {
                     }
                 }),
                 pos: 0,
+                knn_results_merger: params.knn_results_merger,
             }),
-            knn_results_merger: params.knn_results_merger,
         })
     }
 
@@ -1208,6 +1216,8 @@ impl SpatialJoinBatchIterator {
     }
 
     fn produce_result_batch(&self, progress: &mut ProbeProgress) -> Result<Option<RecordBatch>> {
+        let need_merge_knn_results = progress.knn_results_merger.is_some();
+
         let Some((build_indices, probe_indices, distances)) =
             progress.indices_for_next_batch(self.build_side, self.join_type, self.max_batch_size)
         else {
@@ -1220,8 +1230,7 @@ impl SpatialJoinBatchIterator {
 
         // Prepare unfiltered indices and distances for KNN joins. This has to be done before calling
         // progress.next_probe_range to make the borrow checker happy.
-        let (unfiltered_probe_indices, unfiltered_distances) = if self.knn_results_merger.is_some()
-        {
+        let (unfiltered_probe_indices, unfiltered_distances) = if need_merge_knn_results {
             (probe_indices.to_vec(), distances.map(|v| v.to_vec()))
         } else {
             (Vec::new(), None)
@@ -1237,7 +1246,7 @@ impl SpatialJoinBatchIterator {
                 probe_indices_array.clone(),
                 probe_range,
             )?
-        } else if self.knn_results_merger.is_some() {
+        } else if need_merge_knn_results {
             // For KNN joins, it's possible that after filtering there is no matched result.
             // In this case, we still need to call merge.ingest to update the K-nearest-so-far distances.
             RecordBatch::new_empty(self.schema.clone())
@@ -1245,7 +1254,7 @@ impl SpatialJoinBatchIterator {
             return Ok(None);
         };
 
-        let batch_opt = if let Some(merger) = &self.knn_results_merger {
+        let batch_opt = if let Some(merger) = &mut progress.knn_results_merger {
             let probe_indices_slice = probe_indices_array.values().as_ref();
             let unfiltered_distances = unfiltered_distances.as_deref().unwrap_or(&[]);
             merger.ingest(
@@ -1281,7 +1290,7 @@ impl SpatialJoinBatchIterator {
 
         // For partitioned KNN joins, flush any pending buffered probe index first.
         // If this produces a batch, return it and let the caller poll again.
-        if let Some(merger) = &self.knn_results_merger {
+        if let Some(merger) = &mut progress.knn_results_merger {
             let end_offset_in_partition = self.offset_in_partition + num_rows;
             if let Some(batch) = merger.produce_batch_until(end_offset_in_partition)? {
                 if batch.num_rows() > 0 {
@@ -1325,6 +1334,15 @@ impl SpatialJoinBatchIterator {
             .as_ref()
             .expect("Progress should be available");
         self.is_complete_inner(progress)
+    }
+
+    pub fn take_knn_results_merger(&mut self) -> Option<Box<KNNResultsMerger>> {
+        assert!(self.is_complete(), "Iterator should be complete");
+        let progress = self
+            .progress
+            .as_mut()
+            .expect("Progress should be available");
+        progress.knn_results_merger.take()
     }
 
     fn is_complete_inner(&self, progress: &ProbeProgress) -> bool {
@@ -1978,6 +1996,7 @@ mod tests {
             probe_indices: probe_indices.to_vec(),
             distances: None,
             pos: 0,
+            knn_results_merger: None,
         };
         let mut produced_probe_indices: Vec<u32> = Vec::new();
         loop {
