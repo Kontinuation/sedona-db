@@ -172,43 +172,6 @@ impl EvaluatedGeometryArray {
 
         Ok(geom_array_size + self.rects.allocated_size() + distance_in_mem_size + wkb_vec_size)
     }
-
-    /// Replace the geometry array with a new one.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the new geometry array contains the same geometries as the old one,
-    /// in the same order. This method will not recompute the bounding boxes of the geometries.
-    /// If the new geometry array contains different geometries, the bounding boxes will be incorrect.
-    pub unsafe fn replace_geometry_array(&mut self, geometry_array: ArrayRef) -> Result<()> {
-        if geometry_array.len() != self.rects.len() {
-            return Err(DataFusionError::Internal(format!(
-                "New geometry array length {} does not match existing rects length {}",
-                geometry_array.len(),
-                self.rects.len()
-            )));
-        }
-
-        let num_rows = geometry_array.len();
-        let mut wkbs = Vec::with_capacity(num_rows);
-        geometry_array.iter_as_wkb(&self.sedona_type, num_rows, |wkb_opt| {
-            wkbs.push(wkb_opt);
-            Ok(())
-        })?;
-
-        // Safety: The wkbs must reference buffers inside the `geometry_array`. Since the `geometry_array` and
-        // `wkbs` are both owned by the `EvaluatedGeometryArray`, so they have the same lifetime. We'll never
-        // have a situation where the `EvaluatedGeometryArray` is dropped while the `wkbs` are still in use
-        // (guaranteed by the scope of the `wkbs` field and lifetime signature of the `wkbs` method).
-        let wkbs = wkbs
-            .into_iter()
-            .map(|wkb| wkb.map(|wkb| unsafe { transmute(wkb) }))
-            .collect();
-
-        self.geometry_array = geometry_array;
-        self.wkbs = wkbs;
-        Ok(())
-    }
 }
 
 /// Evaluator for a relation predicate.

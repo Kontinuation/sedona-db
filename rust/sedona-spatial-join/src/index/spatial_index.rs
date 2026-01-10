@@ -51,6 +51,8 @@ use crate::{
 use arrow::array::BooleanBufferBuilder;
 use sedona_common::{option::SpatialJoinOptions, sedona_internal_err, ExecutionMode};
 
+pub const DISTANCE_TOLERANCE: f64 = 1e-9;
+
 pub struct SpatialIndex {
     pub(crate) schema: SchemaRef,
     pub(crate) options: SpatialJoinOptions,
@@ -377,7 +379,6 @@ impl SpatialIndex {
                     .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
                 // Include all results up to and including those with the same distance as the k-th result
-                const DISTANCE_TOLERANCE: f64 = 1e-9;
                 let mut tie_breaker_results: Vec<u32> = Vec::new();
 
                 for (i, &(distance, result_idx)) in all_distances_with_indices.iter().enumerate() {

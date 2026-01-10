@@ -34,10 +34,10 @@ use crate::{
         partition_slots::PartitionSlots, util::geo_rect_to_bbox, PartitionedSide, SpatialPartition,
         SpatialPartitioner,
     },
-    utils::arrow_utils::compact_batch,
+    utils::arrow_utils::{compact_array, compact_batch},
 };
 use arrow::compute::interleave_record_batch;
-use arrow_array::{Array, ArrayRef, BinaryViewArray, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_select::interleave::interleave as arrow_interleave;
 use datafusion::config::SpillCompression;
 use datafusion_common::{Result, ScalarValue};
@@ -569,19 +569,11 @@ fn interleave_geometry_array(
         .map(|geom| geom.geometry_array.as_ref())
         .collect();
     let geometry_array = arrow_interleave(&value_refs, indices)?;
-
-    // Compact the geometry array in `EvaluatedGeometryArray` if it is a `BinaryViewArray`.
-    // See [`compact_batch`] for the rationale.
-    let compacted_geometry_array =
-        if let Some(view_array) = geometry_array.as_any().downcast_ref::<BinaryViewArray>() {
-            Arc::new(view_array.gc())
-        } else {
-            geometry_array
-        };
+    let (geometry_array, _) = compact_array(geometry_array)?;
 
     let distance = interleave_distance_columns(geom_arrays, indices)?;
 
-    let mut result = EvaluatedGeometryArray::try_new(compacted_geometry_array, sedona_type)?;
+    let mut result = EvaluatedGeometryArray::try_new(geometry_array, sedona_type)?;
     result.distance = distance;
     Ok(result)
 }

@@ -69,7 +69,10 @@ pub(crate) fn compact_batch(batch: RecordBatch) -> Result<RecordBatch> {
     }
 }
 
-fn compact_array(array: ArrayRef) -> Result<(ArrayRef, bool)> {
+/// Recursively compacts view arrays in `array` by calling `gc()` on them.
+/// Returns a tuple of the potentially new array and a boolean indicating
+/// whether any compaction was performed.
+pub(crate) fn compact_array(array: ArrayRef) -> Result<(ArrayRef, bool)> {
     if let Some(view_array) = array.as_any().downcast_ref::<StringViewArray>() {
         return Ok((Arc::new(view_array.gc()), true));
     }
