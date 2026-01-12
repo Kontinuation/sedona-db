@@ -136,6 +136,13 @@ impl SpatialIndexBuilder {
         );
         let refiner_mem_usage = refiner.estimate_max_memory_usage(geo_stats);
 
+        let knn_components_mem_usage =
+            if matches!(spatial_predicate, SpatialPredicate::KNearestNeighbors(_)) {
+                KnnComponents::estimate_max_memory_usage(geo_stats)
+            } else {
+                0
+            };
+
         // Estimate the amount of memory needed for the R-tree
         let rtree_mem_usage = num_geoms * RTREE_MEMORY_ESTIMATE_PER_RECT;
 
@@ -144,7 +151,7 @@ impl SpatialIndexBuilder {
         let auxiliary = num_geoms * 16;
 
         // The final estimation is the sum of all above
-        refiner_mem_usage + rtree_mem_usage + auxiliary
+        refiner_mem_usage + knn_components_mem_usage + rtree_mem_usage + auxiliary
     }
 
     /// Add a geometry batch to be indexed.

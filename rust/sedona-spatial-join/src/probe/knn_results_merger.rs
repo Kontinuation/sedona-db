@@ -971,26 +971,13 @@ impl KNNResultBatchBuilder {
             &mut self.top_k_distances,
         );
 
-        let num_kept_rows = if let Some(kth_distance) = self.top_k_distances.last() {
-            let distance_threshold = if include_tie_breaker {
-                // The distance threshold is slighly looser when including tie breakers, please
-                // refer to `SpatialIndex::query_knn` for more details.
-                *kth_distance + DISTANCE_TOLERANCE
-            } else {
-                *kth_distance
-            };
-            self.append_merged_knn_probe_results(
-                spilled_batch_idx,
-                spilled_results,
-                ingested_results,
-                k,
-                distance_threshold,
-                include_tie_breaker,
-            )
-        } else {
-            // No filtered results
-            0
-        };
+        let num_kept_rows = self.append_merged_knn_probe_results(
+            spilled_batch_idx,
+            spilled_results,
+            ingested_results,
+            k,
+            include_tie_breaker,
+        );
 
         self.row_array_offsets_builder.push_length(num_kept_rows);
         self.unfiltered_dist_array_builder
@@ -1011,7 +998,6 @@ impl KNNResultBatchBuilder {
         spilled_results: &KNNProbeResult<'_>,
         ingested_results: &KNNProbeResult<'_>,
         k: usize,
-        distance_threshold: f64,
         include_tie_breaker: bool,
     ) -> usize {
         // Sort all distances from both spilled and ingested results
@@ -1039,22 +1025,18 @@ impl KNNResultBatchBuilder {
         {
             row_dists.push((RowSelector::FromIngested { row_idx }, *dist));
         }
-        row_dists.sort_unstable_by(|(_, a), (_, b)| a.total_cmp(b));
 
-        // Append row selectors and distances within distance_threshold
-        let mut kept_rows = 0;
-        for (row_selector, dist) in row_dists {
-            if kept_rows >= k && !include_tie_breaker {
-                break;
-            }
-            if *dist <= distance_threshold {
-                self.rows_selector.push(*row_selector);
-                self.dist_array_builder.append_value(*dist);
-                kept_rows += 1;
-            }
+        truncate_row_selectors_to_top_k(
+            row_dists,
+            &mut self.top_k_distances,
+            k,
+            include_tie_breaker,
+        );
+        for (row_selector, dist) in row_dists.iter() {
+            self.rows_selector.push(*row_selector);
+            self.dist_array_builder.append_value(*dist);
         }
-
-        kept_rows
+        row_dists.len()
     }
 
     fn build_spilled_batch(
@@ -1255,6 +1237,69 @@ fn merge_unfiltered_topk(k: usize, prev: &[f64], new: &[f64], top_k: &mut Vec<f6
         top_k.truncate(k);
     }
     top_k.sort_by(|a, b| a.total_cmp(b));
+}
+
+fn truncate_row_selectors_to_top_k(
+    row_dist_vec: &mut Vec<(RowSelector, f64)>,
+    top_k_distances: &[f64],
+    k: usize,
+    include_tie_breaker: bool,
+) {
+    let Some(kth_distance) = top_k_distances.last() else {
+        row_dist_vec.clear();
+        return;
+    };
+
+    let distance_threshold = if include_tie_breaker {
+        // The distance threshold is slighly looser when including tie breakers, please
+        // refer to `SpatialIndex::query_knn` for more details.
+        *kth_distance + DISTANCE_TOLERANCE
+    } else {
+        *kth_distance
+    };
+
+    row_dist_vec.sort_unstable_by(|(_, l_dist), (_, r_dist)| l_dist.total_cmp(r_dist));
+
+    // Keep only the row selectors within distance_threshold
+    let mut kept_rows = 0;
+    for (_, dist) in row_dist_vec.iter() {
+        if kept_rows >= k && !include_tie_breaker {
+            break;
+        }
+        if *dist <= distance_threshold {
+            kept_rows += 1;
+        } else {
+            break;
+        }
+    }
+
+    row_dist_vec.truncate(kept_rows);
+
+    // If the last distance D in top_k_distances has N ties, and include_tie_breaker is false, we
+    // need to make sure that the kept rows with distance D should not exceed N, otherwise we'll
+    // incorrectly have extra rows kept.
+    // To fix this, we need to count how many rows have distance equal to the last distance,
+    // and make sure we only keep that many rows among the kept rows with that distance.
+    if !include_tie_breaker {
+        let last_distance = *kth_distance;
+        let num_ties_in_topk = top_k_distances
+            .iter()
+            .rev()
+            .take_while(|d| **d == last_distance)
+            .count();
+
+        let num_ties_in_kept = row_dist_vec
+            .iter()
+            .rev()
+            .take_while(|(_, d)| *d == last_distance)
+            .count();
+
+        if num_ties_in_kept > num_ties_in_topk {
+            let to_remove = num_ties_in_kept - num_ties_in_topk;
+            let new_len = row_dist_vec.len() - to_remove;
+            row_dist_vec.truncate(new_len);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1548,6 +1593,101 @@ mod test {
         assert_eq!(top_k, vec![1.0, 2.0]);
     }
 
+    fn create_dummy_row_selectors(dists: &[f64]) -> Vec<(RowSelector, f64)> {
+        dists
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (RowSelector::FromIngested { row_idx: i }, *d))
+            .collect()
+    }
+
+    fn count_dist(v: &[(RowSelector, f64)], target: f64) -> usize {
+        v.iter().filter(|(_, d)| *d == target).count()
+    }
+
+    #[test]
+    fn test_truncate_row_selectors_for_empty_unfiltered_top_k() {
+        let mut row_dist_vec = create_dummy_row_selectors(&[1.0, 2.0, 3.0]);
+        truncate_row_selectors_to_top_k(&mut row_dist_vec, &[], 3, false);
+        assert!(row_dist_vec.is_empty());
+    }
+
+    #[test]
+    fn test_truncate_row_selectors_no_dup() {
+        // Keep at most K rows within distance threshold.
+        let k = 3;
+        let top_k_distances = vec![1.0, 2.0, 3.0];
+        let mut row_dist_vec = create_dummy_row_selectors(&[3.0, 2.0, 4.0, 1.0, 5.0]);
+
+        truncate_row_selectors_to_top_k(&mut row_dist_vec, &top_k_distances, k, false);
+
+        assert_eq!(row_dist_vec.len(), 3);
+        assert!(row_dist_vec.iter().all(|(_, d)| *d <= 3.0));
+        assert_eq!(count_dist(&row_dist_vec, 3.0), 1);
+    }
+
+    #[test]
+    fn test_truncate_row_selectors_handle_last_ties() {
+        // top_k_distances has last distance 4.0 with only 1 tie.
+        // Filtered results can contain more 4.0 rows than allowed; we must trim them.
+        let k = 5;
+        let top_k_distances = vec![1.0, 2.0, 3.0, 3.0, 4.0];
+        let mut row_dist_vec = create_dummy_row_selectors(&[4.0, 1.0, 4.0, 2.0, 4.0, 10.0]);
+
+        truncate_row_selectors_to_top_k(&mut row_dist_vec, &top_k_distances, k, false);
+
+        assert!(row_dist_vec.iter().all(|(_, d)| *d <= 4.0));
+        assert!(row_dist_vec.len() <= k);
+        assert_eq!(count_dist(&row_dist_vec, 4.0), 1);
+        assert_eq!(count_dist(&row_dist_vec, 1.0), 1);
+        assert_eq!(count_dist(&row_dist_vec, 2.0), 1);
+
+        // top_k_distances has last distance 4.0 with 2 ties.
+        // If we keep more than 2 rows with 4.0, we must discard some from the tail.
+        let k = 4;
+        let top_k_distances = vec![1.0, 2.0, 4.0, 4.0];
+        let mut row_dist_vec = create_dummy_row_selectors(&[4.0, 4.0, 4.0, 1.0]);
+
+        truncate_row_selectors_to_top_k(&mut row_dist_vec, &top_k_distances, k, false);
+
+        assert!(row_dist_vec.iter().all(|(_, d)| *d <= 4.0));
+        assert!(row_dist_vec.len() <= k);
+        assert_eq!(count_dist(&row_dist_vec, 4.0), 2);
+        assert_eq!(count_dist(&row_dist_vec, 1.0), 1);
+
+        // Keep fewer ties than in top_k_distances should not trigger any trimming.
+        let k = 5;
+        let top_k_distances = vec![1.0, 2.0, 3.0, 5.0, 5.0];
+        let mut row_dist_vec = create_dummy_row_selectors(&[5.0, 1.0]);
+
+        truncate_row_selectors_to_top_k(&mut row_dist_vec, &top_k_distances, k, false);
+
+        assert_eq!(row_dist_vec.len(), 2);
+        assert_eq!(count_dist(&row_dist_vec, 5.0), 1);
+        assert_eq!(count_dist(&row_dist_vec, 1.0), 1);
+    }
+
+    #[test]
+    fn test_truncate_row_selectors_include_tie_breakers() {
+        let k = 3;
+        let top_k_distances = vec![1.0, 2.0, 3.0];
+        let tol_half = DISTANCE_TOLERANCE / 2.0;
+
+        let mut row_dist_vec =
+            create_dummy_row_selectors(&[3.0, 1.0, 3.0, 2.0, 3.0 + tol_half, 4.0]);
+        truncate_row_selectors_to_top_k(&mut row_dist_vec, &top_k_distances, k, true);
+
+        // Should keep all <= 3.0 + DISTANCE_TOLERANCE (i.e. not limited by k).
+        assert!(row_dist_vec.len() > k);
+        assert!(row_dist_vec
+            .iter()
+            .all(|(_, d)| *d <= 3.0 + DISTANCE_TOLERANCE));
+        assert_eq!(count_dist(&row_dist_vec, 1.0), 1);
+        assert_eq!(count_dist(&row_dist_vec, 2.0), 1);
+        assert_eq!(count_dist(&row_dist_vec, 3.0), 2);
+        assert_eq!(count_dist(&row_dist_vec, 3.0 + tol_half), 1);
+    }
+
     #[derive(Clone, PartialEq, Debug)]
     struct FuzzTestKNNResult {
         query_id: usize,
@@ -1619,6 +1759,16 @@ mod test {
                 .unwrap_or(0.0);
 
             let k = result.knn_objects.len();
+            if k == 0 {
+                for part_idx in 0..num_partitions {
+                    partitions[part_idx].push(FuzzTestKNNResult {
+                        query_id: result.query_id,
+                        knn_objects: Vec::new(),
+                    });
+                }
+                continue;
+            }
+
             let mut extended_knn_objects = result.knn_objects.clone();
             for _ in 0..((num_partitions - 1) * k) {
                 extended_knn_objects.push(FuzzKNNResultObject {
@@ -2027,5 +2177,55 @@ mod test {
             )
             .unwrap();
         }
+    }
+
+    #[rstest]
+    fn test_knn_results_merger_with_missing_probe_rows(
+        #[values(1, 10, 13, 50, 51, 1000)] target_batch_size: usize,
+    ) {
+        let k = 5;
+        let include_tie_breaker = true;
+        let num_rows = 20;
+        let num_partitions = 3;
+        let kept_prob = 0.5;
+        let mut rng = StdRng::seed_from_u64(target_batch_size as u64);
+
+        let mut test_data = create_fuzz_test_data(k, num_rows, kept_prob, &mut rng);
+
+        // Remove the query results of some probe rows randomly
+        for result in test_data.iter_mut() {
+            if rng.gen_bool(0.1) {
+                result.knn_objects.clear();
+            }
+        }
+
+        let mut partitioned_test_data =
+            partition_fuzz_test_data(&test_data, num_partitions, kept_prob, &mut rng);
+        assert!(is_fuzz_test_data_equivalent(
+            &test_data,
+            &partitioned_test_data,
+            k,
+            include_tie_breaker
+        ));
+
+        // Randomly remove some probe rows from each partition
+        for partition in partitioned_test_data.iter_mut() {
+            for result in partition.iter_mut() {
+                if rng.gen_bool(0.1) {
+                    result.knn_objects.clear();
+                }
+            }
+        }
+
+        let query_group_size = 30;
+        let target_batch_size = 33;
+        fuzz_test_knn_results_merger_using_partitioned_data(
+            &partitioned_test_data,
+            k,
+            include_tie_breaker,
+            query_group_size,
+            target_batch_size,
+        )
+        .unwrap();
     }
 }
