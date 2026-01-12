@@ -50,8 +50,7 @@ use crate::utils::spill::{RecordBatchSpillReader, RecordBatchSpillWriter};
 /// Each probe row has a unique index. The index must be strictly increasing
 /// across probe rows. The sequence of index across the entire sequence of ingested
 /// [UnprocessedKNNResultBatch] must also be strictly increasing. The index is computed based on
-/// the 0-based index of the probe row in this probe partition, so it is also continuous.
-/// We are not relying on the index being continuous, but it must be strictly increasing.
+/// the 0-based index of the probe row in this probe partition.
 ///
 /// The KNN results are filtered, meaning that the original KNN results obtained by probing
 /// the spatial index may be further filtered based on some predicates. It is also possible that
@@ -490,8 +489,9 @@ impl SpilledBatchIndexArray {
         Self { array, pos: 0 }
     }
 
-    /// Advance the cursor to target index. The `target` is expected to be strictly increasing
-    /// across calls.
+    /// Advance the cursor to target index. The `target` is expected to be monotonically increasing
+    /// across calls. We still tolerate the case where `target` is smaller than the current position,
+    /// in which case we simply return [HasFoundIndex::NotFound].
     ///
     /// Please note that once a `target` is found, the cursor is advanced to the next position.
     /// Advancing to the same `target` again will yield [HasFoundIndex::NotFound].
@@ -717,9 +717,11 @@ impl KNNResultsMerger {
             None
         };
 
-        // Load spilled batches up to end_index_exclusive, if there's any
+        // Load spilled batches up to end_index_exclusive, if there's any.
         let spilled_batch_opt = if end_index_exclusive > 0 {
             let end_target_idx = end_index_exclusive - 1;
+            // `end_target_idx` might have already been loaded before, but that's fine. The following operation
+            // will be a no-op in that case.
             if let Some((batch_idx, row_idx)) = self.load_spilled_batches_up_to(end_target_idx)? {
                 let loaded_range = row_idx..(row_idx + 1);
                 self.append_spilled_results_in_range(batch_idx, &loaded_range);
@@ -1037,9 +1039,7 @@ impl KNNResultBatchBuilder {
         {
             row_dists.push((RowSelector::FromIngested { row_idx }, *dist));
         }
-        row_dists.sort_unstable_by(|(_, a), (_, b)| {
-            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        row_dists.sort_unstable_by(|(_, a), (_, b)| a.total_cmp(b));
 
         // Append row selectors and distances within distance_threshold
         let mut kept_rows = 0;
@@ -1259,6 +1259,11 @@ fn merge_unfiltered_topk(k: usize, prev: &[f64], new: &[f64], top_k: &mut Vec<f6
 
 #[cfg(test)]
 mod test {
+    use arrow::compute::take_record_batch;
+    use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+    use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
+    use rstest::rstest;
+
     use super::*;
 
     #[test]
@@ -1541,5 +1546,486 @@ mod test {
         assert_eq!(top_k, vec![1.0, 2.0]);
         merge_unfiltered_topk(2, &[2.0, 1.0], &[], &mut top_k);
         assert_eq!(top_k, vec![1.0, 2.0]);
+    }
+
+    #[derive(Clone, PartialEq, Debug)]
+    struct FuzzTestKNNResult {
+        query_id: usize,
+        knn_objects: Vec<FuzzKNNResultObject>,
+    }
+
+    #[derive(Clone, PartialEq, Debug)]
+    struct FuzzKNNResultObject {
+        object_id: usize,
+        distance: f64,
+        is_kept: bool,
+    }
+
+    fn create_fuzz_test_data_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("query_id", DataType::UInt64, false),
+            Field::new("object_id", DataType::UInt64, false),
+        ]))
+    }
+
+    fn create_fuzz_test_data(
+        k: usize,
+        num_rows: usize,
+        kept_prob: f64,
+        rng: &mut StdRng,
+    ) -> Vec<FuzzTestKNNResult> {
+        let mut test_data = Vec::with_capacity(num_rows);
+        let mut next_object_id = 0;
+        for query_id in 0..num_rows {
+            // Generate K objects
+            let knn_objects = (next_object_id..next_object_id + k)
+                .map(|object_id| FuzzKNNResultObject {
+                    object_id,
+                    distance: rng.gen_range(1..10) as f64,
+                    is_kept: rng.gen_bool(kept_prob),
+                })
+                .collect::<Vec<FuzzKNNResultObject>>();
+            next_object_id += k;
+
+            test_data.push(FuzzTestKNNResult {
+                query_id,
+                knn_objects,
+            });
+        }
+        test_data
+    }
+
+    fn partition_fuzz_test_data(
+        test_data: &[FuzzTestKNNResult],
+        num_partitions: usize,
+        kept_prob: f64,
+        rng: &mut StdRng,
+    ) -> Vec<Vec<FuzzTestKNNResult>> {
+        let mut partitions: Vec<Vec<FuzzTestKNNResult>> = vec![Vec::new(); num_partitions];
+        let mut next_object_id = test_data
+            .iter()
+            .flat_map(|r| r.knn_objects.iter())
+            .map(|o| o.object_id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        for result in test_data.iter() {
+            // Split the knn_objects into partitions, randomly mix in some objects with large distances
+            let distance_threshold = result
+                .knn_objects
+                .iter()
+                .map(|o| o.distance)
+                .reduce(f64::max)
+                .unwrap_or(0.0);
+
+            let k = result.knn_objects.len();
+            let mut extended_knn_objects = result.knn_objects.clone();
+            for _ in 0..((num_partitions - 1) * k) {
+                extended_knn_objects.push(FuzzKNNResultObject {
+                    object_id: next_object_id,
+                    distance: distance_threshold + rng.gen_range(1..10) as f64,
+                    is_kept: rng.gen_bool(kept_prob),
+                });
+                next_object_id += 1;
+            }
+            extended_knn_objects.shuffle(rng);
+
+            for (part_idx, chunk) in extended_knn_objects.chunks(k).enumerate() {
+                partitions[part_idx].push(FuzzTestKNNResult {
+                    query_id: result.query_id,
+                    knn_objects: chunk.to_vec(),
+                });
+            }
+        }
+        partitions
+    }
+
+    fn merge_partitioned_test_data(
+        partitioned_data: &[Vec<FuzzTestKNNResult>],
+    ) -> Vec<FuzzTestKNNResult> {
+        let num_queries = partitioned_data[0].len();
+        let mut merged_results = Vec::with_capacity(num_queries);
+        for query_idx in 0..num_queries {
+            let mut knn_objects = Vec::new();
+            for partition in partitioned_data.iter() {
+                knn_objects.extend_from_slice(&partition[query_idx].knn_objects);
+            }
+            merged_results.push(FuzzTestKNNResult {
+                query_id: partitioned_data[0][query_idx].query_id,
+                knn_objects,
+            });
+        }
+        merged_results
+    }
+
+    fn compute_expected_results(
+        test_data: &[FuzzTestKNNResult],
+        k: usize,
+        include_tie_breaker: bool,
+    ) -> Vec<(usize, Vec<FuzzKNNResultObject>)> {
+        let mut expected_results = Vec::with_capacity(test_data.len());
+        for result in test_data.iter() {
+            let mut knn_objects = result.knn_objects.clone();
+
+            // Take top K objects first
+            knn_objects.sort_by(|a, b| {
+                a.distance
+                    .total_cmp(&b.distance)
+                    .then(a.object_id.cmp(&b.object_id))
+            });
+            if let Some(kth_distance) = knn_objects.get(k.saturating_sub(1)).map(|o| o.distance) {
+                if include_tie_breaker {
+                    let distance_threshold = kth_distance + DISTANCE_TOLERANCE;
+                    knn_objects.retain(|o| o.distance <= distance_threshold);
+                } else {
+                    knn_objects.truncate(k);
+                }
+            } else {
+                knn_objects.clear();
+            }
+
+            // Filter the results to only kept objects
+            let kept_objects = knn_objects.into_iter().filter(|o| o.is_kept).collect();
+
+            expected_results.push((result.query_id, kept_objects));
+        }
+        expected_results
+    }
+
+    fn is_fuzz_test_data_equivalent(
+        test_data: &[FuzzTestKNNResult],
+        partitioned_test_data: &[Vec<FuzzTestKNNResult>],
+        k: usize,
+        include_tie_breaker: bool,
+    ) -> bool {
+        let merged_partitioned_test_data = merge_partitioned_test_data(&partitioned_test_data);
+        let expected_results = compute_expected_results(&test_data, k, include_tie_breaker);
+        let partitioned_results =
+            compute_expected_results(&merged_partitioned_test_data, k, include_tie_breaker);
+        expected_results == partitioned_results
+    }
+
+    fn ingest_partitioned_fuzz_test_data(
+        knn_result_spiller: &mut KNNResultsMerger,
+        partitioned_test_data: &[Vec<FuzzTestKNNResult>],
+        query_group_size: usize,
+        batch_size: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        let mut merged_record_batches = Vec::new();
+        for (i_partition, partition) in partitioned_test_data.iter().enumerate() {
+            if i_partition != 0 {
+                let is_last_partition = i_partition == partitioned_test_data.len() - 1;
+                knn_result_spiller.rotate(is_last_partition)?;
+            }
+
+            let mut start_offset = 0;
+            for partition_chunk in partition.chunks(query_group_size) {
+                let res_batches = ingest_fuzz_test_data_segment(
+                    knn_result_spiller,
+                    partition_chunk,
+                    start_offset,
+                    batch_size,
+                )?;
+                merged_record_batches.extend(res_batches);
+                start_offset += partition_chunk.len();
+            }
+
+            if let Some(batch) = knn_result_spiller.produce_batch_until(start_offset)? {
+                merged_record_batches.push(batch);
+            }
+        }
+        Ok(merged_record_batches)
+    }
+
+    fn ingest_fuzz_test_data_segment(
+        knn_result_spiller: &mut KNNResultsMerger,
+        test_data: &[FuzzTestKNNResult],
+        start_offset: usize,
+        batch_size: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        // Assemble the test_data into one RecordBatch
+        let mut query_id_builder = UInt64Array::builder(test_data.len());
+        let mut object_id_builder = UInt64Array::builder(test_data.len());
+        let mut indices = Vec::new();
+        let mut distances = Vec::new();
+        let mut is_kept = Vec::new();
+        for (idx, result) in test_data.iter().enumerate() {
+            for obj in result.knn_objects.iter() {
+                query_id_builder.append_value(result.query_id as u64);
+                object_id_builder.append_value(obj.object_id as u64);
+                indices.push(idx + start_offset);
+                distances.push(obj.distance);
+                is_kept.push(obj.is_kept);
+            }
+        }
+        let query_id_array = Arc::new(query_id_builder.finish());
+        let object_id_array = Arc::new(object_id_builder.finish());
+        let schema = create_fuzz_test_data_schema();
+        let knn_result_batch = RecordBatch::try_new(schema, vec![query_id_array, object_id_array])?;
+
+        // Break the record batch into smaller batches and ingest them
+        let mut merged_record_batches = Vec::new();
+        for start in (0..knn_result_batch.num_rows()).step_by(batch_size) {
+            let end = (start + batch_size).min(knn_result_batch.num_rows());
+            let batch = knn_result_batch.slice(start, end - start);
+
+            let unfiltered_distances = distances[start..end].to_vec();
+            let unfiltered_indices = indices[start..end].to_vec();
+            let is_kept_slice = &is_kept[start..end];
+
+            // Find local indices for kept rows
+            let kept_indices_within_batch: Vec<usize> = is_kept_slice
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &kept)| if kept { Some(i) } else { None })
+                .collect();
+
+            let kept_indices_array = UInt64Array::from(
+                kept_indices_within_batch
+                    .iter()
+                    .map(|&i| i as u64)
+                    .collect::<Vec<u64>>(),
+            );
+            let batch = take_record_batch(&batch, &kept_indices_array).unwrap();
+            let filtered_distances: Vec<f64> = kept_indices_within_batch
+                .iter()
+                .map(|&i| unfiltered_distances[i])
+                .collect();
+            let filtered_indices = kept_indices_within_batch
+                .iter()
+                .map(|&i| unfiltered_indices[i])
+                .collect::<Vec<usize>>();
+
+            let res = knn_result_spiller.ingest(
+                batch,
+                filtered_indices,
+                filtered_distances,
+                unfiltered_indices,
+                unfiltered_distances,
+            )?;
+            if let Some(res_batch) = res {
+                merged_record_batches.push(res_batch);
+            }
+        }
+
+        Ok(merged_record_batches)
+    }
+
+    fn assert_merged_knn_result_is_correct(
+        batch: &RecordBatch,
+        partitioned_test_data: &[Vec<FuzzTestKNNResult>],
+        k: usize,
+        include_tie_breaker: bool,
+    ) {
+        let merged_test_data = merge_partitioned_test_data(&partitioned_test_data);
+        let expected_results = compute_expected_results(&merged_test_data, k, include_tie_breaker);
+        let mut expected_results: Vec<(u64, u64)> = expected_results
+            .iter()
+            .flat_map(|(query_id, objects)| {
+                objects
+                    .iter()
+                    .map(move |obj| (*query_id as u64, obj.object_id as u64))
+            })
+            .collect();
+        expected_results.sort();
+
+        let mut actual_results: Vec<(u64, u64)> = Vec::new();
+        let query_id_array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let object_id_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            actual_results.push((query_id_array.value(i), object_id_array.value(i)));
+        }
+        actual_results.sort();
+
+        assert_eq!(expected_results, actual_results);
+    }
+
+    fn fuzz_test_knn_results_merger(
+        rng: &mut StdRng,
+        num_rows: usize,
+        num_partitions: usize,
+        kept_prob: f64,
+        k: usize,
+        include_tie_breaker: bool,
+        query_group_size: usize,
+        target_batch_size: usize,
+    ) -> Result<()> {
+        assert!(num_partitions > 1);
+
+        for _ in 0..10 {
+            let test_data = create_fuzz_test_data(k, num_rows, kept_prob, rng);
+            let partitioned_test_data =
+                partition_fuzz_test_data(&test_data, num_partitions, kept_prob, rng);
+            assert!(is_fuzz_test_data_equivalent(
+                &test_data,
+                &partitioned_test_data,
+                k,
+                include_tie_breaker
+            ));
+
+            fuzz_test_knn_results_merger_using_partitioned_data(
+                &partitioned_test_data,
+                k,
+                include_tie_breaker,
+                query_group_size,
+                target_batch_size,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn fuzz_test_knn_results_merger_using_partitioned_data(
+        partitioned_test_data: &[Vec<FuzzTestKNNResult>],
+        k: usize,
+        include_tie_breaker: bool,
+        query_group_size: usize,
+        target_batch_size: usize,
+    ) -> Result<()> {
+        let test_data_schema = create_fuzz_test_data_schema();
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let spill_metrics = SpillMetrics::new(&metrics_set, 0);
+        let mut knn_results_merger = KNNResultsMerger::try_new(
+            k,
+            include_tie_breaker,
+            target_batch_size,
+            runtime_env,
+            SpillCompression::Uncompressed,
+            Arc::clone(&test_data_schema),
+            spill_metrics,
+        )?;
+
+        let batches = ingest_partitioned_fuzz_test_data(
+            &mut knn_results_merger,
+            &partitioned_test_data,
+            query_group_size,
+            target_batch_size,
+        )?;
+        let batch = concat_batches(&test_data_schema, batches.iter())
+            .map_err(|e| arrow_datafusion_err!(e))?;
+        assert_merged_knn_result_is_correct(&batch, &partitioned_test_data, k, include_tie_breaker);
+        Ok(())
+    }
+
+    #[rstest]
+    fn test_knn_results_merger(
+        #[values(1, 10, 13, 50, 51, 1000)] target_batch_size: usize,
+        #[values(false, true)] include_tie_breaker: bool,
+    ) {
+        let mut rng = StdRng::seed_from_u64(target_batch_size as u64);
+        fuzz_test_knn_results_merger(
+            &mut rng,
+            100,
+            4,
+            0.5,
+            5,
+            include_tie_breaker,
+            30,
+            target_batch_size,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_knn_results_merger_empty_query_side() {
+        let mut rng = StdRng::seed_from_u64(42);
+        fuzz_test_knn_results_merger(&mut rng, 0, 3, 1.0, 10, false, 100, 33).unwrap();
+    }
+
+    #[test]
+    fn test_knn_results_merger_all_filtered() {
+        let mut rng = StdRng::seed_from_u64(42);
+        fuzz_test_knn_results_merger(&mut rng, 100, 3, 0.0, 10, false, 50, 33).unwrap();
+    }
+
+    #[test]
+    fn test_knn_results_merger_no_knn_results() {
+        let empty_test_data = (0..100)
+            .map(|query_id| FuzzTestKNNResult {
+                query_id,
+                knn_objects: Vec::new(),
+            })
+            .collect::<Vec<FuzzTestKNNResult>>();
+        let partitioned_test_data = vec![empty_test_data.clone(); 3];
+        fuzz_test_knn_results_merger_using_partitioned_data(
+            &partitioned_test_data,
+            5,
+            false,
+            50,
+            33,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_knn_results_merger_k_is_zero() {
+        let empty_test_data = (0..100)
+            .map(|query_id| FuzzTestKNNResult {
+                query_id,
+                knn_objects: Vec::new(),
+            })
+            .collect::<Vec<FuzzTestKNNResult>>();
+        let partitioned_test_data = vec![empty_test_data.clone(); 3];
+        fuzz_test_knn_results_merger_using_partitioned_data(
+            &partitioned_test_data,
+            0,
+            false,
+            50,
+            33,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_knn_result_merger_with_empty_partitions() {
+        let k = 5;
+        let include_tie_breaker = false;
+        let num_rows = 100;
+        let num_partitions = 3;
+        let kept_prob = 0.5;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let test_data = create_fuzz_test_data(k, num_rows, kept_prob, &mut rng);
+        let partitioned_test_data =
+            partition_fuzz_test_data(&test_data, num_partitions, kept_prob, &mut rng);
+        for i in 0..(num_partitions + 1) {
+            let empty_test_data = (0..num_rows)
+                .map(|query_id| FuzzTestKNNResult {
+                    query_id,
+                    knn_objects: Vec::new(),
+                })
+                .collect::<Vec<FuzzTestKNNResult>>();
+
+            // Insert a partition with no knn results at position i
+            let mut test_data_with_empty_partition = partitioned_test_data.clone();
+            test_data_with_empty_partition.insert(i, empty_test_data);
+
+            assert!(is_fuzz_test_data_equivalent(
+                &test_data,
+                &test_data_with_empty_partition,
+                k,
+                include_tie_breaker
+            ));
+
+            let query_group_size = 30;
+            let target_batch_size = 33;
+            fuzz_test_knn_results_merger_using_partitioned_data(
+                &test_data_with_empty_partition,
+                k,
+                include_tie_breaker,
+                query_group_size,
+                target_batch_size,
+            )
+            .unwrap();
+        }
     }
 }
