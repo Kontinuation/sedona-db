@@ -284,8 +284,8 @@ impl SpatialJoinOptimizer {
                     left
                 };
 
-                let left = left.clone();
-                let right = nested_loop_join.right().clone();
+                let mut left = left.clone();
+                let mut right = nested_loop_join.right().clone();
                 let join_type = nested_loop_join.join_type();
 
                 // Check if the geospatial types involved in spatial_predicate are supported
@@ -302,16 +302,20 @@ impl SpatialJoinOptimizer {
                     .extensions
                     .get::<SedonaOptions>()
                     .is_some_and(|ext| ext.spatial_join.repartition_probe_side);
-
-                let right = if repartition_probe_side {
-                    let num_partitions = right.output_partitioning().partition_count();
-                    Arc::new(RepartitionExec::try_new(
-                        right,
+                if repartition_probe_side {
+                    let probe_plan = match &spatial_predicate {
+                        SpatialPredicate::KNearestNeighbors(knn) => match knn.probe_side {
+                            JoinSide::Left => &mut left,
+                            _ => &mut right,
+                        },
+                        _ => &mut right,
+                    };
+                    let num_partitions = probe_plan.output_partitioning().partition_count();
+                    *probe_plan = Arc::new(RepartitionExec::try_new(
+                        Arc::clone(probe_plan),
                         datafusion_physical_expr::Partitioning::RoundRobinBatch(num_partitions),
                     )?)
-                } else {
-                    right
-                };
+                }
 
                 // Create the spatial join
                 let spatial_join = SpatialJoinExec::try_new(

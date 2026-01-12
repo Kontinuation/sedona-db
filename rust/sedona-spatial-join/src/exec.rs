@@ -482,7 +482,6 @@ impl ExecutionPlan for SpatialJoinExec {
                         })?
                 };
 
-                // Column indices for regular joins - no swapping needed
                 let column_indices_after_projection = match &self.projection {
                     Some(projection) => projection
                         .iter()
@@ -569,29 +568,13 @@ impl SpatialJoinExec {
                 })?
         };
 
-        // Handle column indices for KNN - need to swap if we swapped execution plans
-        let mut column_indices_after_projection = match &self.projection {
+        let column_indices_after_projection = match &self.projection {
             Some(projection) => projection
                 .iter()
                 .map(|i| self.column_indices[*i].clone())
                 .collect(),
             None => self.column_indices.clone(),
         };
-
-        // If we swapped execution plans for KNN, we need to swap the column indices too
-        if !actual_probe_plan_is_left {
-            for col_idx in &mut column_indices_after_projection {
-                match col_idx.side {
-                    datafusion_common::JoinSide::Left => {
-                        col_idx.side = datafusion_common::JoinSide::Right
-                    }
-                    datafusion_common::JoinSide::Right => {
-                        col_idx.side = datafusion_common::JoinSide::Left
-                    }
-                    datafusion_common::JoinSide::None => {} // No change needed
-                }
-            }
-        }
 
         let probe_stream = probe_plan.execute(partition, Arc::clone(&context))?;
 
@@ -643,7 +626,6 @@ mod tests {
     use sedona_geometry::types::GeometryTypeId;
     use sedona_schema::datatypes::{SedonaType, WKB_GEOGRAPHY, WKB_GEOMETRY};
     use sedona_testing::datagen::RandomPartitionedDataBuilder;
-    use std::cmp::Ordering;
     use tokio::sync::OnceCell;
     use wkb::reader::read_wkb;
 
@@ -1534,11 +1516,7 @@ mod tests {
                 .collect();
 
             // Sort by distance, then by ID for stability
-            distances.sort_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
+            distances.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
             // KNN semantics: pick top-K unfiltered, then optionally post-filter.
             for i in 0..k.min(distances.len()) {
@@ -1574,43 +1552,12 @@ mod tests {
             ..Default::default()
         };
         let k = 3;
-        let sql = format!(
+
+        let sql1 = format!(
             "SELECT L.id, R.id, ST_Distance(L.geometry, R.geometry) FROM L JOIN R ON ST_KNN(L.geometry, R.geometry, {}, false) ORDER BY L.id, R.id",
             k
         );
-
-        let batches = run_spatial_join_query(
-            &left_schema,
-            &right_schema,
-            left_partitions.clone(),
-            right_partitions.clone(),
-            Some(options),
-            max_batch_size,
-            &sql,
-        )
-        .await?;
-
-        // Collect actual results
-        let mut actual_results = Vec::new();
-        let combined_batch = arrow::compute::concat_batches(&batches.schema(), &[batches])?;
-        let l_ids = combined_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::Int32Array>()
-            .unwrap();
-        let r_ids = combined_batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow_array::Int32Array>()
-            .unwrap();
-
-        for i in 0..combined_batch.num_rows() {
-            actual_results.push((l_ids.value(i), r_ids.value(i)));
-        }
-        actual_results.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-        // Compute ground truth
-        let expected_results = compute_knn_ground_truth_with_pair_filter(
+        let expected1 = compute_knn_ground_truth_with_pair_filter(
             &left_partitions,
             &right_partitions,
             k,
@@ -1619,8 +1566,55 @@ mod tests {
         .into_iter()
         .map(|(l, r, _)| (l, r))
         .collect::<Vec<_>>();
+        let sql2 = format!(
+            "SELECT R.id, L.id, ST_Distance(L.geometry, R.geometry) FROM L JOIN R ON ST_KNN(R.geometry, L.geometry, {}, false) ORDER BY R.id, L.id",
+            k
+        );
+        let expected2 = compute_knn_ground_truth_with_pair_filter(
+            &right_partitions,
+            &left_partitions,
+            k,
+            |_l_id, _r_id| true,
+        )
+        .into_iter()
+        .map(|(l, r, _)| (l, r))
+        .collect::<Vec<_>>();
 
-        assert_eq!(actual_results, expected_results);
+        let sqls = [(&sql1, &expected1), (&sql2, &expected2)];
+
+        for (sql, expected_results) in sqls {
+            let batches = run_spatial_join_query(
+                &left_schema,
+                &right_schema,
+                left_partitions.clone(),
+                right_partitions.clone(),
+                Some(options.clone()),
+                max_batch_size,
+                &sql,
+            )
+            .await?;
+
+            // Collect actual results
+            let mut actual_results = Vec::new();
+            let combined_batch = arrow::compute::concat_batches(&batches.schema(), &[batches])?;
+            let l_ids = combined_batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap();
+            let r_ids = combined_batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap();
+
+            for i in 0..combined_batch.num_rows() {
+                actual_results.push((l_ids.value(i), r_ids.value(i)));
+            }
+            actual_results.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+            assert_eq!(actual_results, *expected_results);
+        }
 
         Ok(())
     }
