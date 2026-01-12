@@ -759,7 +759,7 @@ mod tests {
         assert!(bitmap_builder.get_bit(offset + 1));
         assert!(bitmap_builder.get_bit(offset + 4));
         // Offset + 0 was true, stays true
-        assert!(bitmap_builder.get_bit(offset + 0));
+        assert!(bitmap_builder.get_bit(offset));
         // Offset + 3 was true, stays true
         assert!(bitmap_builder.get_bit(offset + 3));
         // Offset + 2 was false, stays false (unmatched)
@@ -802,7 +802,7 @@ mod tests {
         // Expected: 0, 1, 3, 4 (all visited)
         // 0 (pre-visited), 1 (matched now), 3 (pre-visited), 4 (matched now)
         assert_eq!(r.len(), 4);
-        let r_values: Vec<u32> = r.values().iter().map(|&x| x).collect();
+        let r_values: Vec<u32> = r.values().iter().copied().collect();
         assert!(r_values.contains(&0));
         assert!(r_values.contains(&1));
         assert!(r_values.contains(&3));

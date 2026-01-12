@@ -1026,12 +1026,7 @@ impl KNNResultBatchBuilder {
             row_dists.push((RowSelector::FromIngested { row_idx }, *dist));
         }
 
-        truncate_row_selectors_to_top_k(
-            row_dists,
-            &mut self.top_k_distances,
-            k,
-            include_tie_breaker,
-        );
+        truncate_row_selectors_to_top_k(row_dists, &self.top_k_distances, k, include_tie_breaker);
         for (row_selector, dist) in row_dists.iter() {
             self.rows_selector.push(*row_selector);
             self.dist_array_builder.append_value(*dist);
@@ -1848,8 +1843,8 @@ mod test {
         k: usize,
         include_tie_breaker: bool,
     ) -> bool {
-        let merged_partitioned_test_data = merge_partitioned_test_data(&partitioned_test_data);
-        let expected_results = compute_expected_results(&test_data, k, include_tie_breaker);
+        let merged_partitioned_test_data = merge_partitioned_test_data(partitioned_test_data);
+        let expected_results = compute_expected_results(test_data, k, include_tie_breaker);
         let partitioned_results =
             compute_expected_results(&merged_partitioned_test_data, k, include_tie_breaker);
         expected_results == partitioned_results
@@ -1967,7 +1962,7 @@ mod test {
         k: usize,
         include_tie_breaker: bool,
     ) {
-        let merged_test_data = merge_partitioned_test_data(&partitioned_test_data);
+        let merged_test_data = merge_partitioned_test_data(partitioned_test_data);
         let expected_results = compute_expected_results(&merged_test_data, k, include_tie_breaker);
         let mut expected_results: Vec<(u64, u64)> = expected_results
             .iter()
@@ -2056,13 +2051,13 @@ mod test {
 
         let batches = ingest_partitioned_fuzz_test_data(
             &mut knn_results_merger,
-            &partitioned_test_data,
+            partitioned_test_data,
             query_group_size,
             target_batch_size,
         )?;
         let batch = concat_batches(&test_data_schema, batches.iter())
             .map_err(|e| arrow_datafusion_err!(e))?;
-        assert_merged_knn_result_is_correct(&batch, &partitioned_test_data, k, include_tie_breaker);
+        assert_merged_knn_result_is_correct(&batch, partitioned_test_data, k, include_tie_breaker);
         Ok(())
     }
 

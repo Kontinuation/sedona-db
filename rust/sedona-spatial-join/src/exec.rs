@@ -1479,7 +1479,7 @@ mod tests {
                         arr.value(i)
                     };
 
-                    let geom_wkb = read_wkb(&mut &*geom_bytes).expect("Failed to parse WKB");
+                    let geom_wkb = read_wkb(geom_bytes).expect("Failed to parse WKB");
                     let geom = item_to_geometry(geom_wkb).expect("Failed to parse WKB");
                     result.push((id, geom));
                 }
@@ -1519,11 +1519,9 @@ mod tests {
             distances.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
             // KNN semantics: pick top-K unfiltered, then optionally post-filter.
-            for i in 0..k.min(distances.len()) {
-                let (r_id, dist) = distances[i];
-
-                if keep_pair(l_id, r_id) {
-                    results.push((l_id, r_id, dist));
+            for (r_id, dist) in distances.iter().take(k.min(distances.len())) {
+                if keep_pair(l_id, *r_id) {
+                    results.push((l_id, *r_id, *dist));
                 }
             }
         }
@@ -1590,7 +1588,7 @@ mod tests {
                 right_partitions.clone(),
                 Some(options.clone()),
                 max_batch_size,
-                &sql,
+                sql,
             )
             .await?;
 
@@ -1746,7 +1744,7 @@ mod tests {
         ) -> Result<Vec<RecordBatch>> {
             assert_eq!(ids.len(), wkts.len());
             let total = ids.len();
-            let chunk = (total + num_batches - 1) / num_batches;
+            let chunk = total.div_ceil(num_batches);
 
             let mut batches = Vec::new();
             for b in 0..num_batches {

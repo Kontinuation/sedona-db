@@ -1948,9 +1948,9 @@ mod tests {
             JoinType::RightMark,
         ] {
             let expected_probe_indices =
-                produce_probe_indices_once(&probe_indices, num_rows, join_type);
+                produce_probe_indices_once(probe_indices, num_rows, join_type);
             let produced_probe_indices = produce_probe_indices_incrementally(
-                &probe_indices,
+                probe_indices,
                 num_rows,
                 max_batch_size,
                 join_type,

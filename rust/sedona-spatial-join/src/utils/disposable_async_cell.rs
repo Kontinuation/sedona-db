@@ -176,7 +176,7 @@ mod tests {
         let cell = DisposableAsyncCell::new();
         cell.set("first").expect("initial set succeeds");
         assert_eq!(Err(CellSetError::AlreadySet), cell.set("second"));
-        assert_eq!(Some("first"), cell.get().await.as_deref());
+        assert_eq!(Some("first"), cell.get().await);
     }
 
     #[tokio::test]

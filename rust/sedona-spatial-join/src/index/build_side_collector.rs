@@ -478,7 +478,7 @@ mod tests {
         let schema = batches
             .first()
             .map(|batch| batch.schema())
-            .unwrap_or_else(|| test_schema());
+            .unwrap_or_else(test_schema);
         Box::pin(InMemoryEvaluatedBatchStream::new(schema, batches))
     }
 

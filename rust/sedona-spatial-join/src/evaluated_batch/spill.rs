@@ -357,7 +357,7 @@ mod tests {
             Some("Charlie"),
         ]));
         let batch = RecordBatch::try_new(schema, vec![id_array, name_array])
-            .map_err(|e| DataFusionError::from(e))?;
+            .map_err(DataFusionError::from)?;
 
         // Create geometry array with null in the middle
         let point1_wkb: Vec<u8> = vec![
@@ -718,7 +718,7 @@ mod tests {
         let id_array = Arc::new(Int32Array::from(Vec::<i32>::new()));
         let name_array = Arc::new(StringArray::from(Vec::<Option<&str>>::new()));
         let empty_batch = RecordBatch::try_new(schema, vec![id_array, name_array])
-            .map_err(|e| DataFusionError::from(e))?;
+            .map_err(DataFusionError::from)?;
 
         let geom_array: ArrayRef = Arc::new(BinaryArray::from(Vec::<Option<&[u8]>>::new()));
         let geom_array = EvaluatedGeometryArray::try_new(geom_array, &sedona_type)?;

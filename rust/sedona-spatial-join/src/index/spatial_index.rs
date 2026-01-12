@@ -1598,7 +1598,7 @@ mod tests {
         let mut build_positions_with_ties = Vec::new();
         let result_with_ties = index
             .query_knn(
-                &query_wkb,
+                query_wkb,
                 2,     // k=2
                 false, // use_spheroid
                 true,  // include_tie_breakers=true

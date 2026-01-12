@@ -307,7 +307,7 @@ mod tests {
 
         let mut builder = StringViewBuilder::with_capacity(n);
         for i in 0..n {
-            builder.append_value(&format!("batch0_{i}_{long}"));
+            builder.append_value(format!("batch0_{i}_{long}"));
         }
         let string_view_array: ArrayRef = Arc::new(builder.finish());
         let boolean_array: ArrayRef = Arc::new(BooleanArray::from(vec![true; n]));

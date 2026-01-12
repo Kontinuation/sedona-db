@@ -1199,8 +1199,8 @@ mod tests {
         use sedona_schema::datatypes::{Edges, SedonaType};
         let wkb_view_geometry = SedonaType::WkbView(Edges::Planar, Crs::None);
 
-        let wkbs1 = vec![point_wkb(10.0, 10.0), point_wkb(20.0, 20.0)];
-        let wkbs2 = vec![point_wkb(30.0, 30.0)];
+        let wkbs1 = [point_wkb(10.0, 10.0), point_wkb(20.0, 20.0)];
+        let wkbs2 = [point_wkb(30.0, 30.0)];
 
         // Create BinaryViewArray
         let array1 = BinaryViewArray::from_iter(wkbs1.iter().map(|w| Some(w.as_slice())));
