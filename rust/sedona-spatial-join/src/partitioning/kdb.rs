@@ -172,7 +172,7 @@ impl KDBTree {
                 return;
             }
 
-            // Try splitting over longer side. It it does not work, fallback splitting
+            // Try splitting over longer side. If it does not work, fallback splitting
             // over the shorter side.
             let split_x = self.extent.width() > self.extent.height();
             if !self.split(split_x) && !self.split(!split_x) {

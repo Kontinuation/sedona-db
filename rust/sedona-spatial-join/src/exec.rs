@@ -1515,12 +1515,16 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_knn_join_correctness(
+        #[values(true, false)] point_only: bool,
         #[values(1, 2, 3, 4)] num_partitions: usize,
         #[values(10, 30, 1000)] max_batch_size: usize,
     ) -> Result<()> {
         // Generate slightly larger data
-        let ((left_schema, left_partitions), (right_schema, right_partitions)) =
-            create_knn_test_data((0.1, 10.0), WKB_GEOMETRY)?;
+        let ((left_schema, left_partitions), (right_schema, right_partitions)) = if point_only {
+            create_knn_test_data((0.1, 10.0), WKB_GEOMETRY)?
+        } else {
+            create_default_test_data()?
+        };
 
         // Use single partition to verify algorithm correctness first, avoiding partitioning issues
         let options = SpatialJoinOptions {
@@ -1530,7 +1534,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let k = 3;
+        let k = 6;
 
         let sql1 = format!(
             "SELECT L.id, R.id, ST_Distance(L.geometry, R.geometry) FROM L JOIN R ON ST_KNN(L.geometry, R.geometry, {}, false) ORDER BY L.id, R.id",

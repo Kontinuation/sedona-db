@@ -46,10 +46,8 @@ impl SpatialPartitioner for RoundRobinPartitioner {
         self.num_partitions
     }
 
-    fn partition(&self, _bbox: &BoundingBox) -> Result<SpatialPartition> {
-        // For KNN join, the probe side needs to be compared with all partitions
-        // on the build side. Therefore, we assign it to the Multi partition.
-        Ok(SpatialPartition::Multi)
+    fn partition(&self, bbox: &BoundingBox) -> Result<SpatialPartition> {
+        self.partition_no_multi(bbox)
     }
 
     fn partition_no_multi(&self, _bbox: &BoundingBox) -> Result<SpatialPartition> {
@@ -72,13 +70,6 @@ mod tests {
 
         let bbox = BoundingBox::xy((0.0, 10.0), (0.0, 10.0));
 
-        // Test partition (probe side)
-        assert_eq!(
-            partitioner.partition(&bbox).unwrap(),
-            SpatialPartition::Multi
-        );
-
-        // Test partition_no_multi (build side)
         for i in 0..10 {
             assert_eq!(
                 partitioner.partition_no_multi(&bbox).unwrap(),

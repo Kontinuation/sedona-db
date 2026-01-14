@@ -296,8 +296,8 @@ impl BuildSideBatchesCollector {
             "each build stream must have a metrics collector"
         );
 
-        // Spawn all tasks to scan all build streams concurrently
         if concurrent {
+            // Spawn all tasks to scan all build streams concurrently
             let mut join_set = JoinSet::new();
             for (partition_id, ((stream, metrics), reservation)) in streams
                 .into_iter()
@@ -315,7 +315,11 @@ impl BuildSideBatchesCollector {
                     seed.wrapping_add(partition_id as u64),
                 )?;
                 join_set.spawn(async move {
-                    let evaluated_stream = create_evaluated_build_stream(stream, evaluator);
+                    let evaluated_stream = create_evaluated_build_stream(
+                        stream,
+                        evaluator,
+                        metrics.time_taken.clone(),
+                    );
                     let result = collector
                         .collect(evaluated_stream, reservation, bbox_sampler, &metrics)
                         .await;
@@ -338,6 +342,7 @@ impl BuildSideBatchesCollector {
 
             Ok(partitions.into_iter().map(|v| v.unwrap()).collect())
         } else {
+            // Collect partitions sequentially (for JNI/embedded contexts)
             let mut results = Vec::with_capacity(streams.len());
             for (partition_id, ((stream, metrics), reservation)) in streams
                 .into_iter()
@@ -354,7 +359,8 @@ impl BuildSideBatchesCollector {
                     seed.wrapping_add(partition_id as u64),
                 )?;
 
-                let evaluated_stream = create_evaluated_build_stream(stream, evaluator);
+                let evaluated_stream =
+                    create_evaluated_build_stream(stream, evaluator, metrics.time_taken.clone());
                 let result = self
                     .collect(evaluated_stream, reservation, bbox_sampler, &metrics)
                     .await?;
