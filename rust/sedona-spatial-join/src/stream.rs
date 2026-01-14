@@ -151,9 +151,13 @@ impl SpatialJoinStream {
             .unwrap_or_default();
 
         let evaluator = create_operand_evaluator(on, sedona_options.spatial_join.clone());
-        let probe_stream = create_evaluated_probe_stream(probe_stream, Arc::clone(&evaluator));
-        let probe_stream_schema = probe_stream.schema();
         let join_metrics = SpatialJoinProbeMetrics::new(probe_partition_id, metrics);
+        let probe_stream = create_evaluated_probe_stream(
+            probe_stream,
+            Arc::clone(&evaluator),
+            join_metrics.join_time.clone(),
+        );
+        let probe_stream_schema = probe_stream.schema();
 
         Self {
             probe_partition_id,
