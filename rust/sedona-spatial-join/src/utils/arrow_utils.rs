@@ -162,7 +162,7 @@ pub(crate) fn get_record_batch_memory_size(batch: &RecordBatch) -> Result<usize>
 
     for array in batch.columns() {
         let array_data = array.to_data();
-        total_size += count_array_data_memory_size(&array_data)?;
+        total_size += get_array_data_memory_size(&array_data)?;
     }
 
     Ok(total_size)
@@ -172,7 +172,7 @@ pub(crate) fn get_record_batch_memory_size(batch: &RecordBatch) -> Result<usize>
 /// size as if the underlying buffers were copied to somewhere else and not shared.
 pub(crate) fn get_array_memory_size(array: &ArrayRef) -> Result<usize> {
     let array_data = array.to_data();
-    let size = count_array_data_memory_size(&array_data)?;
+    let size = get_array_data_memory_size(&array_data)?;
     Ok(size)
 }
 
@@ -185,7 +185,7 @@ pub(crate) fn get_array_memory_size(array: &ArrayRef) -> Result<usize> {
 pub const MAX_INLINE_VIEW_LEN: u32 = 12;
 
 /// Count the memory usage of `array_data` and its children recursively.
-fn count_array_data_memory_size(array_data: &ArrayData) -> core::result::Result<usize, ArrowError> {
+fn get_array_data_memory_size(array_data: &ArrayData) -> core::result::Result<usize, ArrowError> {
     Ok(get_binary_view_value_size(array_data)? + array_data.get_slice_memory_size()?)
 }
 
