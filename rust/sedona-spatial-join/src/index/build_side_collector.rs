@@ -64,7 +64,7 @@ pub(crate) struct BuildPartition {
     /// Memory reservation for tracking the maximum memory usage when collecting
     /// the build side. This reservation won't be freed even when spilling is
     /// triggered. We deliberately only grow the memory reservation to probe
-    /// the amount of memory avaible for loading spatial index into memory.
+    /// the amount of memory available for loading spatial index into memory.
     /// The size of this reservation will be used to determine the maximum size of
     /// each spatial partition, as well as how many spatial partitions to create.
     pub reservation: MemoryReservation,
@@ -190,7 +190,7 @@ impl BuildSideBatchesCollector {
 
             match &mut spill_writer_opt {
                 None => {
-                    // Collected batches are in memory, no spilling happened for this patition before. We'll try
+                    // Collected batches are in memory, no spilling happened for this partition before. We'll try
                     // storing this batch in memory first, and switch to writing everything to disk if we fail
                     // to grow the reservation.
                     in_mem_batches.push(build_side_batch);
@@ -297,77 +297,96 @@ impl BuildSideBatchesCollector {
         );
 
         if concurrent {
-            // Spawn all tasks to scan all build streams concurrently
-            let mut join_set = JoinSet::new();
-            for (partition_id, ((stream, metrics), reservation)) in streams
-                .into_iter()
-                .zip(metrics_vec)
-                .zip(reservations)
-                .enumerate()
-            {
-                let collector = self.clone();
-                let evaluator = Arc::clone(&self.evaluator);
-                let bbox_sampler = BoundingBoxSampler::try_new(
-                    self.spatial_join_options.min_index_side_bbox_samples,
-                    self.spatial_join_options.max_index_side_bbox_samples,
-                    self.spatial_join_options
-                        .target_index_side_bbox_sampling_rate,
-                    seed.wrapping_add(partition_id as u64),
-                )?;
-                join_set.spawn(async move {
-                    let evaluated_stream = create_evaluated_build_stream(
-                        stream,
-                        evaluator,
-                        metrics.time_taken.clone(),
-                    );
-                    let result = collector
-                        .collect(evaluated_stream, reservation, bbox_sampler, &metrics)
-                        .await;
-                    (partition_id, result)
-                });
-            }
-
-            // Wait for all async tasks to finish. Results may be returned in arbitrary order,
-            // so we need to reorder them by partition_id later.
-            let results = join_set.join_all().await;
-
-            // Reorder results according to partition ids
-            let mut partitions: Vec<Option<BuildPartition>> = Vec::with_capacity(results.len());
-            partitions.resize_with(results.len(), || None);
-            for result in results {
-                let (partition_id, partition_result) = result;
-                let partition = partition_result?;
-                partitions[partition_id] = Some(partition);
-            }
-
-            Ok(partitions.into_iter().map(|v| v.unwrap()).collect())
+            self.collect_all_concurrently(streams, reservations, metrics_vec, seed)
+                .await
         } else {
-            // Collect partitions sequentially (for JNI/embedded contexts)
-            let mut results = Vec::with_capacity(streams.len());
-            for (partition_id, ((stream, metrics), reservation)) in streams
-                .into_iter()
-                .zip(metrics_vec)
-                .zip(reservations)
-                .enumerate()
-            {
-                let evaluator = Arc::clone(&self.evaluator);
-                let bbox_sampler = BoundingBoxSampler::try_new(
-                    self.spatial_join_options.min_index_side_bbox_samples,
-                    self.spatial_join_options.max_index_side_bbox_samples,
-                    self.spatial_join_options
-                        .target_index_side_bbox_sampling_rate,
-                    seed.wrapping_add(partition_id as u64),
-                )?;
+            self.collect_all_sequentially(streams, reservations, metrics_vec, seed)
+                .await
+        }
+    }
 
+    async fn collect_all_concurrently(
+        &self,
+        streams: Vec<SendableRecordBatchStream>,
+        reservations: Vec<MemoryReservation>,
+        metrics_vec: Vec<CollectBuildSideMetrics>,
+        seed: u64,
+    ) -> Result<Vec<BuildPartition>> {
+        // Spawn task for each stream to scan all streams concurrently
+        let mut join_set = JoinSet::new();
+        for (partition_id, ((stream, metrics), reservation)) in streams
+            .into_iter()
+            .zip(metrics_vec)
+            .zip(reservations)
+            .enumerate()
+        {
+            let collector = self.clone();
+            let evaluator = Arc::clone(&self.evaluator);
+            let bbox_sampler = BoundingBoxSampler::try_new(
+                self.spatial_join_options.min_index_side_bbox_samples,
+                self.spatial_join_options.max_index_side_bbox_samples,
+                self.spatial_join_options
+                    .target_index_side_bbox_sampling_rate,
+                seed.wrapping_add(partition_id as u64),
+            )?;
+            join_set.spawn(async move {
                 let evaluated_stream =
                     create_evaluated_build_stream(stream, evaluator, metrics.time_taken.clone());
-                let result = self
+                let result = collector
                     .collect(evaluated_stream, reservation, bbox_sampler, &metrics)
-                    .await?;
-                results.push(result);
-            }
-            Ok(results)
+                    .await;
+                (partition_id, result)
+            });
         }
+
+        // Wait for all async tasks to finish. Results may be returned in arbitrary order,
+        // so we need to reorder them by partition_id later.
+        let results = join_set.join_all().await;
+
+        // Reorder results according to partition ids
+        let mut partitions: Vec<Option<BuildPartition>> = Vec::with_capacity(results.len());
+        partitions.resize_with(results.len(), || None);
+        for result in results {
+            let (partition_id, partition_result) = result;
+            let partition = partition_result?;
+            partitions[partition_id] = Some(partition);
+        }
+
+        Ok(partitions.into_iter().map(|v| v.unwrap()).collect())
+    }
+
+    async fn collect_all_sequentially(
+        &self,
+        streams: Vec<SendableRecordBatchStream>,
+        reservations: Vec<MemoryReservation>,
+        metrics_vec: Vec<CollectBuildSideMetrics>,
+        seed: u64,
+    ) -> Result<Vec<BuildPartition>> {
+        // Collect partitions sequentially (for JNI/embedded contexts)
+        let mut results = Vec::with_capacity(streams.len());
+        for (partition_id, ((stream, metrics), reservation)) in streams
+            .into_iter()
+            .zip(metrics_vec)
+            .zip(reservations)
+            .enumerate()
+        {
+            let evaluator = Arc::clone(&self.evaluator);
+            let bbox_sampler = BoundingBoxSampler::try_new(
+                self.spatial_join_options.min_index_side_bbox_samples,
+                self.spatial_join_options.max_index_side_bbox_samples,
+                self.spatial_join_options
+                    .target_index_side_bbox_sampling_rate,
+                seed.wrapping_add(partition_id as u64),
+            )?;
+
+            let evaluated_stream =
+                create_evaluated_build_stream(stream, evaluator, metrics.time_taken.clone());
+            let result = self
+                .collect(evaluated_stream, reservation, bbox_sampler, &metrics)
+                .await?;
+            results.push(result);
+        }
+        Ok(results)
     }
 
     fn spill_in_mem_batches(

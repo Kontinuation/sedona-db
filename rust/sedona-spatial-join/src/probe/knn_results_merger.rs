@@ -37,7 +37,6 @@ use datafusion_physical_plan::metrics::SpillMetrics;
 use sedona_common::sedona_internal_err;
 
 use crate::index::spatial_index::DISTANCE_TOLERANCE;
-use crate::utils::arrow_utils::compact_batch;
 use crate::utils::spill::{RecordBatchSpillReader, RecordBatchSpillWriter};
 
 /// [UnprocessedKNNResultBatch] represents the KNN results produced by probing the spatial index.
@@ -62,7 +61,7 @@ use crate::utils::spill::{RecordBatchSpillReader, RecordBatchSpillWriter};
 ///
 /// ```text
 /// D0  D1  D2  D3  D4
-/// R0      R2  R3  
+/// R0      R2  R3
 /// ```
 ///
 /// Where Di is the distance of the i-th nearest neighbor, and Ri is the result row index.
@@ -845,8 +844,7 @@ impl KNNResultsMerger {
                     .batch_builder
                     .build_spilled_batch(ingested_array, &spilled_batches)?
                 {
-                    let spilled_batch = compact_batch(spilled_batch)?;
-                    writer.write_batch(&spilled_batch)?;
+                    writer.write_batch(spilled_batch)?;
                 }
                 None
             }
@@ -1246,7 +1244,7 @@ fn truncate_row_selectors_to_top_k(
     };
 
     let distance_threshold = if include_tie_breaker {
-        // The distance threshold is slighly looser when including tie breakers, please
+        // The distance threshold is slightly looser when including tie breakers, please
         // refer to `SpatialIndex::query_knn` for more details.
         *kth_distance + DISTANCE_TOLERANCE
     } else {
@@ -1755,8 +1753,8 @@ mod test {
 
             let k = result.knn_objects.len();
             if k == 0 {
-                for part_idx in 0..num_partitions {
-                    partitions[part_idx].push(FuzzTestKNNResult {
+                for partition in partitions.iter_mut() {
+                    partition.push(FuzzTestKNNResult {
                         query_id: result.query_id,
                         knn_objects: Vec::new(),
                     });
@@ -1993,6 +1991,7 @@ mod test {
         assert_eq!(expected_results, actual_results);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fuzz_test_knn_results_merger(
         rng: &mut StdRng,
         num_rows: usize,

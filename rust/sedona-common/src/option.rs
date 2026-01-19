@@ -94,7 +94,11 @@ config_namespace! {
         /// spill files. Specify 0 for unlimited size.
         pub spilled_batch_in_memory_size_threshold: usize, default = 0
 
-        /// The chunk size for parallel refinement in spatial join.
+        /// The minimum number of geometry pairs per chunk required to enable parallel
+        /// refinement during the spatial join operation. When the refinement phase has
+        /// fewer geometry pairs than this threshold, it will run sequentially instead
+        /// of spawning parallel tasks. Higher values reduce parallelization overhead
+        /// for small datasets, while lower values enable more fine-grained parallelism.
         pub parallel_refinement_chunk_size: usize, default = 8192
 
         /// Options for debugging or testing spatial join

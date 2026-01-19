@@ -1835,8 +1835,10 @@ mod tests {
         // We need candidates.len() >= chunk_size * 2
         // Let's set chunk_size = 2, so we need >= 4 candidates.
         let build_geoms = vec![Some("POINT (0 0)"); 10];
-        let mut options = SpatialJoinOptions::default();
-        options.parallel_refinement_chunk_size = 2;
+        let options = SpatialJoinOptions {
+            parallel_refinement_chunk_size: 2,
+            ..Default::default()
+        };
 
         let index = setup_index_for_batch_test(&build_geoms, options).await;
 
@@ -1943,8 +1945,10 @@ mod tests {
             Some("POINT (0 0)"),
             Some("POINT (0 0)"),
         ];
-        let mut options = SpatialJoinOptions::default();
-        options.parallel_refinement_chunk_size = 0; // will force synchronous refinement
+        let options = SpatialJoinOptions {
+            parallel_refinement_chunk_size: 0,
+            ..Default::default()
+        };
 
         let index = setup_index_for_batch_test(build_geoms, options).await;
         let probe_geoms = &[Some("POINT (0 0)")];

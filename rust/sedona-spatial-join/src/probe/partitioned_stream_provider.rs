@@ -116,16 +116,19 @@ impl PartitionedProbeStreamProvider {
                         .as_ref()
                         .expect("Partitioned first pass requires a partitioner"),
                 );
-                let repartitioner = StreamRepartitioner::new(
+                let repartitioner = StreamRepartitioner::builder(
                     Arc::clone(&self.runtime_env),
                     Arc::clone(&partitioner),
                     PartitionedSide::ProbeSide,
-                    self.options.spill_compression,
                     self.metrics.spill_metrics.clone(),
-                    self.options.buffer_bytes_threshold,
-                    self.options.target_batch_rows,
+                )
+                .spill_compression(self.options.spill_compression)
+                .buffer_bytes_threshold(self.options.buffer_bytes_threshold)
+                .target_batch_size(self.options.target_batch_rows)
+                .spilled_batch_in_memory_size_threshold(
                     self.options.spilled_batch_in_memory_size_threshold,
-                );
+                )
+                .build();
 
                 let state = Arc::clone(&self.state);
                 let callback = move |res: Result<SpilledPartitions>| {

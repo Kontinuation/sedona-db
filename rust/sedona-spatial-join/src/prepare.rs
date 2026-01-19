@@ -42,9 +42,7 @@ use crate::{
         flat::FlatPartitioner,
         kdb::KDBPartitioner,
         round_robin::RoundRobinPartitioner,
-        stream_repartitioner::{
-            repartition_evaluated_batches, SpilledPartition, SpilledPartitions,
-        },
+        stream_repartitioner::{SpilledPartition, SpilledPartitions, StreamRepartitioner},
         PartitionedSide, SpatialPartition, SpatialPartitioner,
     },
     probe::partitioned_stream_provider::ProbeStreamOptions,
@@ -269,17 +267,18 @@ pub(crate) async fn prepare_spatial_join_components(
             let runtime_env = Arc::clone(&runtime_env);
             let partitioner = Arc::clone(&build_partitioner);
             join_set.spawn(async move {
-                let partitioned_spill_files = repartition_evaluated_batches(
+                let partitioned_spill_files = StreamRepartitioner::builder(
                     runtime_env,
-                    stream,
                     partitioner,
                     PartitionedSide::BuildSide,
-                    spill_compression,
                     spill_metrics,
-                    buffer_bytes_threshold,
-                    target_batch_size,
-                    spilled_batch_in_memory_size_threshold,
                 )
+                .spill_compression(spill_compression)
+                .buffer_bytes_threshold(buffer_bytes_threshold)
+                .target_batch_size(target_batch_size)
+                .spilled_batch_in_memory_size_threshold(spilled_batch_in_memory_size_threshold)
+                .build()
+                .repartition_stream(stream)
                 .await;
                 partitioned_spill_files
             });

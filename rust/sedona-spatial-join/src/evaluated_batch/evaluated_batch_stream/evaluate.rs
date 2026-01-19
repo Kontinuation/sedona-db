@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, SchemaRef};
 use datafusion_common::Result;
 use datafusion_physical_plan::{metrics, SendableRecordBatchStream};
 use futures::{Stream, StreamExt};
@@ -30,7 +29,7 @@ use crate::evaluated_batch::{
     EvaluatedBatch,
 };
 use crate::operand_evaluator::{EvaluatedGeometryArray, OperandEvaluator};
-use crate::utils::arrow_utils::compact_batch;
+use crate::utils::arrow_utils::{compact_batch, schema_contains_view_types};
 
 /// An evaluator that can evaluate geometry expressions on record batches
 /// and produces evaluated geometry arrays.
@@ -84,14 +83,6 @@ impl<E: Evaluator> EvaluateOperandBatchStream<E> {
             gc_view_arrays,
         }
     }
-}
-
-/// Checks if the schema contains any view types (Utf8View or BinaryView).
-fn schema_contains_view_types(schema: &SchemaRef) -> bool {
-    schema
-        .flattened_fields()
-        .iter()
-        .any(|field| matches!(field.data_type(), DataType::Utf8View | DataType::BinaryView))
 }
 
 impl<E: Evaluator> EvaluatedBatchStream for EvaluateOperandBatchStream<E> {

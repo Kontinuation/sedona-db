@@ -574,26 +574,25 @@ impl SpatialJoinStream {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<StatefulStreamResult<Option<RecordBatch>>>> {
+        let _timer = self.join_metrics.join_time.timer();
+
         // Extract the necessary data first to avoid borrowing conflicts
-        let (partition_desc, mut iterator, batch_opt) = {
-            let _timer = self.join_metrics.join_time.timer();
-            match &mut self.state {
-                SpatialJoinStreamState::ProcessProbeBatch(desc, future) => {
-                    match future.poll_unpin(cx) {
-                        Poll::Ready((iterator, result)) => {
-                            let batch_opt = match result {
-                                Ok(opt) => opt,
-                                Err(e) => {
-                                    return Poll::Ready(Err(e));
-                                }
-                            };
-                            (*desc, iterator, batch_opt)
-                        }
-                        Poll::Pending => return Poll::Pending,
+        let (partition_desc, mut iterator, batch_opt) = match &mut self.state {
+            SpatialJoinStreamState::ProcessProbeBatch(desc, future) => {
+                match future.poll_unpin(cx) {
+                    Poll::Ready((iterator, result)) => {
+                        let batch_opt = match result {
+                            Ok(opt) => opt,
+                            Err(e) => {
+                                return Poll::Ready(Err(e));
+                            }
+                        };
+                        (*desc, iterator, batch_opt)
                     }
+                    Poll::Pending => return Poll::Pending,
                 }
-                _ => unreachable!(),
             }
+            _ => unreachable!(),
         };
 
         match batch_opt {
@@ -951,7 +950,7 @@ impl ProbeProgress {
         // when running probe-semi, probe-anti or probe-mark joins. This is because
         // semi/anti/mark joins only care about whether a probe row has matches,
         // and we don't want to produce duplicate unmatched probe rows when the same
-        // probe row P has multiple matches and we splitted probe_indices range into
+        // probe row P has multiple matches and we split probe_indices range into
         // multiple pieces containing P.
         let should_skip_lastly_produced_probe_rows = matches!(
             (build_side, join_type),
