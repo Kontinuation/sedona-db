@@ -34,20 +34,70 @@ result_large_err = "allow"
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
+arrow-cast = { workspace = true }
+async-trait = { workspace = true }
+datafusion = { workspace = true, default_features = false }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
+futures = { workspace = true }
 sedona-common = { workspace = true }
 sedona-expr = { workspace = true }
 sedona-geometry = { workspace = true }
 sedona-raster = { workspace = true }
 sedona-schema = { workspace = true }
+sedona-tg = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 sedona-testing = { workspace = true, features = ["criterion"] }
 rstest = { workspace = true }
+tokio = { workspace = true }
 
 [[bench]]
 harness = false
-name = "native-raster-functions"
+name = "rs_bandpath"
+
+[[bench]]
+harness = false
+name = "rs_convexhull"
+
+[[bench]]
+harness = false
+name = "rs_envelope"
+
+[[bench]]
+harness = false
+name = "rs_georeference"
+
+[[bench]]
+harness = false
+name = "rs_geotransform"
+
+[[bench]]
+harness = false
+name = "rs_metadata"
+
+[[bench]]
+harness = false
+name = "rs_numbands"
+
+[[bench]]
+harness = false
+name = "rs_rastercoordinate"
+
+[[bench]]
+harness = false
+name = "rs_size"
+
+[[bench]]
+harness = false
+name = "rs_spatial_predicates"
+
+[[bench]]
+harness = false
+name = "rs_srid"
+
+[[bench]]
+harness = false
+name = "rs_worldcoordinate"

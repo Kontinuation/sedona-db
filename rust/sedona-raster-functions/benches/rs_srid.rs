@@ -15,19 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod executor;
-pub mod register;
-pub mod rs_bandpath;
-pub mod rs_convexhull;
-pub mod rs_envelope;
-pub mod rs_example;
-pub mod rs_georeference;
-pub mod rs_geotransform;
-pub mod rs_metadata;
-pub mod rs_numbands;
-pub mod rs_rastercoordinate;
-pub mod rs_size;
-pub mod rs_spatial_predicates;
-pub mod rs_srid;
-pub mod rs_tile_explode;
-pub mod rs_worldcoordinate;
+use criterion::{criterion_group, criterion_main, Criterion};
+use sedona_testing::benchmark_util::{benchmark, BenchmarkArgSpec::*};
+
+fn criterion_benchmark(c: &mut Criterion) {
+    let f = sedona_raster_functions::register::default_function_set();
+
+    // RS_SRID(raster)
+    benchmark::scalar(c, &f, "rs_srid", "rs_srid", Raster(64, 64));
+
+    // RS_CRS(raster)
+    benchmark::scalar(c, &f, "rs_srid", "rs_crs", Raster(64, 64));
+}
+
+criterion_group!(benches, criterion_benchmark);
+criterion_main!(benches);

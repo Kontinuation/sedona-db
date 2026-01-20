@@ -126,6 +126,10 @@ impl SedonaContext {
             "sd_random_geometry",
             Arc::new(RandomGeometryFunction::default()),
         );
+        out.ctx.register_udtf(
+            "rs_tile_explode",
+            sedona_raster_functions::rs_tile_explode::rs_tile_explode_udtf(),
+        );
 
         // Always register default function set
         out.register_function_set(sedona_functions::register::default_function_set());

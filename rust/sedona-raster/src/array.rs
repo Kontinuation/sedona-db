@@ -57,8 +57,6 @@ impl MetadataRef for RasterMetadata {
     }
 }
 
-//
-
 /// Implementation of MetadataRef for Arrow StructArray
 struct MetadataRefImpl<'a> {
     width_array: &'a UInt64Array,
@@ -204,9 +202,7 @@ struct BandsRefImpl<'a> {
 
 impl<'a> BandsRef for BandsRefImpl<'a> {
     fn len(&self) -> usize {
-        let start = self.bands_list.value_offsets()[self.raster_index] as usize;
-        let end = self.bands_list.value_offsets()[self.raster_index + 1] as usize;
-        end - start
+        self.bands_list.value_length(self.raster_index) as usize
     }
 
     /// Get a specific band by number (1-based index)

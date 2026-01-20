@@ -5334,10 +5334,14 @@ version = "0.3.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
+ "arrow-cast",
  "arrow-schema",
+ "async-trait",
  "criterion",
+ "datafusion",
  "datafusion-common",
  "datafusion-expr",
+ "futures",
  "rstest",
  "sedona-common",
  "sedona-expr",
@@ -5345,7 +5349,9 @@ dependencies = [
  "sedona-raster",
  "sedona-schema",
  "sedona-testing",
+ "sedona-tg",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
