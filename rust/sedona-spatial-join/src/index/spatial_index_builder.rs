@@ -22,12 +22,11 @@ use sedona_common::SpatialJoinOptions;
 use sedona_expr::statistics::GeoStatistics;
 
 use datafusion_common::{utils::proxy::VecAllocExt, Result};
-use datafusion_execution::memory_pool::MemoryPool;
 use datafusion_expr::JoinType;
 use futures::StreamExt;
-use geo_index::rtree::{sort::HilbertSort, RTree, RTreeBuilder};
+use geo_index::rtree::{sort::HilbertSort, RTree, RTreeBuilder, RTreeIndex};
 use parking_lot::Mutex;
-use std::sync::{atomic::AtomicUsize, Arc};
+use std::sync::atomic::AtomicUsize;
 
 use crate::{
     evaluated_batch::{evaluated_batch_stream::SendableEvaluatedBatchStream, EvaluatedBatch},
@@ -67,9 +66,6 @@ pub struct SpatialIndexBuilder {
     /// Statistics for indexed geometries
     stats: GeoStatistics,
 
-    /// Memory pool for managing the memory usage of the spatial index
-    memory_pool: Arc<dyn MemoryPool>,
-
     /// Memory used by the spatial index
     memory_used: usize,
 }
@@ -100,7 +96,6 @@ impl SpatialIndexBuilder {
         options: SpatialJoinOptions,
         join_type: JoinType,
         probe_threads_count: usize,
-        memory_pool: Arc<dyn MemoryPool>,
         metrics: SpatialJoinBuildMetrics,
     ) -> Result<Self> {
         Ok(Self {
@@ -112,7 +107,6 @@ impl SpatialIndexBuilder {
             metrics,
             indexed_batches: Vec::new(),
             stats: GeoStatistics::empty(),
-            memory_pool,
             memory_used: 0,
         })
     }
@@ -161,8 +155,7 @@ impl SpatialIndexBuilder {
     pub fn add_batch(&mut self, indexed_batch: EvaluatedBatch) -> Result<()> {
         let in_mem_size = indexed_batch.in_mem_size()?;
         self.indexed_batches.push(indexed_batch);
-        self.memory_used += in_mem_size;
-        self.metrics.build_mem_used.set_max(self.memory_used);
+        self.record_memory_usage(in_mem_size);
         Ok(())
     }
 
@@ -183,9 +176,6 @@ impl SpatialIndexBuilder {
 
         let mut rtree_builder = RTreeBuilder::<f32>::new(num_rects as u32);
         let mut batch_pos_vec = vec![(-1, -1); num_rects];
-        let rtree_mem_estimate = num_rects * RTREE_MEMORY_ESTIMATE_PER_RECT;
-        self.memory_used += batch_pos_vec.allocated_size() + rtree_mem_estimate;
-        self.metrics.build_mem_used.set_max(self.memory_used);
 
         for (batch_idx, batch) in self.indexed_batches.iter().enumerate() {
             let rects = batch.rects();
@@ -202,6 +192,9 @@ impl SpatialIndexBuilder {
 
         let rtree = rtree_builder.finish::<HilbertSort>();
         build_timer.done();
+
+        let mem_usage = rtree.metadata().data_buffer_length() + batch_pos_vec.allocated_size();
+        self.record_memory_usage(mem_usage);
 
         Ok((rtree, batch_pos_vec))
     }
@@ -225,8 +218,7 @@ impl SpatialIndexBuilder {
             bitmaps.push(bitmap);
         }
 
-        self.memory_used += total_buffer_size;
-        self.metrics.build_mem_used.set_max(self.memory_used);
+        self.record_memory_usage(total_buffer_size);
 
         Ok(Some(Mutex::new(bitmaps)))
     }
@@ -242,8 +234,7 @@ impl SpatialIndexBuilder {
         }
 
         let mut geom_idx_vec = Vec::with_capacity(batch_pos_vec.len());
-        self.memory_used += geom_idx_vec.allocated_size();
-        self.metrics.build_mem_used.set_max(self.memory_used);
+        self.record_memory_usage(geom_idx_vec.allocated_size());
 
         for (batch_idx, row_idx) in batch_pos_vec {
             // Convert (batch_idx, row_idx) to a linear, sequential index
@@ -263,7 +254,6 @@ impl SpatialIndexBuilder {
                 self.schema,
                 self.options,
                 AtomicUsize::new(self.probe_threads_count),
-                self.memory_pool.clone(),
             ));
         }
 
@@ -285,7 +275,7 @@ impl SpatialIndexBuilder {
             num_geoms,
             self.stats.clone(),
         );
-        self.memory_used += refiner.estimate_max_memory_usage(&self.stats);
+        self.record_memory_usage(refiner.estimate_max_memory_usage(&self.stats));
 
         let cache_size = batch_pos_vec.len();
         let knn_components_opt = {
@@ -293,18 +283,13 @@ impl SpatialIndexBuilder {
                 self.spatial_predicate,
                 SpatialPredicate::KNearestNeighbors(_)
             ) {
-                let knn_components = KnnComponents::new(
-                    cache_size,
-                    &self.indexed_batches,
-                    self.memory_pool.clone(),
-                )?;
-                self.memory_used += knn_components.estimated_memory_usage();
+                let knn_components = KnnComponents::new(cache_size, &self.indexed_batches)?;
+                self.record_memory_usage(knn_components.estimated_memory_usage());
                 Some(knn_components)
             } else {
                 None
             }
         };
-        self.metrics.build_mem_used.set_max(self.memory_used);
 
         log::info!(
             "Estimated memory used by spatial index: {}",
@@ -336,5 +321,10 @@ impl SpatialIndexBuilder {
         }
         self.merge_stats(geo_statistics);
         Ok(())
+    }
+
+    fn record_memory_usage(&mut self, bytes: usize) {
+        self.memory_used += bytes;
+        self.metrics.build_mem_used.set_max(self.memory_used);
     }
 }

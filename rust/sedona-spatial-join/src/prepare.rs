@@ -99,7 +99,6 @@ pub(crate) async fn prepare_spatial_join_components(
             sedona_options.spatial_join,
             join_type,
             probe_threads_count,
-            Arc::clone(memory_pool),
             SpatialJoinBuildMetrics::new(0, &metrics),
         );
         let probe_stream_options = ProbeStreamOptions {
@@ -179,7 +178,6 @@ pub(crate) async fn prepare_spatial_join_components(
             join_type,
             probe_threads_count,
             build_partitions,
-            Arc::clone(memory_pool),
             SpatialJoinBuildMetrics::new(0, &metrics),
         );
         let probe_stream_options = ProbeStreamOptions {
@@ -334,7 +332,6 @@ pub(crate) async fn prepare_spatial_join_components(
             join_type,
             probe_threads_count,
             merged_spilled_partitions,
-            Arc::clone(memory_pool),
             SpatialJoinBuildMetrics::new(0, &metrics),
             reservations,
         );

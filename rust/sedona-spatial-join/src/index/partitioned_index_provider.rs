@@ -18,7 +18,7 @@
 use arrow_schema::SchemaRef;
 use datafusion_common::{DataFusionError, Result, SharedResult};
 use datafusion_common_runtime::JoinSet;
-use datafusion_execution::memory_pool::{MemoryPool, MemoryReservation};
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::JoinType;
 use futures::StreamExt;
 use parking_lot::Mutex;
@@ -43,7 +43,6 @@ pub(crate) struct PartitionedIndexProvider {
     options: SpatialJoinOptions,
     join_type: JoinType,
     probe_threads_count: usize,
-    memory_pool: Arc<dyn MemoryPool>,
     metrics: SpatialJoinBuildMetrics,
 
     /// Data on the build side to build index for
@@ -71,7 +70,6 @@ impl PartitionedIndexProvider {
         join_type: JoinType,
         probe_threads_count: usize,
         partitioned_spill_files: SpilledPartitions,
-        memory_pool: Arc<dyn MemoryPool>,
         metrics: SpatialJoinBuildMetrics,
         reservations: Vec<MemoryReservation>,
     ) -> Self {
@@ -85,7 +83,6 @@ impl PartitionedIndexProvider {
             options,
             join_type,
             probe_threads_count,
-            memory_pool,
             metrics,
             data: BuildSideData::MultiPartition(Mutex::new(partitioned_spill_files)),
             index_cells,
@@ -101,7 +98,6 @@ impl PartitionedIndexProvider {
         join_type: JoinType,
         probe_threads_count: usize,
         mut build_partitions: Vec<BuildPartition>,
-        memory_pool: Arc<dyn MemoryPool>,
         metrics: SpatialJoinBuildMetrics,
     ) -> Self {
         let reservations = build_partitions
@@ -115,7 +111,6 @@ impl PartitionedIndexProvider {
             options,
             join_type,
             probe_threads_count,
-            memory_pool,
             metrics,
             data: BuildSideData::SinglePartition(Mutex::new(Some(build_partitions))),
             index_cells,
@@ -129,7 +124,6 @@ impl PartitionedIndexProvider {
         options: SpatialJoinOptions,
         join_type: JoinType,
         probe_threads_count: usize,
-        memory_pool: Arc<dyn MemoryPool>,
         metrics: SpatialJoinBuildMetrics,
     ) -> Self {
         let build_partitions = Vec::new();
@@ -140,7 +134,6 @@ impl PartitionedIndexProvider {
             join_type,
             probe_threads_count,
             build_partitions,
-            memory_pool,
             metrics,
         )
     }
@@ -282,7 +275,6 @@ impl PartitionedIndexProvider {
             self.options.clone(),
             self.join_type,
             self.probe_threads_count,
-            Arc::clone(&self.memory_pool),
             self.metrics.clone(),
         )?;
 
@@ -306,7 +298,6 @@ impl PartitionedIndexProvider {
             self.options.clone(),
             self.join_type,
             self.probe_threads_count,
-            Arc::clone(&self.memory_pool),
             self.metrics.clone(),
         )?;
 
@@ -386,7 +377,7 @@ mod tests {
     use datafusion::config::SpillCompression;
     use datafusion_common::{DataFusionError, Result};
     use datafusion_execution::{
-        memory_pool::{GreedyMemoryPool, MemoryConsumer},
+        memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryPool},
         runtime_env::RuntimeEnv,
     };
     use datafusion_expr::JoinType;
@@ -547,7 +538,6 @@ mod tests {
             JoinType::Inner,
             1,
             vec![build_partition],
-            Arc::clone(&memory_pool),
             SpatialJoinBuildMetrics::new(0, &metrics),
         );
 
@@ -583,7 +573,6 @@ mod tests {
             JoinType::Inner,
             1,
             spilled_partitions,
-            Arc::clone(&memory_pool),
             SpatialJoinBuildMetrics::new(0, &metrics),
             vec![new_reservation(Arc::clone(&memory_pool))],
         ));

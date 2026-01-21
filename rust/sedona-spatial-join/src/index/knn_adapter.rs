@@ -17,9 +17,7 @@
 
 use once_cell::sync::OnceCell;
 use sedona_expr::statistics::GeoStatistics;
-use std::sync::Arc;
 
-use datafusion_execution::memory_pool::MemoryPool;
 use geo_index::rtree::distance::{EuclideanDistance, GeometryAccessor, HaversineDistance};
 use geo_types::Geometry;
 use sedona_geo::to_geo::item_to_geometry;
@@ -41,7 +39,6 @@ impl KnnComponents {
     pub fn new(
         cache_size: usize,
         indexed_batches: &[EvaluatedBatch],
-        _memory_pool: Arc<dyn MemoryPool>,
     ) -> datafusion_common::Result<Self> {
         // Pre-allocate OnceCell vector
         let geometry_cache = (0..cache_size).map(|_| OnceCell::new()).collect();
