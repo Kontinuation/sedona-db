@@ -5403,6 +5403,7 @@ dependencies = [
  "geo-traits",
  "geo-types",
  "geos",
+ "log",
  "once_cell",
  "parking_lot",
  "pin-project-lite",
