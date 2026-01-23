@@ -1171,9 +1171,9 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chrono"
-version = "0.4.42"
+version = "0.4.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "145052bdd345b87320e369255277e3fb5152762ad123a901ef5c262dd38fe8d2"
+checksum = "fac4744fb15ae8337dc853fee7fb3f4e48c0fbaa23d0afe49c447b4fab126118"
 dependencies = [
  "iana-time-zone",
  "num-traits",
@@ -2491,6 +2491,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
+name = "evalexpr"
+version = "13.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25929004897f2bbab309121a60400d36992f6d911d09baa6c172f6cc55706601"
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2684,6 +2690,27 @@ dependencies = [
  "pin-project-lite",
  "pin-utils",
  "slab",
+]
+
+[[package]]
+name = "gdal"
+version = "0.19.0"
+dependencies = [
+ "bitflags",
+ "chrono",
+ "gdal-sys",
+ "geo-types",
+ "semver",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "gdal-sys"
+version = "0.12.0"
+dependencies = [
+ "bindgen",
+ "pkg-config",
+ "semver",
 ]
 
 [[package]]
@@ -5352,6 +5379,26 @@ dependencies = [
  "sedona-tg",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "sedona-raster-gdal"
+version = "0.3.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "criterion",
+ "datafusion-common",
+ "datafusion-expr",
+ "evalexpr",
+ "gdal",
+ "gdal-sys",
+ "sedona-common",
+ "sedona-expr",
+ "sedona-raster",
+ "sedona-schema",
+ "sedona-testing",
 ]
 
 [[package]]
