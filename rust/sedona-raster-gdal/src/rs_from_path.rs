@@ -177,8 +177,10 @@ impl RsFromPath {
                 .map_err(|e| DataFusionError::Execution(format!("Failed to start band: {}", e)))?;
 
             // For out-db rasters, we don't store the actual band data
-            // Just append empty/null data placeholder
-            builder.band_data_writer().append_null();
+            // but the schema requires the `data` field to be non-null.
+            // Use an empty (0-length) value as a placeholder; readers must consult
+            // `storage_type` + `outdb_*` metadata to load the actual pixels.
+            builder.band_data_writer().append_value(&[]);
 
             builder
                 .finish_band()
@@ -350,7 +352,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "RasterBuilder doesn't correctly handle null data for out-db rasters"]
     fn test_load_outdb_raster_from_file() {
         use sedona_testing::data::test_raster;
 
@@ -364,7 +365,9 @@ mod tests {
         assert_eq!(raster.len(), 1);
 
         // Verify metadata directly from the struct array
-        use arrow_array::{ListArray, StringViewArray, StructArray, UInt32Array, UInt64Array};
+        use arrow_array::{
+            ListArray, StringArray, StringViewArray, StructArray, UInt32Array, UInt64Array,
+        };
         use sedona_schema::raster::{
             band_indices, band_metadata_indices, metadata_indices, raster_indices,
         };
@@ -419,7 +422,7 @@ mod tests {
         let outdb_url = band_metadata_struct
             .column(band_metadata_indices::OUTDB_URL)
             .as_any()
-            .downcast_ref::<StringViewArray>()
+            .downcast_ref::<StringArray>()
             .unwrap();
         assert!(
             !outdb_url.is_null(0),
@@ -440,7 +443,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "RasterBuilder doesn't correctly handle null data for out-db rasters"]
     fn test_invoke_rs_from_path() {
         use arrow_array::{StringArray, UInt64Array};
         use sedona_expr::scalar_udf::SedonaScalarKernel;
