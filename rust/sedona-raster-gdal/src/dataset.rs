@@ -23,18 +23,15 @@
 //! - For out-db rasters: Creates a GDALDataset as a VRT (Virtual Raster) that references
 //!   the external data sources.
 
-use std::ffi::{c_void, CString};
+use std::ffi::c_void;
 use std::marker::PhantomData;
-use std::ptr::null_mut;
 
+use gdal::cpl::CslStringList;
 use gdal::errors::{GdalError, Result};
 use gdal::raster::GdalDataType;
 use gdal::vrt::VrtDataset;
-use gdal::{Dataset, DatasetOptions, GdalOpenFlags};
-use gdal_sys::{
-    CPLErr, GDALAddBand, GDALClose, GDALCreate, GDALDatasetH, GDALDriverH, GDALGetDriverByName,
-    GDALGetRasterBand, GDALSetGeoTransform, GDALSetProjection, GDALSetRasterNoDataValue,
-};
+use gdal::{Dataset, DatasetOptions, DriverManager, GdalOpenFlags};
+use gdal_sys::{CPLErr, GDALAddBand};
 
 use sedona_raster::traits::RasterRef;
 use sedona_schema::raster::{BandDataType, StorageType};
@@ -162,55 +159,51 @@ pub fn nodata_f64_to_bytes(nodata: f64, band_type: &BandDataType) -> Vec<u8> {
 /// The `'a` lifetime parameter ensures that this dataset cannot outlive the RasterRef
 /// it was created from.
 pub struct RasterMemDataset<'a> {
-    c_dataset: GDALDatasetH,
+    dataset: Dataset,
     _phantom: PhantomData<&'a ()>,
 }
 
-impl<'a> Drop for RasterMemDataset<'a> {
-    fn drop(&mut self) {
-        unsafe {
-            GDALClose(self.c_dataset);
+impl<'a> RasterMemDataset<'a> {
+    /// Returns a reference to the underlying GDAL `Dataset`.
+    pub fn as_dataset(&self) -> &Dataset {
+        &self.dataset
+    }
+}
+
+impl<'a> std::ops::Deref for RasterMemDataset<'a> {
+    type Target = Dataset;
+
+    fn deref(&self) -> &Self::Target {
+        &self.dataset
+    }
+}
+
+/// A GDAL dataset created from a `RasterRef`.
+///
+/// This wrapper guarantees the backing resources stay alive:
+/// - For in-db rasters, the dataset is tied to the input raster lifetime.
+/// - For out-db rasters, the dataset keeps source datasets open.
+pub enum RasterDataset<'a> {
+    Mem(RasterMemDataset<'a>),
+    Vrt(RasterVrtDataset),
+}
+
+impl<'a> RasterDataset<'a> {
+    pub fn as_dataset(&self) -> &Dataset {
+        &*self
+    }
+}
+
+impl<'a> std::ops::Deref for RasterDataset<'a> {
+    type Target = Dataset;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            RasterDataset::Mem(ds) => ds.as_dataset(),
+            RasterDataset::Vrt(ds) => ds.as_dataset(),
         }
     }
 }
-
-impl<'a> RasterMemDataset<'a> {
-    /// Returns the raw GDAL dataset handle.
-    ///
-    /// # Safety
-    /// The returned handle is only valid for the lifetime of this struct.
-    /// Do not close or transfer ownership of the handle.
-    pub unsafe fn c_dataset(&self) -> GDALDatasetH {
-        self.c_dataset
-    }
-
-    /// Creates a GDAL Dataset (read-only) from this wrapper.
-    ///
-    /// # Safety
-    /// The returned Dataset borrows from this wrapper and must not outlive it.
-    /// The caller must ensure the Dataset is dropped before this wrapper.
-    pub unsafe fn as_dataset(&self) -> Dataset {
-        Dataset::from_c_dataset(self.c_dataset)
-    }
-
-    /// Consumes this wrapper and returns a GDAL Dataset, transferring ownership.
-    ///
-    /// This is the preferred method when you need to return or store the Dataset
-    /// separately from this wrapper. The wrapper is consumed without calling its
-    /// destructor, so the Dataset becomes solely responsible for closing the handle.
-    ///
-    /// # Safety
-    /// The returned Dataset internally references the original RasterRef's memory.
-    /// The caller must ensure the RasterRef outlives the returned Dataset.
-    pub unsafe fn into_dataset(self) -> Dataset {
-        let dataset = Dataset::from_c_dataset(self.c_dataset);
-        std::mem::forget(self);
-        dataset
-    }
-}
-
-/// Creates a GDAL MEM dataset from an in-db raster with zero-copy band data access.
-///
 /// This function creates a GDAL dataset backed by the MEM driver that directly
 /// references the band data stored in the Arrow array. No data copying occurs -
 /// the GDAL bands point to the same memory as the Arrow array.
@@ -257,43 +250,15 @@ pub fn raster_to_mem_dataset<'a>(raster: &'a dyn RasterRef) -> Result<RasterMemD
     let width = metadata.width() as usize;
     let height = metadata.height() as usize;
 
-    // Get MEM driver
-    let driver: GDALDriverH = unsafe {
-        let driver_name = CString::new("MEM").unwrap();
-        GDALGetDriverByName(driver_name.as_ptr())
-    };
-
-    if driver.is_null() {
-        return Err(GdalError::NullPointer {
-            method_name: "GDALGetDriverByName",
-            msg: "Could not load MEM GDAL driver".to_string(),
-        });
-    }
+    // Get MEM driver (safe API)
+    let mem_driver = DriverManager::get_driver_by_name("MEM")?;
 
     // Create empty dataset (0 bands initially, we'll add them with DATAPOINTER)
-    let c_dataset: GDALDatasetH = unsafe {
-        let empty_name = CString::new("").unwrap();
-        GDALCreate(
-            driver,
-            empty_name.as_ptr(),
-            width as i32,
-            height as i32,
-            0, // 0 bands initially
-            gdal_sys::GDALDataType::GDT_Byte,
-            null_mut(),
-        )
-    };
+    let mut dataset = mem_driver.create_with_band_type::<u8, _>("in-memory", width, height, 0)?;
 
-    if c_dataset.is_null() {
-        return Err(GdalError::NullPointer {
-            method_name: "GDALCreate",
-            msg: "Could not create GDALDataset".to_string(),
-        });
-    }
-
-    // Set geotransform
+    // Set geotransform (safe API)
     // GDAL geotransform: [origin_x, pixel_width, rotation_x, origin_y, rotation_y, pixel_height]
-    let mut geotransform = [
+    let geotransform = [
         metadata.upper_left_x(),
         metadata.scale_x(),
         metadata.skew_x(),
@@ -302,43 +267,18 @@ pub fn raster_to_mem_dataset<'a>(raster: &'a dyn RasterRef) -> Result<RasterMemD
         metadata.scale_y(),
     ];
 
-    let rv = unsafe { GDALSetGeoTransform(c_dataset, geotransform.as_mut_ptr()) };
-    if rv != CPLErr::CE_None {
-        unsafe {
-            GDALClose(c_dataset);
-        }
-        return Err(GdalError::CplError {
-            class: rv,
-            number: 0,
-            msg: "Could not set geotransform".to_string(),
-        });
-    }
+    dataset.set_geo_transform(&geotransform)?;
 
     // Set projection/CRS if available
     if let Some(crs) = raster.crs() {
-        let crs_cstring = CString::new(crs)
-            .map_err(|_| GdalError::BadArgument("CRS string contains null byte".to_string()))?;
-        let rv = unsafe { GDALSetProjection(c_dataset, crs_cstring.as_ptr()) };
-        if rv != CPLErr::CE_None {
-            unsafe {
-                GDALClose(c_dataset);
-            }
-            return Err(GdalError::CplError {
-                class: rv,
-                number: 0,
-                msg: "Could not set projection".to_string(),
-            });
-        }
+        dataset.set_projection(crs)?;
     }
 
     // Add bands with DATAPOINTER option (zero-copy)
     for i in 1..=bands.len() {
-        let band = bands.band(i).map_err(|e| {
-            unsafe {
-                GDALClose(c_dataset);
-            }
-            GdalError::BadArgument(format!("Failed to access band {}: {}", i, e))
-        })?;
+        let band = bands
+            .band(i)
+            .map_err(|e| GdalError::BadArgument(format!("Failed to access band {}: {}", i, e)))?;
 
         let band_metadata = band.metadata();
         let band_type = band_metadata.data_type();
@@ -350,17 +290,23 @@ pub fn raster_to_mem_dataset<'a>(raster: &'a dyn RasterRef) -> Result<RasterMemD
 
         // Format the data pointer as a hex string for GDAL
         let datapointer_option = format!("DATAPOINTER={:p}", data_ptr);
-        let datapointer_cstring = CString::new(datapointer_option).unwrap();
 
-        // Create options array for GDALAddBand
-        let mut options_ptrs = vec![datapointer_cstring.as_ptr() as *mut i8, null_mut()];
-
-        let rv = unsafe { GDALAddBand(c_dataset, gdal_type as u32, options_ptrs.as_mut_ptr()) };
+        // SAFETY: We use GDAL MEM's `DATAPOINTER=...` band creation option to achieve zero-copy
+        // reads from the Arrow-backed raster band buffer.
+        //
+        // Why this is sound in this function:
+        // - The pointer comes from `band.data().as_ptr()` and points to a contiguous buffer of at
+        //   least `width * height * sizeof(pixel)` bytes for this band.
+        // - `raster_to_mem_dataset` returns `RasterMemDataset<'a>`, tying the dataset lifetime to
+        //   the input `&'a dyn RasterRef`, so the underlying Arrow buffers cannot be dropped while
+        //   this GDAL dataset exists.
+        // - We only use this MEM dataset for read-oriented operations (sampling, polygonize,
+        //   rasterize-as-input, etc.). Callers must not use it for in-place writes because the
+        //   Arrow buffer may be shared/immutable.
+        let c_options = CslStringList::from_iter([datapointer_option.as_str()]);
+        let rv = unsafe { GDALAddBand(dataset.c_dataset(), gdal_type as u32, c_options.as_ptr()) };
 
         if rv != CPLErr::CE_None {
-            unsafe {
-                GDALClose(c_dataset);
-            }
             return Err(GdalError::CplError {
                 class: rv,
                 number: 0,
@@ -370,17 +316,12 @@ pub fn raster_to_mem_dataset<'a>(raster: &'a dyn RasterRef) -> Result<RasterMemD
 
         // Set nodata value if present
         if let Some(nodata) = nodata_bytes_to_f64(band_metadata.nodata_value(), &band_type) {
-            let raster_band = unsafe { GDALGetRasterBand(c_dataset, i as i32) };
-            if !raster_band.is_null() {
-                unsafe {
-                    GDALSetRasterNoDataValue(raster_band, nodata);
-                }
-            }
+            dataset.rasterband(i)?.set_no_data_value(Some(nodata))?;
         }
     }
 
     Ok(RasterMemDataset {
-        c_dataset,
+        dataset,
         _phantom: PhantomData,
     })
 }
@@ -394,51 +335,23 @@ pub fn raster_to_mem_dataset<'a>(raster: &'a dyn RasterRef) -> Result<RasterMemD
 /// It also keeps references to source datasets open to ensure they remain valid
 /// for the lifetime of the VRT.
 pub struct RasterVrtDataset {
-    vrt: VrtDataset,
+    dataset: Dataset,
     /// Source datasets that must remain open while the VRT is in use
     _source_datasets: Vec<Dataset>,
 }
 
 impl RasterVrtDataset {
-    /// Returns the underlying VrtDataset.
-    pub fn vrt(&self) -> &VrtDataset {
-        &self.vrt
-    }
-
-    /// Returns the raw GDAL dataset handle.
-    ///
-    /// # Safety
-    /// The returned handle is only valid for the lifetime of this struct.
-    /// Do not close or transfer ownership of the handle.
-    pub unsafe fn c_dataset(&self) -> GDALDatasetH {
-        self.vrt.c_dataset()
-    }
-
     /// Returns a reference to the underlying GDAL `Dataset`.
     pub fn as_dataset(&self) -> &Dataset {
-        self.vrt.as_ref()
+        &self.dataset
     }
+}
 
-    /// Consumes this wrapper and returns a GDAL Dataset, transferring ownership.
-    ///
-    /// This is the preferred method when you need to return or store the Dataset
-    /// separately from this wrapper. The wrapper is consumed without calling its
-    /// destructor, so the Dataset becomes solely responsible for closing the handle.
-    ///
-    /// Note: This method leaks the source datasets that were kept alive by this wrapper.
-    /// This is acceptable for short-lived operations but may cause resource leaks in
-    /// long-running processes.
-    pub unsafe fn into_dataset(self) -> Dataset {
-        let RasterVrtDataset {
-            vrt,
-            _source_datasets,
-        } = self;
+impl std::ops::Deref for RasterVrtDataset {
+    type Target = Dataset;
 
-        // `VrtDataset::as_dataset` transfers ownership of the underlying GDAL handle.
-        // Keep the source datasets alive by intentionally leaking them.
-        let dataset = vrt.as_dataset();
-        std::mem::forget(_source_datasets);
-        dataset
+    fn deref(&self) -> &Self::Target {
+        &self.dataset
     }
 }
 
@@ -571,7 +484,7 @@ pub fn raster_to_vrt_dataset(raster: &dyn RasterRef) -> Result<RasterVrtDataset>
     }
 
     Ok(RasterVrtDataset {
-        vrt,
+        dataset: vrt.as_dataset(),
         _source_datasets: source_datasets,
     })
 }
@@ -593,7 +506,7 @@ pub fn raster_to_vrt_dataset(raster: &dyn RasterRef) -> Result<RasterVrtDataset>
 /// # Note
 /// For in-db rasters, the returned Dataset internally references the original
 /// RasterRef's memory. Ensure the RasterRef outlives the Dataset.
-pub fn raster_to_dataset(raster: &dyn RasterRef) -> Result<Dataset> {
+pub fn raster_to_dataset<'a>(raster: &'a dyn RasterRef) -> Result<RasterDataset<'a>> {
     let bands = raster.bands();
 
     // Check if any band uses out-db storage
@@ -606,13 +519,10 @@ pub fn raster_to_dataset(raster: &dyn RasterRef) -> Result<Dataset> {
 
     if has_outdb {
         let vrt_dataset = raster_to_vrt_dataset(raster)?;
-        // Safety: We're transferring ownership to the caller
-        Ok(unsafe { vrt_dataset.into_dataset() })
+        Ok(RasterDataset::Vrt(vrt_dataset))
     } else {
         let mem_dataset = raster_to_mem_dataset(raster)?;
-        // Safety: We're transferring ownership to the caller, who must ensure
-        // the RasterRef outlives this Dataset
-        Ok(unsafe { mem_dataset.into_dataset() })
+        Ok(RasterDataset::Mem(mem_dataset))
     }
 }
 

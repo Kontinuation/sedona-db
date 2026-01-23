@@ -21,7 +21,7 @@
 //!
 //! NOTE: This benchmark is currently disabled because RS_FromPath has a known issue
 //! with RasterBuilder not correctly handling null data for out-db rasters.
-//! See: test_invoke_rs_from_path test marked with #[ignore] in rs_from_path.rs
+//! The out-db path support is still evolving; this file currently contains a placeholder benchmark.
 //!
 //! Once the out-db raster support is fixed, this benchmark should cover:
 //! - Loading rasters with and without extent calculation

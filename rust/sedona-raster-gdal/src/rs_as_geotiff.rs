@@ -165,7 +165,7 @@ impl RsAsGeoTiff {
         })?;
 
         // Get the underlying dataset
-        let source_dataset = unsafe { mem_dataset.as_dataset() };
+        let source_dataset = mem_dataset.as_dataset();
 
         // Get GeoTiff driver
         let driver = DriverManager::get_driver_by_name("GTiff").map_err(|e| {
@@ -513,7 +513,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires investigation - segfault in GDAL memory dataset"]
     fn test_roundtrip_geotiff() {
         use crate::rs_from_gdal_raster::RsFromGDALRaster;
         use sedona_raster::array::RasterStructArray;
@@ -560,7 +559,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Requires investigation - segfault in GDAL memory dataset"]
     fn test_geotiff_with_compression() {
         use crate::rs_from_gdal_raster::RsFromGDALRaster;
         use sedona_raster::array::RasterStructArray;
