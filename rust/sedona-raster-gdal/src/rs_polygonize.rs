@@ -29,6 +29,7 @@ use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{
     scalar_doc_sections::DOC_SECTION_OTHER, ColumnarValue, Documentation, Volatility,
 };
+use gdal::raster::PolygonizeOptions;
 use gdal::vector::LayerAccess;
 use gdal::vector::{OGRFieldType, OGRwkbGeometryType};
 use gdal::DriverManager;
@@ -204,7 +205,8 @@ fn polygonize_raster(raster: &RasterRefImpl<'_>, band_num: usize) -> Result<Vec<
         .map_err(|e| DataFusionError::Execution(format!("Failed to add field to layer: {}", e)))?;
 
     // Call GDAL Polygonize via georust/gdal safe wrapper.
-    gdal::raster::polygonize(&raster_band, None, &layer, 0, None)
+    let polygonize_options = PolygonizeOptions::new();
+    gdal::raster::polygonize(&raster_band, None, &layer, 0, &polygonize_options)
         .map_err(|e| DataFusionError::Execution(format!("GDAL polygonize failed: {e}")))?;
 
     // Extract polygons from layer
