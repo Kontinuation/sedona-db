@@ -32,6 +32,7 @@
 
 pub mod dataset;
 pub mod rs_as_geotiff;
+pub mod rs_as_raster;
 pub mod rs_clip;
 pub mod rs_from_gdal_raster;
 pub mod rs_from_path;
@@ -49,6 +50,7 @@ pub use dataset::{
 
 // Re-export UDF constructors
 pub use rs_as_geotiff::{rs_as_geotiff_udf, CompressionType};
+pub use rs_as_raster::rs_as_raster_udf;
 pub use rs_clip::rs_clip_udf;
 pub use rs_from_gdal_raster::rs_from_gdal_raster_udf;
 pub use rs_from_path::rs_from_path_udf;
@@ -63,6 +65,7 @@ pub fn all_gdal_udfs() -> Vec<datafusion_expr::ScalarUDF> {
         rs_from_path_udf().into(),
         rs_from_gdal_raster_udf().into(),
         rs_as_geotiff_udf().into(),
+        rs_as_raster_udf().into(),
         rs_value_udf().into(),
         rs_polygonize_udf().into(),
         rs_clip_udf().into(),
