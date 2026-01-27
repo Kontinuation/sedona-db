@@ -31,6 +31,7 @@
 //! - `RS_AsGeoTiff`: Export raster as GeoTiff binary
 
 pub mod dataset;
+mod gdal_polygonize;
 pub mod rs_as_geotiff;
 pub mod rs_clip;
 pub mod rs_from_gdal_raster;
