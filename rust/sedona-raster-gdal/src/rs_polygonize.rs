@@ -40,7 +40,6 @@ use sedona_schema::datatypes::SedonaType;
 use sedona_schema::matchers::ArgMatcher;
 
 use crate::dataset::raster_to_dataset;
-use crate::gdal_polygonize;
 
 /// RS_Polygonize() scalar UDF implementation
 ///
@@ -204,8 +203,9 @@ fn polygonize_raster(raster: &RasterRefImpl<'_>, band_num: usize) -> Result<Vec<
         .add_to_layer(&layer)
         .map_err(|e| DataFusionError::Execution(format!("Failed to add field to layer: {}", e)))?;
 
-    // Call GDAL Polygonize (via a small wrapper that contains the only unsafe boundary).
-    gdal_polygonize::polygonize(&raster_band, &layer, 0)?;
+    // Call GDAL Polygonize via georust/gdal safe wrapper.
+    gdal::raster::polygonize(&raster_band, None, &layer, 0, None)
+        .map_err(|e| DataFusionError::Execution(format!("GDAL polygonize failed: {e}")))?;
 
     // Extract polygons from layer
     let mut polygon_values = Vec::new();
