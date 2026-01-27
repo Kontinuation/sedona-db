@@ -18,9 +18,7 @@
 //! RS_Polygonize UDF - Convert raster band to vector polygons
 //!
 //! Returns a list of polygons for all connected regions of pixels with the same
-//! value in the specified band. This is a wrapper around GDAL's GDALPolygonize function.
-
-use std::ptr::null_mut;
+//! value in the specified band.
 use std::sync::Arc;
 
 use arrow_array::builder::{BinaryBuilder, Float64Builder, ListBuilder, StructBuilder};
@@ -32,12 +30,8 @@ use datafusion_expr::{
     scalar_doc_sections::DOC_SECTION_OTHER, ColumnarValue, Documentation, Volatility,
 };
 use gdal::vector::LayerAccess;
+use gdal::vector::{OGRFieldType, OGRwkbGeometryType};
 use gdal::DriverManager;
-use gdal_sys::{
-    CPLErr, GDALPolygonize, OGRFeatureH, OGRFieldType, OGR_F_Destroy, OGR_F_GetFieldAsDouble,
-    OGR_F_GetGeometryRef, OGR_G_ExportToIsoWkb, OGR_G_WkbSize, OGR_L_GetNextFeature,
-    OGR_L_ResetReading,
-};
 
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_raster::array::{RasterRefImpl, RasterStructArray};
@@ -46,6 +40,7 @@ use sedona_schema::datatypes::SedonaType;
 use sedona_schema::matchers::ArgMatcher;
 
 use crate::dataset::raster_to_dataset;
+use crate::gdal_polygonize;
 
 /// RS_Polygonize() scalar UDF implementation
 ///
@@ -183,8 +178,8 @@ fn polygonize_raster(raster: &RasterRefImpl<'_>, band_num: usize) -> Result<Vec<
     })?;
 
     // Create memory datasource for output polygons
-    let mem_driver = DriverManager::get_driver_by_name("Memory")
-        .map_err(|e| DataFusionError::Execution(format!("Failed to get Memory driver: {}", e)))?;
+    let mem_driver = DriverManager::get_driver_by_name("MEM")
+        .map_err(|e| DataFusionError::Execution(format!("Failed to get MEM driver: {}", e)))?;
 
     let mut mem_ds = mem_driver.create_vector_only("").map_err(|e| {
         DataFusionError::Execution(format!("Failed to create memory dataset: {}", e))
@@ -196,7 +191,7 @@ fn polygonize_raster(raster: &RasterRefImpl<'_>, band_num: usize) -> Result<Vec<
         .create_layer(gdal::vector::LayerOptions {
             name: "polygons",
             srs: spatial_ref.as_ref(),
-            ty: gdal_sys::OGRwkbGeometryType::wkbPolygon,
+            ty: OGRwkbGeometryType::wkbPolygon,
             options: None,
         })
         .map_err(|e| DataFusionError::Execution(format!("Failed to create layer: {}", e)))?;
@@ -209,64 +204,39 @@ fn polygonize_raster(raster: &RasterRefImpl<'_>, band_num: usize) -> Result<Vec<
         .add_to_layer(&layer)
         .map_err(|e| DataFusionError::Execution(format!("Failed to add field to layer: {}", e)))?;
 
-    // Call GDAL Polygonize
-    unsafe {
-        let c_band = raster_band.c_rasterband();
-        let c_layer = layer.c_layer();
-
-        let result = GDALPolygonize(
-            c_band,
-            null_mut(), // No mask band
-            c_layer,
-            0,          // Field index for pixel value
-            null_mut(), // No options
-            None,       // No progress callback
-            null_mut(), // No progress arg
-        );
-
-        if result != CPLErr::CE_None {
-            return Err(DataFusionError::Execution(
-                "GDALPolygonize failed".to_string(),
-            ));
-        }
-    }
+    // Call GDAL Polygonize (via a small wrapper that contains the only unsafe boundary).
+    gdal_polygonize::polygonize(&raster_band, &layer, 0)?;
 
     // Extract polygons from layer
     let mut polygon_values = Vec::new();
 
-    unsafe {
-        let c_layer = layer.c_layer();
-        OGR_L_ResetReading(c_layer);
+    let mut value_field_idx: Option<usize> = None;
+    let mut layer_for_read = layer;
+    for feature in layer_for_read.features() {
+        let geom = feature.geometry().ok_or_else(|| {
+            DataFusionError::Execution("Polygonize output feature missing geometry".to_string())
+        })?;
+        let wkb = geom.iso_wkb().map_err(|e| {
+            DataFusionError::Execution(format!("Failed to export geometry to WKB: {e}"))
+        })?;
 
-        loop {
-            let feature: OGRFeatureH = OGR_L_GetNextFeature(c_layer);
-            if feature.is_null() {
-                break;
+        let idx = match value_field_idx {
+            Some(idx) => idx,
+            None => {
+                let idx = feature.field_index("value").map_err(|e| {
+                    DataFusionError::Execution(format!("Missing 'value' field: {e}"))
+                })?;
+                value_field_idx = Some(idx);
+                idx
             }
+        };
 
-            // Get geometry
-            let geom_ref = OGR_F_GetGeometryRef(feature);
-            if !geom_ref.is_null() {
-                // Get WKB size
-                let wkb_size = OGR_G_WkbSize(geom_ref) as usize;
-                let mut wkb_buffer = vec![0u8; wkb_size];
+        let value = feature
+            .field_as_double(idx)
+            .map_err(|e| DataFusionError::Execution(format!("Failed to read 'value' field: {e}")))?
+            .unwrap_or(0.0);
 
-                // Export to WKB
-                let err = OGR_G_ExportToIsoWkb(
-                    geom_ref,
-                    gdal_sys::OGRwkbByteOrder::wkbNDR, // Little endian
-                    wkb_buffer.as_mut_ptr(),
-                );
-
-                if err == gdal_sys::OGRErr::OGRERR_NONE {
-                    // Get pixel value
-                    let value = OGR_F_GetFieldAsDouble(feature, 0);
-                    polygon_values.push((wkb_buffer, value));
-                }
-            }
-
-            OGR_F_Destroy(feature);
-        }
+        polygon_values.push((wkb, value));
     }
 
     Ok(polygon_values)
