@@ -39,6 +39,7 @@ datafusion-expr = { workspace = true }
 evalexpr = "13"
 gdal = { workspace = true }
 gdal-sys = { workspace = true }
+lru = { workspace = true }
 sedona-common = { workspace = true }
 sedona-expr = { workspace = true }
 sedona-raster = { workspace = true }

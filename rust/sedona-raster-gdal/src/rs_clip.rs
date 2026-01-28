@@ -42,7 +42,7 @@ use sedona_schema::datatypes::{SedonaType, RASTER};
 use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::{BandDataType, StorageType};
 
-use crate::dataset::{nodata_bytes_to_f64, nodata_f64_to_bytes, raster_to_dataset};
+use crate::gdal_common::{nodata_bytes_to_f64, nodata_f64_to_bytes};
 
 /// RS_Clip() scalar UDF implementation
 ///
@@ -225,9 +225,13 @@ fn clip_raster(
         DataFusionError::Execution(format!("Failed to parse geometry from WKB: {}", e))
     })?;
 
-    // Create GDAL dataset from raster to use for spatial reference
-    let gdal_dataset = raster_to_dataset(raster)
+    // Create GDAL dataset from raster to use for spatial reference (thread-local provider)
+    let provider = crate::gdal_dataset_provider::thread_local_provider()
+        .map_err(|e| DataFusionError::Execution(format!("Failed to init GDAL provider: {}", e)))?;
+    let raster_ds = provider
+        .raster_ref_to_gdal(raster)
         .map_err(|e| DataFusionError::Execution(format!("Failed to create GDAL dataset: {}", e)))?;
+    let gdal_dataset = raster_ds.as_dataset();
 
     // Create a mask raster (same dimensions as input)
     let mem_driver = DriverManager::get_driver_by_name("MEM")

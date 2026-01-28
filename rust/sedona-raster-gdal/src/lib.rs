@@ -30,7 +30,7 @@
 //! - `RS_FromGDALRaster`: Parse binary content using GDAL driver as in-db raster
 //! - `RS_AsGeoTiff`: Export raster as GeoTiff binary
 
-pub mod dataset;
+// dataset module removed; utilities moved into `gdal_common` and `gdal_dataset_provider`
 pub mod rs_as_geotiff;
 pub mod rs_as_raster;
 pub mod rs_clip;
@@ -41,12 +41,17 @@ pub mod rs_polygonize;
 pub mod rs_value;
 pub mod rs_zonal_stats;
 
+mod gdal_common;
+mod gdal_dataset_provider;
+
 // Re-export main dataset conversion functions
-pub use dataset::{
-    band_data_type_to_gdal, gdal_to_band_data_type, gdal_type_byte_size, nodata_bytes_to_f64,
-    nodata_f64_to_bytes, raster_to_dataset, raster_to_mem_dataset, raster_to_vrt_dataset,
-    RasterMemDataset, RasterVrtDataset,
+pub use gdal_common::{
+    band_data_type_to_gdal, bytes_to_f64, gdal_to_band_data_type, gdal_type_byte_size,
+    nodata_bytes_to_f64, nodata_f64_to_bytes,
 };
+
+// Expose provider initializer for callers that need GDAL datasets from a `RasterRef`.
+// `thread_local_provider` is crate-internal; callers use `crate::gdal_dataset_provider::thread_local_provider()`
 
 // Re-export UDF constructors
 pub use rs_as_geotiff::{rs_as_geotiff_udf, CompressionType};

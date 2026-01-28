@@ -44,7 +44,7 @@ use sedona_raster::array::{RasterRefImpl, RasterStructArray};
 use sedona_schema::datatypes::SedonaType;
 use sedona_schema::matchers::ArgMatcher;
 
-use crate::dataset::raster_to_mem_dataset;
+// Use thread-local provider to create GDAL datasets from `RasterRef`.
 
 /// Counter for generating unique VSI memory file names
 static VSI_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -159,13 +159,14 @@ impl RsAsGeoTiff {
         tile_width: Option<u32>,
         tile_height: Option<u32>,
     ) -> Result<Vec<u8>> {
-        // Create MEM dataset from raster
-        let mem_dataset = raster_to_mem_dataset(raster).map_err(|e| {
-            DataFusionError::Execution(format!("Failed to create MEM dataset: {}", e))
+        // Create GDAL dataset from raster using the thread-local provider
+        let provider = crate::gdal_dataset_provider::thread_local_provider().map_err(|e| {
+            DataFusionError::Execution(format!("Failed to init GDAL provider: {}", e))
         })?;
-
-        // Get the underlying dataset
-        let source_dataset = mem_dataset.as_dataset();
+        let raster_ds = provider.raster_ref_to_gdal(raster).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to create GDAL dataset: {}", e))
+        })?;
+        let source_dataset = raster_ds.as_dataset();
 
         // Get GeoTiff driver
         let driver = DriverManager::get_driver_by_name("GTiff").map_err(|e| {

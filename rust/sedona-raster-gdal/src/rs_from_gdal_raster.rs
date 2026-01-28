@@ -40,7 +40,7 @@ use sedona_schema::datatypes::{SedonaType, RASTER};
 use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::{BandDataType, StorageType};
 
-use crate::dataset::{gdal_to_band_data_type, nodata_f64_to_bytes};
+use crate::gdal_common::{gdal_to_band_data_type, nodata_f64_to_bytes};
 
 /// Counter for generating unique VSI memory file names
 static VSI_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -249,7 +249,7 @@ impl RsFromGDALRaster {
             })?;
 
             let gdal_type = band.band_type();
-            let band_data_type = gdal_to_band_data_type(gdal_type).ok_or_else(|| {
+            let band_data_type = gdal_to_band_data_type(gdal_type).map_err(|_| {
                 let _ = unlink_mem_file(&vsi_path);
                 DataFusionError::Execution(format!("Unsupported band data type: {:?}", gdal_type))
             })?;
