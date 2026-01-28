@@ -44,7 +44,7 @@ use sedona_schema::datatypes::SedonaType;
 use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::BandDataType;
 
-use crate::dataset::{nodata_bytes_to_f64, raster_to_dataset};
+use crate::gdal_common::nodata_bytes_to_f64;
 
 /// Statistics types supported by RS_ZonalStats
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -495,9 +495,13 @@ fn compute_zonal_stats(
         DataFusionError::Execution(format!("Failed to parse geometry from WKB: {}", e))
     })?;
 
-    // Create GDAL dataset from raster
-    let gdal_dataset = raster_to_dataset(raster)
+    // Create GDAL dataset from raster (thread-local provider)
+    let provider = crate::gdal_dataset_provider::thread_local_provider()
+        .map_err(|e| DataFusionError::Execution(format!("Failed to init GDAL provider: {}", e)))?;
+    let raster_ds = provider
+        .raster_ref_to_gdal(raster)
         .map_err(|e| DataFusionError::Execution(format!("Failed to create GDAL dataset: {}", e)))?;
+    let gdal_dataset = raster_ds.as_dataset();
 
     // Create a mask raster
     let mem_driver = DriverManager::get_driver_by_name("MEM")

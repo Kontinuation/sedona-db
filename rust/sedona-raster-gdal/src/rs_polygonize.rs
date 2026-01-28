@@ -40,7 +40,7 @@ use sedona_raster::traits::RasterRef;
 use sedona_schema::datatypes::SedonaType;
 use sedona_schema::matchers::ArgMatcher;
 
-use crate::dataset::raster_to_dataset;
+// `dataset` removed; the provider is used instead when creating GDAL datasets.
 
 /// RS_Polygonize() scalar UDF implementation
 ///
@@ -168,9 +168,13 @@ fn polygonize_raster(raster: &RasterRefImpl<'_>, band_num: usize) -> Result<Vec<
         )));
     }
 
-    // Create GDAL dataset from raster
-    let gdal_dataset = raster_to_dataset(raster)
+    // Create GDAL dataset from raster (thread-local provider)
+    let provider = crate::gdal_dataset_provider::thread_local_provider()
+        .map_err(|e| DataFusionError::Execution(format!("Failed to init GDAL provider: {}", e)))?;
+    let raster_ds = provider
+        .raster_ref_to_gdal(raster)
         .map_err(|e| DataFusionError::Execution(format!("Failed to create GDAL dataset: {}", e)))?;
+    let gdal_dataset = raster_ds.as_dataset();
 
     // Get the raster band
     let raster_band = gdal_dataset.rasterband(band_num).map_err(|e| {

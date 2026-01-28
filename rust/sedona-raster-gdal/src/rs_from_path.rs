@@ -41,7 +41,7 @@ use sedona_schema::datatypes::{SedonaType, RASTER};
 use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::StorageType;
 
-use crate::dataset::{gdal_to_band_data_type, nodata_f64_to_bytes};
+use crate::gdal_common::{gdal_to_band_data_type, nodata_f64_to_bytes};
 
 /// RS_FromPath() scalar UDF implementation
 ///
@@ -155,7 +155,7 @@ impl RsFromPath {
             })?;
 
             let gdal_type = band.band_type();
-            let band_data_type = gdal_to_band_data_type(gdal_type).ok_or_else(|| {
+            let band_data_type = gdal_to_band_data_type(gdal_type).map_err(|_| {
                 DataFusionError::Execution(format!("Unsupported band data type: {:?}", gdal_type))
             })?;
 

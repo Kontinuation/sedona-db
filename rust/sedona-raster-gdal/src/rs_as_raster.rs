@@ -40,7 +40,7 @@ use sedona_schema::datatypes::{SedonaType, RASTER};
 use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::{BandDataType, StorageType};
 
-use crate::dataset::{nodata_f64_to_bytes, raster_to_dataset};
+use crate::gdal_common::nodata_f64_to_bytes;
 
 /// RS_AsRaster() scalar UDF implementation
 pub fn rs_as_raster_udf() -> SedonaScalarUDF {
@@ -325,9 +325,12 @@ fn as_raster(
         .map_err(|e| DataFusionError::Execution(format!("Failed to set geotransform: {}", e)))?;
 
     // Set spatial reference based on reference raster dataset (if present)
-    let ref_ds = raster_to_dataset(reference_raster)
+    let provider = crate::gdal_dataset_provider::thread_local_provider()
+        .map_err(|e| DataFusionError::Execution(format!("Failed to init GDAL provider: {}", e)))?;
+    let ref_raster_ds = provider
+        .raster_ref_to_gdal(reference_raster)
         .map_err(|e| DataFusionError::Execution(format!("Failed to create GDAL dataset: {}", e)))?;
-    if let Ok(srs) = ref_ds.spatial_ref() {
+    if let Ok(srs) = ref_raster_ds.as_dataset().spatial_ref() {
         out_dataset.set_spatial_ref(&srs).map_err(|e| {
             DataFusionError::Execution(format!("Failed to set spatial reference: {}", e))
         })?;

@@ -64,7 +64,7 @@ use sedona_schema::datatypes::{SedonaType, RASTER};
 use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::{BandDataType, StorageType};
 
-use crate::dataset::nodata_f64_to_bytes;
+use crate::gdal_common::nodata_f64_to_bytes;
 
 /// RS_MapAlgebra() scalar UDF implementation
 ///
