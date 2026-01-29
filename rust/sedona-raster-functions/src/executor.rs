@@ -523,11 +523,84 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
         }
     }
 
+    /// Execute a function by iterating over rasters and a geometry in sync.
+    ///
+    /// The geometry argument may be:
+    /// - A WKB Binary or BinaryView array/scalar (with type-level CRS via [SedonaType])
+    /// - An item-level CRS struct column: struct(item: wkb, crs: utf8view)
+    ///
+    /// The closure is invoked for each row with `(raster, wkb_bytes, crs_str)`.
+    pub fn execute_raster_wkb_crs_void<F>(&self, mut func: F) -> Result<()>
+    where
+        F: FnMut(Option<RasterRefImpl<'_>>, Option<&[u8]>, Option<&str>) -> Result<()>,
+    {
+        if self.arg_types.get(0) != Some(&RASTER) {
+            return sedona_internal_err!("First argument must be a raster type");
+        }
+        if self.args.len() < 2 {
+            return sedona_internal_err!("Expected at least 2 arguments (raster, geom)");
+        }
+
+        let geom_accessor = self.make_geom_wkb_crs_accessor(1)?;
+
+        match &self.args[0] {
+            ColumnarValue::Array(array) => {
+                let raster_struct =
+                    array
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(
+                                "Expected StructArray for raster data".to_string(),
+                            )
+                        })?;
+                let raster_array = RasterStructArray::new(raster_struct);
+
+                for i in 0..self.num_iterations {
+                    let (maybe_wkb, maybe_crs) = geom_accessor.get(i)?;
+                    if raster_array.is_null(i) {
+                        func(None, maybe_wkb, maybe_crs)?;
+                        continue;
+                    }
+                    let raster = raster_array.get(i)?;
+                    func(Some(raster), maybe_wkb, maybe_crs)?;
+                }
+
+                Ok(())
+            }
+            ColumnarValue::Scalar(scalar_value) => match scalar_value {
+                ScalarValue::Struct(arc_struct) => {
+                    let raster_array = RasterStructArray::new(arc_struct.as_ref());
+                    let raster_is_null = raster_array.is_null(0);
+                    for i in 0..self.num_iterations {
+                        let (maybe_wkb, maybe_crs) = geom_accessor.get(i)?;
+                        if raster_is_null {
+                            func(None, maybe_wkb, maybe_crs)?;
+                        } else {
+                            let raster = raster_array.get(0)?;
+                            func(Some(raster), maybe_wkb, maybe_crs)?;
+                        }
+                    }
+                    Ok(())
+                }
+                ScalarValue::Null => {
+                    for i in 0..self.num_iterations {
+                        let (maybe_wkb, maybe_crs) = geom_accessor.get(i)?;
+                        func(None, maybe_wkb, maybe_crs)?;
+                    }
+                    Ok(())
+                }
+                _ => Err(DataFusionError::Internal(
+                    "Expected Struct scalar for raster".to_string(),
+                )),
+            },
+        }
+    }
+
     /// Alias for the originally requested method name.
-    #[allow(dead_code)]
     pub fn execube_raster_item_crs_void<F>(&self, func: F) -> Result<()>
     where
-        F: FnMut(Option<&RasterRefImpl<'_>>, Option<&[u8]>, Option<&str>) -> Result<()>,
+        F: FnMut(Option<RasterRefImpl<'_>>, Option<&[u8]>, Option<&str>) -> Result<()>,
     {
         self.execute_raster_wkb_crs_void(func)
     }
@@ -832,6 +905,7 @@ mod tests {
         let rasters = generate_test_rasters(2, None).unwrap();
         let raster_args = ColumnarValue::Array(Arc::new(rasters));
 
+        // Build a custom item_crs type (standard item type without static CRS)
         let item_field = WKB_GEOMETRY.to_storage_field("item", true).unwrap();
         let crs_field = Field::new("crs", DataType::Utf8View, true);
         let geom_type = SedonaType::Arrow(DataType::Struct(vec![item_field, crs_field].into()));
