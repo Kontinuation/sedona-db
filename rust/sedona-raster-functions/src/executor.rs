@@ -532,7 +532,7 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
     /// The closure is invoked for each row with `(raster, wkb_bytes, crs_str)`.
     pub fn execute_raster_wkb_crs_void<F>(&self, mut func: F) -> Result<()>
     where
-        F: FnMut(Option<RasterRefImpl<'_>>, Option<&[u8]>, Option<&str>) -> Result<()>,
+        F: FnMut(Option<&RasterRefImpl<'_>>, Option<&[u8]>, Option<&str>) -> Result<()>,
     {
         if self.arg_types.get(0) != Some(&RASTER) {
             return sedona_internal_err!("First argument must be a raster type");
@@ -563,7 +563,7 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
                         continue;
                     }
                     let raster = raster_array.get(i)?;
-                    func(Some(raster), maybe_wkb, maybe_crs)?;
+                    func(Some(&raster), maybe_wkb, maybe_crs)?;
                 }
 
                 Ok(())
@@ -571,15 +571,14 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
             ColumnarValue::Scalar(scalar_value) => match scalar_value {
                 ScalarValue::Struct(arc_struct) => {
                     let raster_array = RasterStructArray::new(arc_struct.as_ref());
-                    let raster_is_null = raster_array.is_null(0);
+                    let raster_opt = if raster_array.is_null(0) {
+                        None
+                    } else {
+                        Some(raster_array.get(0)?)
+                    };
                     for i in 0..self.num_iterations {
                         let (maybe_wkb, maybe_crs) = geom_accessor.get(i)?;
-                        if raster_is_null {
-                            func(None, maybe_wkb, maybe_crs)?;
-                        } else {
-                            let raster = raster_array.get(0)?;
-                            func(Some(raster), maybe_wkb, maybe_crs)?;
-                        }
+                        func(raster_opt.as_ref(), maybe_wkb, maybe_crs)?;
                     }
                     Ok(())
                 }
@@ -600,7 +599,7 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
     /// Alias for the originally requested method name.
     pub fn execube_raster_item_crs_void<F>(&self, func: F) -> Result<()>
     where
-        F: FnMut(Option<RasterRefImpl<'_>>, Option<&[u8]>, Option<&str>) -> Result<()>,
+        F: FnMut(Option<&RasterRefImpl<'_>>, Option<&[u8]>, Option<&str>) -> Result<()>,
     {
         self.execute_raster_wkb_crs_void(func)
     }
