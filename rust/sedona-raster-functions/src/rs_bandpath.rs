@@ -132,7 +132,7 @@ impl SedonaScalarKernel for RsBandPathWithBandIndex {
 
 /// Get the band path for a raster at the specified band index
 fn get_band_path(
-    raster_opt: Option<sedona_raster::array::RasterRefImpl<'_>>,
+    raster_opt: Option<&sedona_raster::array::RasterRefImpl<'_>>,
     band_index: i32,
     builder: &mut StringBuilder,
 ) -> Result<()> {

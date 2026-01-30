@@ -84,7 +84,7 @@ impl SedonaScalarKernel for RsConvexHull {
         executor.execute_raster_void(|_i, raster_opt| {
             match raster_opt {
                 Some(raster) => {
-                    create_convexhull_wkb(&raster, &mut builder)?;
+                    create_convexhull_wkb(raster, &mut builder)?;
                     builder.append_value([]);
                 }
                 None => builder.append_null(),

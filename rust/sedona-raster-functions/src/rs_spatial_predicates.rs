@@ -27,9 +27,7 @@ use std::sync::Arc;
 
 use crate::executor::RasterExecutor;
 use arrow_array::builder::BooleanBuilder;
-use arrow_array::{Array, BinaryArray};
 use arrow_schema::DataType;
-use datafusion_common::cast::as_binary_array;
 use datafusion_common::DataFusionError;
 use datafusion_common::Result;
 use datafusion_expr::{
@@ -209,42 +207,28 @@ impl<Op: tg::BinaryPredicate + Send + Sync> RsSpatialPredicate<Op> {
         arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
-        let executor = RasterExecutor::new(arg_types, args);
+        // Ensure executor always sees (raster, geom)
+        let exec_arg_types = vec![arg_types[0].clone(), arg_types[1].clone()];
+        let exec_args = vec![args[0].clone(), args[1].clone()];
+        let executor = RasterExecutor::new(&exec_arg_types, &exec_args);
         let mut builder = BooleanBuilder::with_capacity(executor.num_iterations());
 
-        // Get the geometry CRS from the type
-        let geom_crs = get_crs_from_geom_type(&arg_types[1])?;
-
-        // Expand geometry argument to array
-        let geom_array = expand_to_binary_array(&args[1], executor.num_iterations())?;
-
-        executor.execute_raster_void(|i, raster_opt| {
-            match raster_opt {
-                Some(raster) => {
-                    // Get geometry WKB
-                    if geom_array.is_null(i) {
-                        builder.append_null();
-                        return Ok(());
-                    }
-                    let geom_wkb = geom_array.value(i);
-
-                    // Get raster CRS
-                    let raster_crs = get_crs_from_raster(&raster)?;
-
-                    // Create convex hull WKB for the raster
+        executor.execute_raster_wkb_crs_void(|raster_opt, maybe_wkb, maybe_geom_crs| {
+            match (raster_opt, maybe_wkb) {
+                (Some(raster), Some(geom_wkb)) => {
+                    let raster_crs = get_crs_from_raster(raster)?;
                     let mut raster_wkb = Vec::with_capacity(93);
-                    create_convexhull_wkb(&raster, &mut raster_wkb)?;
+                    create_convexhull_wkb(raster, &mut raster_wkb)?;
 
-                    // Evaluate predicate with CRS handling
                     let result = evaluate_predicate_with_crs::<Op>(
                         &raster_wkb,
                         raster_crs.as_deref(),
                         geom_wkb,
-                        geom_crs.as_deref(),
+                        maybe_geom_crs,
                     )?;
                     builder.append_value(result);
                 }
-                None => builder.append_null(),
+                _ => builder.append_null(),
             }
             Ok(())
         })?;
@@ -258,49 +242,34 @@ impl<Op: tg::BinaryPredicate + Send + Sync> RsSpatialPredicate<Op> {
         arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
-        let executor = RasterExecutor::new(&arg_types[1..], &args[1..]);
+        // Reorder so executor always sees (raster, geom)
+        let exec_arg_types = vec![arg_types[1].clone(), arg_types[0].clone()];
+        let exec_args = vec![args[1].clone(), args[0].clone()];
+        let executor = RasterExecutor::new(&exec_arg_types, &exec_args);
         let mut builder = BooleanBuilder::with_capacity(executor.num_iterations());
 
-        // Get the geometry CRS from the type
-        let geom_crs = get_crs_from_geom_type(&arg_types[0])?;
-
-        // Expand geometry argument to array
-        let geom_array = expand_to_binary_array(&args[0], executor.num_iterations())?;
-
-        executor.execute_raster_void(|i, raster_opt| {
-            match raster_opt {
-                Some(raster) => {
-                    // Get geometry WKB
-                    if geom_array.is_null(i) {
-                        builder.append_null();
-                        return Ok(());
-                    }
-                    let geom_wkb = geom_array.value(i);
-
-                    // Get raster CRS
-                    let raster_crs = get_crs_from_raster(&raster)?;
-
-                    // Create convex hull WKB for the raster
+        executor.execute_raster_wkb_crs_void(|raster_opt, maybe_wkb, maybe_geom_crs| {
+            match (raster_opt, maybe_wkb) {
+                (Some(raster), Some(geom_wkb)) => {
+                    let raster_crs = get_crs_from_raster(raster)?;
                     let mut raster_wkb = Vec::with_capacity(93);
-                    create_convexhull_wkb(&raster, &mut raster_wkb)?;
+                    create_convexhull_wkb(raster, &mut raster_wkb)?;
 
                     // Note: order is geometry, raster for the predicate
                     let result = evaluate_predicate_with_crs::<Op>(
                         geom_wkb,
-                        geom_crs.as_deref(),
+                        maybe_geom_crs,
                         &raster_wkb,
                         raster_crs.as_deref(),
                     )?;
                     builder.append_value(result);
                 }
-                None => builder.append_null(),
+                _ => builder.append_null(),
             }
             Ok(())
         })?;
 
-        // Use the first raster argument's executor for finishing
-        let executor_for_finish = RasterExecutor::new(&arg_types[1..], &args[1..]);
-        executor_for_finish.finish(Arc::new(builder.finish()))
+        executor.finish(Arc::new(builder.finish()))
     }
 
     /// Invoke RS_<Predicate>(raster1, raster2)
@@ -309,64 +278,37 @@ impl<Op: tg::BinaryPredicate + Send + Sync> RsSpatialPredicate<Op> {
         arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
-        // Create executor for the first raster
-        let executor1 = RasterExecutor::new(&arg_types[0..1], &args[0..1]);
-        // Create executor for the second raster
-        let executor2 = RasterExecutor::new(&arg_types[1..], &args[1..]);
+        // Ensure executor always sees (raster, raster)
+        let exec_arg_types = vec![arg_types[0].clone(), arg_types[1].clone()];
+        let exec_args = vec![args[0].clone(), args[1].clone()];
+        let executor = RasterExecutor::new(&exec_arg_types, &exec_args);
+        let mut builder = BooleanBuilder::with_capacity(executor.num_iterations());
 
-        let num_iterations = executor1.num_iterations().max(executor2.num_iterations());
-        let mut builder = BooleanBuilder::with_capacity(num_iterations);
+        executor.execute_raster_raster_void(|_i, r0_opt, r1_opt| {
+            match (r0_opt, r1_opt) {
+                (Some(r0), Some(r1)) => {
+                    let crs0 = get_crs_from_raster(r0)?;
+                    let crs1 = get_crs_from_raster(r1)?;
+                    let mut wkb0 = Vec::with_capacity(93);
+                    let mut wkb1 = Vec::with_capacity(93);
+                    create_convexhull_wkb(r0, &mut wkb0)?;
+                    create_convexhull_wkb(r1, &mut wkb1)?;
 
-        // We need to iterate over both rasters together
-        // For simplicity, we'll use a combined approach
-        let raster1_vec = collect_rasters(&executor1)?;
-        let raster2_vec = collect_rasters(&executor2)?;
-
-        for i in 0..num_iterations {
-            let r1_idx = if raster1_vec.len() == 1 { 0 } else { i };
-            let r2_idx = if raster2_vec.len() == 1 { 0 } else { i };
-
-            match (&raster1_vec[r1_idx], &raster2_vec[r2_idx]) {
-                (Some(raster1_wkb), Some(raster2_wkb)) => {
-                    // For raster-raster, we need CRS info stored alongside
-                    // This is simplified - ideally we'd store CRS with the WKB
                     let result = evaluate_predicate_with_crs::<Op>(
-                        &raster1_wkb.0,
-                        raster1_wkb.1.as_deref(),
-                        &raster2_wkb.0,
-                        raster2_wkb.1.as_deref(),
+                        &wkb0,
+                        crs0.as_deref(),
+                        &wkb1,
+                        crs1.as_deref(),
                     )?;
                     builder.append_value(result);
                 }
                 _ => builder.append_null(),
             }
-        }
+            Ok(())
+        })?;
 
-        executor1.finish(Arc::new(builder.finish()))
+        executor.finish(Arc::new(builder.finish()))
     }
-}
-
-/// A raster's convex hull WKB bytes paired with its CRS string
-type RasterWkbCrs = (Vec<u8>, Option<String>);
-
-/// Collect rasters into a vector of (WKB, CRS) pairs
-fn collect_rasters(executor: &RasterExecutor) -> Result<Vec<Option<RasterWkbCrs>>> {
-    let mut results = Vec::with_capacity(executor.num_iterations());
-
-    executor.execute_raster_void(|_i, raster_opt| {
-        match raster_opt {
-            Some(raster) => {
-                let crs = get_crs_from_raster(&raster)?;
-                let mut wkb = Vec::with_capacity(93);
-                create_convexhull_wkb(&raster, &mut wkb)?;
-                results.push(Some((wkb, crs)));
-            }
-            None => results.push(None),
-        }
-        Ok(())
-    })?;
-
-    Ok(results)
 }
 
 /// Get CRS string from a raster
@@ -381,31 +323,6 @@ fn get_crs_from_raster(raster: &dyn RasterRef) -> Result<Option<String>> {
                 Some(crs_ref) => Ok(Some(crs_ref.to_crs_string())),
                 None => Ok(None),
             }
-        }
-    }
-}
-
-/// Get CRS string from a geometry type
-fn get_crs_from_geom_type(sedona_type: &SedonaType) -> Result<Option<String>> {
-    match sedona_type {
-        SedonaType::Wkb(_, Some(crs)) | SedonaType::WkbView(_, Some(crs)) => {
-            Ok(Some(crs.to_crs_string()))
-        }
-        _ => Ok(None),
-    }
-}
-
-/// Expand a ColumnarValue to a BinaryArray
-fn expand_to_binary_array(value: &ColumnarValue, num_rows: usize) -> Result<Arc<BinaryArray>> {
-    match value {
-        ColumnarValue::Array(array) => {
-            let binary_array = as_binary_array(&array)?;
-            Ok(Arc::new(binary_array.clone()))
-        }
-        ColumnarValue::Scalar(scalar) => {
-            let array = scalar.to_array_of_size(num_rows)?;
-            let binary_array = as_binary_array(&array)?;
-            Ok(Arc::new(binary_array.clone()))
         }
     }
 }

@@ -147,7 +147,7 @@ impl SedonaScalarKernel for RsGeoReferenceTwoArg {
 
 /// Format the georeference metadata for a raster
 fn format_georeference(
-    raster_opt: Option<sedona_raster::array::RasterRefImpl<'_>>,
+    raster_opt: Option<&sedona_raster::array::RasterRefImpl<'_>>,
     format: GeoReferenceFormat,
     builder: &mut StringBuilder,
 ) -> Result<()> {
