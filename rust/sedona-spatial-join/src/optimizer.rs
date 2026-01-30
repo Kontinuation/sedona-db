@@ -250,7 +250,7 @@ impl SpatialJoinOptimizer {
 
         // Check if this is a HashJoinExec with spatial filter that we can convert to spatial join
         if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
-            if let Some(spatial_join) = self.try_convert_hash_join_to_spatial(hash_join)? {
+            if let Some(spatial_join) = self.try_convert_hash_join_to_spatial(hash_join, config)? {
                 return Ok(Transformed::yes(spatial_join));
             }
         }
@@ -267,6 +267,10 @@ impl SpatialJoinOptimizer {
         nested_loop_join: &NestedLoopJoinExec,
         config: &ConfigOptions,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let Some(options) = config.extensions.get::<SedonaOptions>() else {
+            return Ok(None);
+        };
+
         if let Some(join_filter) = nested_loop_join.filter() {
             if let Some((spatial_predicate, remainder)) = transform_join_filter(join_filter) {
                 // The left side of the nested loop join is required to have only one partition, while SpatialJoinExec
@@ -325,6 +329,7 @@ impl SpatialJoinOptimizer {
                     remainder,
                     join_type,
                     nested_loop_join.projection().cloned(),
+                    &options.spatial_join,
                 )?;
 
                 return Ok(Some(Arc::new(spatial_join)));
@@ -341,7 +346,12 @@ impl SpatialJoinOptimizer {
     fn try_convert_hash_join_to_spatial(
         &self,
         hash_join: &HashJoinExec,
+        config: &ConfigOptions,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let Some(options) = config.extensions.get::<SedonaOptions>() else {
+            return Ok(None);
+        };
+
         // Check if the filter contains spatial predicates
         if let Some(join_filter) = hash_join.filter() {
             if let Some((spatial_predicate, mut remainder)) = transform_join_filter(join_filter) {
@@ -379,6 +389,7 @@ impl SpatialJoinOptimizer {
                     remainder,
                     hash_join.join_type(),
                     None, // No projection in SpatialJoinExec
+                    &options.spatial_join,
                     true, // converted_from_hash_join = true
                 )?);
 

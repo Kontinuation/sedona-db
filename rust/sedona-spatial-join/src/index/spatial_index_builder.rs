@@ -140,12 +140,8 @@ impl SpatialIndexBuilder {
         // Estimate the amount of memory needed for the R-tree
         let rtree_mem_usage = num_geoms * RTREE_MEMORY_ESTIMATE_PER_RECT;
 
-        // Estimate the amount of memory needed for auxiliary data structures, such as
-        // batch_pos_vec and geom_idx_vec.
-        let auxiliary = num_geoms * 16;
-
         // The final estimation is the sum of all above
-        refiner_mem_usage + knn_components_mem_usage + rtree_mem_usage + auxiliary
+        refiner_mem_usage + knn_components_mem_usage + rtree_mem_usage
     }
 
     /// Add a geometry batch to be indexed.
@@ -265,6 +261,7 @@ impl SpatialIndexBuilder {
             .sum::<usize>();
 
         let (rtree, batch_pos_vec) = self.build_rtree()?;
+
         let geom_idx_vec = self.build_geom_idx_vec(&batch_pos_vec);
         let visited_build_side = self.build_visited_bitmaps()?;
 
@@ -291,7 +288,7 @@ impl SpatialIndexBuilder {
             }
         };
 
-        log::info!(
+        log::debug!(
             "Estimated memory used by spatial index: {}",
             self.memory_used
         );

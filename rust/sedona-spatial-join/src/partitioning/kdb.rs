@@ -43,7 +43,9 @@
 use std::sync::Arc;
 
 use crate::partitioning::{
-    util::{bbox_to_geo_rect, rect_contains_point, rect_intersection_area, rects_intersect},
+    util::{
+        bbox_to_geo_rect, make_rect, rect_contains_point, rect_intersection_area, rects_intersect,
+    },
     SpatialPartition, SpatialPartitioner,
 };
 use datafusion_common::Result;
@@ -126,9 +128,12 @@ impl KDBTree {
         if max_items_per_node == 0 {
             return sedona_internal_err!("max_items_per_node must be greater than 0");
         }
-        let Some(extent_rect) = bbox_to_geo_rect(&extent)? else {
-            return sedona_internal_err!("KDBTree extent cannot be empty");
-        };
+
+        // extent_rect is a sentinel rect if the bounding box is empty. In that case,
+        // almost all insertions will be ignored. We are free to partition the data
+        // arbitrarily when the extent is empty.
+        let extent_rect = bbox_to_geo_rect(&extent)?.unwrap_or(make_rect(0.0, 0.0, 0.0, 0.0));
+
         Ok(Self::new_with_level(
             max_items_per_node,
             max_levels,
@@ -492,6 +497,7 @@ impl KDBPartitioner {
         self.tree.num_leaf_nodes()
     }
 
+    /// Write the tree structure in human-readable format for debugging purposes.
     pub fn debug_print(&self, f: &mut impl std::fmt::Write) -> Result<()> {
         let leaves = self.tree.collect_leaf_nodes();
         for leaf in leaves {
@@ -505,6 +511,13 @@ impl KDBPartitioner {
             writeln!(f, "Leaf ID: {}, Extent: {}", leaf.leaf_id(), extent)?;
         }
         Ok(())
+    }
+
+    /// Return the tree structure in human-readable format for debugging purposes.
+    pub fn debug_str(&self) -> String {
+        let mut output = String::new();
+        let _ = self.debug_print(&mut output);
+        output
     }
 }
 
@@ -560,6 +573,32 @@ mod tests {
     use sedona_geometry::interval::{Interval, IntervalTrait};
 
     use super::*;
+
+    fn assert_no_items_in_internal_nodes(tree: &KDBTree) {
+        fn walk(node: &KDBTree, internal_nodes: &mut usize, internal_items: &mut usize) {
+            if let Some(ref children) = node.children {
+                *internal_nodes += 1;
+                *internal_items += node.items.len();
+                assert_eq!(
+                    node.items.len(),
+                    0,
+                    "internal KDB node should not store items; otherwise leaf count can be lower than expected",
+                );
+                for child in children.iter() {
+                    walk(child, internal_nodes, internal_items);
+                }
+            }
+        }
+
+        let mut internal_nodes = 0;
+        let mut internal_items = 0;
+        walk(tree, &mut internal_nodes, &mut internal_items);
+        assert!(
+            internal_nodes > 0,
+            "test must create at least one internal node"
+        );
+        assert_eq!(internal_items, 0);
+    }
 
     #[test]
     fn test_kdb_insert_and_leaf_assignment() {
@@ -782,6 +821,33 @@ mod tests {
     }
 
     #[test]
+    fn test_kdb_partitioner_num_partitions_no_less_than_specified() {
+        let extent = BoundingBox::xy((0.0, 100.0), (0.0, 100.0));
+        let mut tree = KDBTree::try_new(2, 16, extent).unwrap();
+
+        // Insert enough non-empty, in-bounds boxes to force multiple splits.
+        // We vary both x and y because the root split axis depends on extent dimensions.
+        for i in 0..100 {
+            let x = (i % 10) as f64 * 10.0 + 1.0;
+            let y = (i / 10) as f64 * 10.0 + 1.0;
+            tree.insert(BoundingBox::xy((x, x + 0.5), (y, y + 0.5)))
+                .unwrap();
+        }
+
+        assert!(tree.num_leaf_nodes() > 1, "expected tree to split");
+        assert_no_items_in_internal_nodes(&tree);
+
+        let mut leaf_items = 0usize;
+        tree.visit_leaf_nodes(&mut |kdb| {
+            leaf_items += kdb.items.len();
+        });
+        assert_eq!(
+            leaf_items, 100,
+            "all inserted items should end up in leaves"
+        );
+    }
+
+    #[test]
     fn test_split_behavior() {
         let extent = BoundingBox::xy((0.0, 100.0), (0.0, 100.0));
         let mut tree = KDBTree::try_new(3, 5, extent).unwrap();
@@ -911,5 +977,20 @@ mod tests {
             partitioner.partition_no_multi(&bbox).unwrap(),
             SpatialPartition::None
         );
+    }
+
+    #[test]
+    fn test_kdb_partitioner_empty_extent() {
+        let extent = BoundingBox::empty();
+        let bboxes = vec![
+            BoundingBox::xy((0.0, 10.0), (0.0, 10.0)),
+            BoundingBox::xy((1.0, 10.0), (1.0, 10.0)),
+        ];
+        let partitioner = KDBPartitioner::build(bboxes.clone().into_iter(), 10, 4, extent).unwrap();
+
+        // Partition calls should succeed
+        for test_bbox in bboxes {
+            assert!(partitioner.partition(&test_bbox).is_ok());
+        }
     }
 }

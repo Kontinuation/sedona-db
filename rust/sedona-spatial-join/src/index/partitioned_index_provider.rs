@@ -177,14 +177,14 @@ impl PartitionedIndexProvider {
                 if let Err(e) = cell.set(Ok(Arc::clone(&idx))) {
                     // This is probably because the cell has been disposed. No one
                     // will get the index from the cell so this failure is not a big deal.
-                    log::info!("Cannot set the index into the async cell: {:?}", e);
+                    log::debug!("Cannot set the index into the async cell: {:?}", e);
                 }
                 Some(Ok(idx))
             }
             Err(err) => {
                 let err_arc = Arc::new(err);
                 if let Err(e) = cell.set(Err(Arc::clone(&err_arc))) {
-                    log::info!(
+                    log::debug!(
                         "Cannot set the index build error into the async cell: {:?}",
                         e
                     );
@@ -363,15 +363,18 @@ async fn get_index_from_cell(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evaluated_batch::{
-        evaluated_batch_stream::{
-            in_mem::InMemoryEvaluatedBatchStream, SendableEvaluatedBatchStream,
-        },
-        EvaluatedBatch,
-    };
     use crate::operand_evaluator::EvaluatedGeometryArray;
     use crate::partitioning::partition_slots::PartitionSlots;
     use crate::utils::bbox_sampler::BoundingBoxSamples;
+    use crate::{
+        evaluated_batch::{
+            evaluated_batch_stream::{
+                in_mem::InMemoryEvaluatedBatchStream, SendableEvaluatedBatchStream,
+            },
+            EvaluatedBatch,
+        },
+        index::CollectBuildSideMetrics,
+    };
     use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use datafusion::config::SpillCompression;
@@ -470,6 +473,7 @@ mod tests {
             bbox_samples: BoundingBoxSamples::empty(),
             estimated_spatial_index_memory_usage: estimated_usage,
             reservation: new_reservation(memory_pool),
+            metrics: CollectBuildSideMetrics::new(0, &ExecutionPlanMetricsSet::new()),
         })
     }
 

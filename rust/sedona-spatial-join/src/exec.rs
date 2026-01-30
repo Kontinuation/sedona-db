@@ -33,9 +33,10 @@ use datafusion_physical_plan::{
     PlanProperties,
 };
 use parking_lot::Mutex;
+use sedona_common::SpatialJoinOptions;
 
 use crate::{
-    prepare::{prepare_spatial_join_components, SpatialJoinComponents},
+    prepare::{SpatialJoinComponents, SpatialJoinComponentsBuilder},
     spatial_predicate::{KNNPredicate, SpatialPredicate},
     stream::SpatialJoinStream,
     utils::{
@@ -151,8 +152,11 @@ impl SpatialJoinExec {
         filter: Option<JoinFilter>,
         join_type: &JoinType,
         projection: Option<Vec<usize>>,
+        options: &SpatialJoinOptions,
     ) -> Result<Self> {
-        Self::try_new_with_options(left, right, on, filter, join_type, projection, false)
+        Self::try_new_with_options(
+            left, right, on, filter, join_type, projection, options, false,
+        )
     }
 
     /// Create a new SpatialJoinExec with additional options
@@ -163,6 +167,7 @@ impl SpatialJoinExec {
         filter: Option<JoinFilter>,
         join_type: &JoinType,
         projection: Option<Vec<usize>>,
+        options: &SpatialJoinOptions,
         converted_from_hash_join: bool,
     ) -> Result<Self> {
         let left_schema = left.schema();
@@ -186,7 +191,10 @@ impl SpatialJoinExec {
             filter.as_ref(),
             converted_from_hash_join,
         )?;
-        let seed = fastrand::u64(0..0xFFFF);
+        let seed = options
+            .debug
+            .random_seed
+            .unwrap_or(fastrand::u64(0..0xFFFF));
 
         Ok(SpatialJoinExec {
             left,
@@ -468,17 +476,16 @@ impl ExecutionPlan for SpatialJoinExec {
 
                             let probe_thread_count =
                                 self.right.output_partitioning().partition_count();
-
-                            Ok(prepare_spatial_join_components(
+                            let spatial_join_components_builder = SpatialJoinComponentsBuilder::new(
                                 Arc::clone(&context),
                                 build_side.schema(),
-                                build_streams,
                                 self.on.clone(),
                                 self.join_type,
                                 probe_thread_count,
                                 self.metrics.clone(),
                                 self.seed,
-                            ))
+                            );
+                            Ok(spatial_join_components_builder.build(build_streams))
                         })?
                 };
 
@@ -554,17 +561,16 @@ impl SpatialJoinExec {
                     }
 
                     let probe_thread_count = probe_plan.output_partitioning().partition_count();
-
-                    Ok(prepare_spatial_join_components(
+                    let spatial_join_components_builder = SpatialJoinComponentsBuilder::new(
                         Arc::clone(&context),
                         build_side.schema(),
-                        build_streams,
                         self.on.clone(),
                         self.join_type,
                         probe_thread_count,
                         self.metrics.clone(),
                         self.seed,
-                    ))
+                    );
+                    Ok(spatial_join_components_builder.build(build_streams))
                 })?
         };
 
@@ -1120,6 +1126,7 @@ mod tests {
             num_spatial_partitions: NumSpatialPartitionsConfig::Fixed(4),
             force_spill: true,
             memory_for_intermittent_usage: None,
+            ..Default::default()
         };
         let options = SpatialJoinOptions {
             spatial_library,
@@ -1128,7 +1135,7 @@ mod tests {
             ..Default::default()
         };
 
-        log::info!("Sedona join options: {:?}", options.clone());
+        log::debug!("Sedona join options: {:?}", options.clone());
 
         for (idx, sql) in RANGE_JOIN_SQLS.iter().enumerate() {
             let actual_result = run_spatial_join_query(
@@ -1166,6 +1173,7 @@ mod tests {
             num_spatial_partitions: NumSpatialPartitionsConfig::Fixed(4),
             force_spill: true,
             memory_for_intermittent_usage: None,
+            ..Default::default()
         };
         let options = SpatialJoinOptions {
             debug,
@@ -1195,6 +1203,7 @@ mod tests {
             num_spatial_partitions: NumSpatialPartitionsConfig::Fixed(4),
             force_spill: true,
             memory_for_intermittent_usage: None,
+            ..Default::default()
         };
         let options = SpatialJoinOptions {
             debug,
@@ -1366,7 +1375,7 @@ mod tests {
         let sql = "SELECT * FROM L LEFT JOIN R ON ST_Intersects(L.geometry, R.geometry)";
 
         // Create SpatialJoinExec plan
-        let ctx = setup_context(Some(options), batch_size)?;
+        let ctx = setup_context(Some(options.clone()), batch_size)?;
         ctx.register_table("L", mem_table_left.clone())?;
         ctx.register_table("R", mem_table_right.clone())?;
         let df = ctx.sql(sql).await?;
@@ -1381,6 +1390,7 @@ mod tests {
             original_exec.filter.clone(),
             &join_type,
             None,
+            &options,
         )?;
 
         // Create NestedLoopJoinExec plan for comparison
