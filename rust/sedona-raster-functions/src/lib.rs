@@ -16,6 +16,7 @@
 // under the License.
 
 mod executor;
+pub use executor::RasterExecutor;
 pub mod register;
 pub mod rs_bandpath;
 pub mod rs_convexhull;

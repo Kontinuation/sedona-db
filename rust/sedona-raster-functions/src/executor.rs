@@ -221,6 +221,28 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
         }
     }
 
+    /// Create a new [RasterExecutor] with an explicit number of iterations.
+    ///
+    /// This is useful when the executor is built from a subset of the original
+    /// arguments (e.g. only raster + geometry) but the overall UDF should still
+    /// iterate according to other array arguments.
+    pub fn new_with_num_iterations(
+        arg_types: &'a [SedonaType],
+        args: &'b [ColumnarValue],
+        num_iterations: usize,
+    ) -> Self {
+        let has_any_array = args.iter().any(|a| matches!(a, ColumnarValue::Array(_)));
+        Self {
+            arg_types,
+            args,
+            num_iterations: if has_any_array {
+                Self::calc_num_iterations(args)
+            } else {
+                num_iterations
+            },
+        }
+    }
+
     /// Return the number of iterations that will be performed
     pub fn num_iterations(&self) -> usize {
         self.num_iterations
@@ -1014,5 +1036,17 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn test_raster_executor_new_with_num_iterations_scalar_args() {
+        let rasters = generate_test_rasters(1, None).unwrap();
+        let raster_struct = rasters.as_any().downcast_ref::<StructArray>().unwrap();
+        let scalar_raster = ScalarValue::Struct(Arc::new(raster_struct.clone()));
+        let args = [ColumnarValue::Scalar(scalar_raster)];
+        let arg_types = vec![RASTER];
+
+        let executor = RasterExecutor::new_with_num_iterations(&arg_types, &args, 10);
+        assert_eq!(executor.num_iterations(), 10);
     }
 }

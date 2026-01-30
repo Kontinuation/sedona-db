@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BinaryArray, StructArray};
+use arrow_array::Array;
 use datafusion_common::error::Result;
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{
@@ -35,9 +35,10 @@ use gdal::vector::Geometry;
 use gdal::DriverManager;
 
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
-use sedona_raster::array::{RasterRefImpl, RasterStructArray};
+use sedona_raster::array::RasterRefImpl;
 use sedona_raster::builder::RasterBuilder;
 use sedona_raster::traits::{BandMetadata, RasterMetadata, RasterRef};
+use sedona_raster_functions::RasterExecutor;
 use sedona_schema::datatypes::{SedonaType, RASTER};
 use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::{BandDataType, StorageType};
@@ -136,66 +137,103 @@ impl SedonaScalarKernel for RsClip {
 
     fn invoke_batch(
         &self,
-        _arg_types: &[SedonaType],
+        arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
         let num_iterations = calc_num_iterations(args);
 
-        // Parse arguments based on signature
-        let (geom_arg_idx, band_num, nodata_value, all_touched) = if self.with_all_touched {
-            let band = extract_i32_scalar(&args[1])?.unwrap_or(0);
-            let nodata = extract_f64_scalar(&args[3])?;
-            let all_touched = extract_bool_scalar(&args[4])?.unwrap_or(false);
-            (2, band, nodata, all_touched)
-        } else if self.with_nodata {
-            let band = extract_i32_scalar(&args[1])?.unwrap_or(0);
-            let nodata = extract_f64_scalar(&args[3])?;
-            (2, band, nodata, false)
-        } else if self.with_band {
-            let band = extract_i32_scalar(&args[1])?.unwrap_or(0);
-            (2, band, None, false)
-        } else {
-            (1, 0, None, false) // band=0 means all bands
-        };
+        // Parse arguments based on signature.
+        // All supported variants put `raster` at index 0 and `geometry` at index 1 (no band)
+        // or index 2 (with band).
+        let geom_arg_idx = if self.with_band { 2 } else { 1 };
 
-        // Get raster and geometry arrays
-        let raster_array = get_raster_array(&args[0])?;
-        let geom_array = get_binary_array(&args[geom_arg_idx])?;
+        // Expand band/nodata/all_touched to arrays so they can vary row-by-row.
+        let band_array = if self.with_band {
+            args[1]
+                .clone()
+                .cast_to(&arrow_schema::DataType::Int32, None)?
+                .into_array(num_iterations)?
+        } else {
+            ScalarValue::Int32(Some(0)).to_array_of_size(num_iterations)?
+        };
+        let band_array = band_array
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .ok_or_else(|| DataFusionError::Internal("Expected Int32Array for band".to_string()))?
+            .clone();
+
+        let nodata_array = if self.with_nodata {
+            args[3]
+                .clone()
+                .cast_to(&arrow_schema::DataType::Float64, None)?
+                .into_array(num_iterations)?
+        } else {
+            ScalarValue::Float64(None).to_array_of_size(num_iterations)?
+        };
+        let nodata_array = nodata_array
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("Expected Float64Array for nodata".to_string())
+            })?
+            .clone();
+
+        let all_touched_array = if self.with_all_touched {
+            args[4]
+                .clone()
+                .cast_to(&arrow_schema::DataType::Boolean, None)?
+                .into_array(num_iterations)?
+        } else {
+            ScalarValue::Boolean(Some(false)).to_array_of_size(num_iterations)?
+        };
+        let all_touched_array = all_touched_array
+            .as_any()
+            .downcast_ref::<arrow_array::BooleanArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("Expected BooleanArray for allTouched".to_string())
+            })?
+            .clone();
+
+        let mut band_iter = band_array.iter();
+        let mut nodata_iter = nodata_array.iter();
+        let mut all_touched_iter = all_touched_array.iter();
 
         // Build output rasters
         let mut builder = RasterBuilder::new(num_iterations);
 
-        for i in 0..num_iterations {
-            let raster_idx = if raster_array.len() == 1 { 0 } else { i };
-            let geom_idx = if geom_array.len() == 1 { 0 } else { i };
+        let exec_arg_types = vec![arg_types[0].clone(), arg_types[geom_arg_idx].clone()];
+        let exec_args = vec![args[0].clone(), args[geom_arg_idx].clone()];
+        let executor =
+            RasterExecutor::new_with_num_iterations(&exec_arg_types, &exec_args, num_iterations);
 
-            if raster_array.is_null(raster_idx) || geom_array.is_null(geom_idx) {
-                builder.append_null()?;
-                continue;
-            }
+        executor.execute_raster_wkb_crs_void(|raster_opt, wkb_opt, _crs| {
+            let band = band_iter.next().unwrap_or(Some(0)).unwrap_or(0);
+            let nodata_value = nodata_iter.next().unwrap_or(None);
+            let all_touched = all_touched_iter
+                .next()
+                .unwrap_or(Some(false))
+                .unwrap_or(false);
 
-            let raster = raster_array.get(raster_idx)?;
-            let geom_wkb = geom_array.value(geom_idx);
-
-            match clip_raster(
-                &raster,
-                geom_wkb,
-                band_num as usize,
-                nodata_value,
-                all_touched,
-            ) {
-                Ok(clipped_data) => {
-                    build_clipped_raster(&mut builder, &raster, &clipped_data)?;
+            let (raster, geom_wkb) = match (raster_opt, wkb_opt) {
+                (Some(r), Some(w)) => (r, w),
+                _ => {
+                    builder.append_null()?;
+                    return Ok(());
                 }
+            };
+
+            match clip_raster(raster, geom_wkb, band as usize, nodata_value, all_touched) {
+                Ok(clipped_data) => build_clipped_raster(&mut builder, raster, &clipped_data)?,
                 Err(e) => {
                     eprintln!("RS_Clip error: {}", e);
                     builder.append_null()?;
                 }
             }
-        }
 
-        let result = Arc::new(builder.finish()?) as ArrayRef;
-        finish_result(args, result)
+            Ok(())
+        })?;
+
+        executor.finish(Arc::new(builder.finish()?))
     }
 }
 
@@ -470,83 +508,6 @@ fn data_type_byte_size(data_type: &BandDataType) -> usize {
     }
 }
 
-/// Helper to get raster array from ColumnarValue
-fn get_raster_array(arg: &ColumnarValue) -> Result<RasterStructArray<'_>> {
-    match arg {
-        ColumnarValue::Array(array) => {
-            let struct_array = array
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("Expected StructArray for raster".to_string())
-                })?;
-            Ok(RasterStructArray::new(struct_array))
-        }
-        ColumnarValue::Scalar(ScalarValue::Struct(arc_struct)) => {
-            Ok(RasterStructArray::new(arc_struct.as_ref()))
-        }
-        _ => Err(DataFusionError::Internal(
-            "Expected raster argument".to_string(),
-        )),
-    }
-}
-
-/// Helper to get binary array from ColumnarValue
-fn get_binary_array(arg: &ColumnarValue) -> Result<Arc<BinaryArray>> {
-    match arg {
-        ColumnarValue::Array(array) => {
-            let binary_array = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("Expected BinaryArray for geometry".to_string())
-                })?;
-            Ok(Arc::new(binary_array.clone()))
-        }
-        ColumnarValue::Scalar(scalar) => {
-            let array = scalar.to_array()?;
-            let binary_array = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("Expected BinaryArray for geometry".to_string())
-                })?;
-            Ok(Arc::new(binary_array.clone()))
-        }
-    }
-}
-
-/// Helper to extract i32 scalar value
-fn extract_i32_scalar(arg: &ColumnarValue) -> Result<Option<i32>> {
-    match arg {
-        ColumnarValue::Scalar(ScalarValue::Int32(v)) => Ok(*v),
-        ColumnarValue::Scalar(ScalarValue::Int64(v)) => Ok(v.map(|x| x as i32)),
-        ColumnarValue::Scalar(ScalarValue::Int16(v)) => Ok(v.map(|x| x as i32)),
-        ColumnarValue::Scalar(ScalarValue::Int8(v)) => Ok(v.map(|x| x as i32)),
-        _ => Ok(None),
-    }
-}
-
-/// Helper to extract f64 scalar value
-fn extract_f64_scalar(arg: &ColumnarValue) -> Result<Option<f64>> {
-    match arg {
-        ColumnarValue::Scalar(ScalarValue::Float64(v)) => Ok(*v),
-        ColumnarValue::Scalar(ScalarValue::Float32(v)) => Ok(v.map(|x| x as f64)),
-        ColumnarValue::Scalar(ScalarValue::Int64(v)) => Ok(v.map(|x| x as f64)),
-        ColumnarValue::Scalar(ScalarValue::Int32(v)) => Ok(v.map(|x| x as f64)),
-        _ => Ok(None),
-    }
-}
-
-/// Helper to extract bool scalar value
-fn extract_bool_scalar(arg: &ColumnarValue) -> Result<Option<bool>> {
-    match arg {
-        ColumnarValue::Scalar(ScalarValue::Boolean(v)) => Ok(*v),
-        _ => Ok(None),
-    }
-}
-
-/// Calculate number of iterations
 fn calc_num_iterations(args: &[ColumnarValue]) -> usize {
     for arg in args {
         if let ColumnarValue::Array(array) = arg {
@@ -556,22 +517,10 @@ fn calc_num_iterations(args: &[ColumnarValue]) -> usize {
     1
 }
 
-/// Convert result to appropriate ColumnarValue
-fn finish_result(args: &[ColumnarValue], out: ArrayRef) -> Result<ColumnarValue> {
-    for arg in args {
-        if let ColumnarValue::Array(_) = arg {
-            return Ok(ColumnarValue::Array(out));
-        }
-    }
-    Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
-        out.as_ref(),
-        0,
-    )?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sedona_raster::array::RasterStructArray;
 
     #[test]
     fn test_rs_clip_basic() {

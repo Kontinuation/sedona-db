@@ -5398,6 +5398,7 @@ dependencies = [
  "sedona-common",
  "sedona-expr",
  "sedona-raster",
+ "sedona-raster-functions",
  "sedona-schema",
  "sedona-testing",
 ]

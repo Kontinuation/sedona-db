@@ -26,7 +26,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{Float64Builder, Int64Builder, StructBuilder};
-use arrow_array::{Array, ArrayRef, BinaryArray, StructArray};
+use arrow_array::{Array, ArrayRef};
+use arrow_array::{BooleanArray, Int32Array};
 use arrow_schema::{DataType, Field, Fields};
 use datafusion_common::error::Result;
 use datafusion_common::{DataFusionError, ScalarValue};
@@ -38,8 +39,9 @@ use gdal::vector::Geometry;
 use gdal::DriverManager;
 
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
-use sedona_raster::array::{RasterRefImpl, RasterStructArray};
+use sedona_raster::array::RasterRefImpl;
 use sedona_raster::traits::RasterRef;
+use sedona_raster_functions::RasterExecutor;
 use sedona_schema::datatypes::SedonaType;
 use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::BandDataType;
@@ -193,23 +195,18 @@ impl SedonaScalarKernel for RsZonalStats {
 
     fn invoke_batch(
         &self,
-        _arg_types: &[SedonaType],
+        arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
         let num_iterations = calc_num_iterations(args);
 
-        // Parse arguments
-        let (geom_arg_idx, stat_arg_idx, band_num, all_touched, exclude_nodata) =
+        let (geom_arg_idx, stat_arg_idx, band_arg_idx, all_touched_arg_idx, exclude_nodata_arg_idx) =
             if self.with_options {
-                let band = extract_i32_scalar(&args[1])?.unwrap_or(1) as usize;
-                let all_touched = extract_bool_scalar(&args[4])?.unwrap_or(false);
-                let exclude_nodata = extract_bool_scalar(&args[5])?.unwrap_or(true);
-                (2, 3, band, all_touched, exclude_nodata)
+                (2, 3, Some(1), Some(4), Some(5))
             } else if self.with_band {
-                let band = extract_i32_scalar(&args[1])?.unwrap_or(1) as usize;
-                (2, 3, band, false, true)
+                (2, 3, Some(1), None, None)
             } else {
-                (1, 2, 1, false, true)
+                (1, 2, None, None, None)
             };
 
         // Get stat type
@@ -219,37 +216,129 @@ impl SedonaScalarKernel for RsZonalStats {
             DataFusionError::Execution(format!("Unknown stat type: {}", stat_str))
         })?;
 
-        // Get raster and geometry arrays
-        let raster_array = get_raster_array(&args[0])?;
-        let geom_array = get_binary_array(&args[geom_arg_idx])?;
-
-        // Build results
         let mut builder = Float64Builder::with_capacity(num_iterations);
 
-        for i in 0..num_iterations {
-            let raster_idx = if raster_array.len() == 1 { 0 } else { i };
-            let geom_idx = if geom_array.len() == 1 { 0 } else { i };
-
-            if raster_array.is_null(raster_idx) || geom_array.is_null(geom_idx) {
-                builder.append_null();
-                continue;
+        // Expand option args to arrays so they can vary row-by-row.
+        let band_array: Int32Array = match band_arg_idx {
+            Some(idx) => {
+                let array = args[idx]
+                    .clone()
+                    .cast_to(&DataType::Int32, None)?
+                    .into_array(num_iterations)?;
+                array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("Expected Int32Array for band".to_string())
+                    })?
+                    .clone()
             }
+            None => {
+                let array = ScalarValue::Int32(Some(1)).to_array_of_size(num_iterations)?;
+                array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("Expected Int32Array for band".to_string())
+                    })?
+                    .clone()
+            }
+        };
 
-            let raster = raster_array.get(raster_idx)?;
-            let geom_wkb = geom_array.value(geom_idx);
+        let all_touched_array: BooleanArray = match all_touched_arg_idx {
+            Some(idx) => {
+                let array = args[idx]
+                    .clone()
+                    .cast_to(&DataType::Boolean, None)?
+                    .into_array(num_iterations)?;
+                array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Expected BooleanArray for allTouched".to_string(),
+                        )
+                    })?
+                    .clone()
+            }
+            None => {
+                let array = ScalarValue::Boolean(Some(false)).to_array_of_size(num_iterations)?;
+                array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Expected BooleanArray for allTouched".to_string(),
+                        )
+                    })?
+                    .clone()
+            }
+        };
 
-            match compute_zonal_stats(&raster, geom_wkb, band_num, all_touched, exclude_nodata) {
-                Ok(stats) => {
-                    builder.append_value(stats.get(stat_type));
+        let exclude_nodata_array: BooleanArray = match exclude_nodata_arg_idx {
+            Some(idx) => {
+                let array = args[idx]
+                    .clone()
+                    .cast_to(&DataType::Boolean, None)?
+                    .into_array(num_iterations)?;
+                array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Expected BooleanArray for excludeNoData".to_string(),
+                        )
+                    })?
+                    .clone()
+            }
+            None => {
+                let array = ScalarValue::Boolean(Some(true)).to_array_of_size(num_iterations)?;
+                array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Expected BooleanArray for excludeNoData".to_string(),
+                        )
+                    })?
+                    .clone()
+            }
+        };
+
+        let mut band_iter = band_array.iter();
+        let mut all_touched_iter = all_touched_array.iter();
+        let mut exclude_nodata_iter = exclude_nodata_array.iter();
+
+        let exec_arg_types = vec![arg_types[0].clone(), arg_types[geom_arg_idx].clone()];
+        let exec_args = vec![args[0].clone(), args[geom_arg_idx].clone()];
+        let executor =
+            RasterExecutor::new_with_num_iterations(&exec_arg_types, &exec_args, num_iterations);
+
+        executor.execute_raster_wkb_crs_void(|raster_opt, wkb_opt, _crs| {
+            let band = band_iter.next().flatten().unwrap_or(1) as usize;
+            let all_touched = all_touched_iter.next().flatten().unwrap_or(false);
+            let exclude_nodata = exclude_nodata_iter.next().flatten().unwrap_or(true);
+
+            let (raster, geom_wkb) = match (raster_opt, wkb_opt) {
+                (Some(r), Some(w)) => (r, w),
+                _ => {
+                    builder.append_null();
+                    return Ok(());
                 }
+            };
+
+            match compute_zonal_stats(raster, geom_wkb, band, all_touched, exclude_nodata) {
+                Ok(stats) => builder.append_value(stats.get(stat_type)),
                 Err(e) => {
                     eprintln!("RS_ZonalStats error: {}", e);
                     builder.append_null();
                 }
             }
-        }
 
-        finish_result(args, Arc::new(builder.finish()))
+            Ok(())
+        })?;
+
+        executor.finish(Arc::new(builder.finish()))
     }
 }
 
@@ -333,114 +422,199 @@ impl SedonaScalarKernel for RsZonalStatsAll {
 
     fn invoke_batch(
         &self,
-        _arg_types: &[SedonaType],
+        arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
         let num_iterations = calc_num_iterations(args);
 
-        // Parse arguments
-        let (geom_arg_idx, band_num, all_touched, exclude_nodata) = if self.with_options {
-            let band = extract_i32_scalar(&args[1])?.unwrap_or(1) as usize;
-            let all_touched = extract_bool_scalar(&args[3])?.unwrap_or(false);
-            let exclude_nodata = extract_bool_scalar(&args[4])?.unwrap_or(true);
-            (2, band, all_touched, exclude_nodata)
-        } else if self.with_band {
-            let band = extract_i32_scalar(&args[1])?.unwrap_or(1) as usize;
-            (2, band, false, true)
-        } else {
-            (1, 1, false, true)
-        };
-
-        // Get raster and geometry arrays
-        let raster_array = get_raster_array(&args[0])?;
-        let geom_array = get_binary_array(&args[geom_arg_idx])?;
+        let (geom_arg_idx, band_arg_idx, all_touched_arg_idx, exclude_nodata_arg_idx) =
+            if self.with_options {
+                (2, Some(1), Some(3), Some(4))
+            } else if self.with_band {
+                (2, Some(1), None, None)
+            } else {
+                (1, None, None, None)
+            };
 
         // Build struct result
         let fields = zonal_stats_struct_fields();
         let mut builder = StructBuilder::from_fields(fields, num_iterations);
 
-        for i in 0..num_iterations {
-            let raster_idx = if raster_array.len() == 1 { 0 } else { i };
-            let geom_idx = if geom_array.len() == 1 { 0 } else { i };
+        // Expand option args to arrays so they can vary row-by-row.
+        let band_array: Int32Array = match band_arg_idx {
+            Some(idx) => {
+                let array = args[idx]
+                    .clone()
+                    .cast_to(&DataType::Int32, None)?
+                    .into_array(num_iterations)?;
+                array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("Expected Int32Array for band".to_string())
+                    })?
+                    .clone()
+            }
+            None => {
+                let array = ScalarValue::Int32(Some(1)).to_array_of_size(num_iterations)?;
+                array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("Expected Int32Array for band".to_string())
+                    })?
+                    .clone()
+            }
+        };
 
-            if raster_array.is_null(raster_idx) || geom_array.is_null(geom_idx) {
-                // Append nulls for all fields
+        let all_touched_array: BooleanArray = match all_touched_arg_idx {
+            Some(idx) => {
+                let array = args[idx]
+                    .clone()
+                    .cast_to(&DataType::Boolean, None)?
+                    .into_array(num_iterations)?;
+                array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Expected BooleanArray for allTouched".to_string(),
+                        )
+                    })?
+                    .clone()
+            }
+            None => {
+                let array = ScalarValue::Boolean(Some(false)).to_array_of_size(num_iterations)?;
+                array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Expected BooleanArray for allTouched".to_string(),
+                        )
+                    })?
+                    .clone()
+            }
+        };
+
+        let exclude_nodata_array: BooleanArray = match exclude_nodata_arg_idx {
+            Some(idx) => {
+                let array = args[idx]
+                    .clone()
+                    .cast_to(&DataType::Boolean, None)?
+                    .into_array(num_iterations)?;
+                array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Expected BooleanArray for excludeNoData".to_string(),
+                        )
+                    })?
+                    .clone()
+            }
+            None => {
+                let array = ScalarValue::Boolean(Some(true)).to_array_of_size(num_iterations)?;
+                array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "Expected BooleanArray for excludeNoData".to_string(),
+                        )
+                    })?
+                    .clone()
+            }
+        };
+
+        let mut band_iter = band_array.iter();
+        let mut all_touched_iter = all_touched_array.iter();
+        let mut exclude_nodata_iter = exclude_nodata_array.iter();
+
+        let append_null = |builder: &mut StructBuilder| {
+            builder
+                .field_builder::<Int64Builder>(0)
+                .unwrap()
+                .append_null();
+            for j in 1..9 {
                 builder
-                    .field_builder::<Int64Builder>(0)
+                    .field_builder::<Float64Builder>(j)
                     .unwrap()
                     .append_null();
-                for j in 1..9 {
-                    builder
-                        .field_builder::<Float64Builder>(j)
-                        .unwrap()
-                        .append_null();
-                }
-                builder.append_null();
-                continue;
             }
+            builder.append_null();
+        };
 
-            let raster = raster_array.get(raster_idx)?;
-            let geom_wkb = geom_array.value(geom_idx);
+        let append_stats = |builder: &mut StructBuilder, stats: ZonalStatistics| {
+            builder
+                .field_builder::<Int64Builder>(0)
+                .unwrap()
+                .append_value(stats.count);
+            builder
+                .field_builder::<Float64Builder>(1)
+                .unwrap()
+                .append_value(stats.sum);
+            builder
+                .field_builder::<Float64Builder>(2)
+                .unwrap()
+                .append_value(stats.mean);
+            builder
+                .field_builder::<Float64Builder>(3)
+                .unwrap()
+                .append_value(stats.median);
+            builder
+                .field_builder::<Float64Builder>(4)
+                .unwrap()
+                .append_value(stats.mode);
+            builder
+                .field_builder::<Float64Builder>(5)
+                .unwrap()
+                .append_value(stats.stddev);
+            builder
+                .field_builder::<Float64Builder>(6)
+                .unwrap()
+                .append_value(stats.variance);
+            builder
+                .field_builder::<Float64Builder>(7)
+                .unwrap()
+                .append_value(stats.min);
+            builder
+                .field_builder::<Float64Builder>(8)
+                .unwrap()
+                .append_value(stats.max);
+            builder.append(true);
+        };
 
-            match compute_zonal_stats(&raster, geom_wkb, band_num, all_touched, exclude_nodata) {
-                Ok(stats) => {
-                    builder
-                        .field_builder::<Int64Builder>(0)
-                        .unwrap()
-                        .append_value(stats.count);
-                    builder
-                        .field_builder::<Float64Builder>(1)
-                        .unwrap()
-                        .append_value(stats.sum);
-                    builder
-                        .field_builder::<Float64Builder>(2)
-                        .unwrap()
-                        .append_value(stats.mean);
-                    builder
-                        .field_builder::<Float64Builder>(3)
-                        .unwrap()
-                        .append_value(stats.median);
-                    builder
-                        .field_builder::<Float64Builder>(4)
-                        .unwrap()
-                        .append_value(stats.mode);
-                    builder
-                        .field_builder::<Float64Builder>(5)
-                        .unwrap()
-                        .append_value(stats.stddev);
-                    builder
-                        .field_builder::<Float64Builder>(6)
-                        .unwrap()
-                        .append_value(stats.variance);
-                    builder
-                        .field_builder::<Float64Builder>(7)
-                        .unwrap()
-                        .append_value(stats.min);
-                    builder
-                        .field_builder::<Float64Builder>(8)
-                        .unwrap()
-                        .append_value(stats.max);
-                    builder.append(true);
+        let exec_arg_types = vec![arg_types[0].clone(), arg_types[geom_arg_idx].clone()];
+        let exec_args = vec![args[0].clone(), args[geom_arg_idx].clone()];
+        let executor =
+            RasterExecutor::new_with_num_iterations(&exec_arg_types, &exec_args, num_iterations);
+
+        executor.execute_raster_wkb_crs_void(|raster_opt, wkb_opt, _crs| {
+            let band = band_iter.next().flatten().unwrap_or(1) as usize;
+            let all_touched = all_touched_iter.next().flatten().unwrap_or(false);
+            let exclude_nodata = exclude_nodata_iter.next().flatten().unwrap_or(true);
+
+            let (raster, geom_wkb) = match (raster_opt, wkb_opt) {
+                (Some(r), Some(w)) => (r, w),
+                _ => {
+                    append_null(&mut builder);
+                    return Ok(());
                 }
+            };
+
+            match compute_zonal_stats(raster, geom_wkb, band, all_touched, exclude_nodata) {
+                Ok(stats) => append_stats(&mut builder, stats),
                 Err(e) => {
                     eprintln!("RS_ZonalStatsAll error: {}", e);
-                    builder
-                        .field_builder::<Int64Builder>(0)
-                        .unwrap()
-                        .append_null();
-                    for j in 1..9 {
-                        builder
-                            .field_builder::<Float64Builder>(j)
-                            .unwrap()
-                            .append_null();
-                    }
-                    builder.append_null();
+                    append_null(&mut builder);
                 }
             }
-        }
 
-        let result = Arc::new(builder.finish()) as ArrayRef;
-        finish_result(args, result)
+            Ok(())
+        })?;
+
+        executor.finish(Arc::new(builder.finish()) as ArrayRef)
     }
 }
 
@@ -741,71 +915,7 @@ fn data_type_byte_size(data_type: &BandDataType) -> usize {
 // Helper Functions
 // =============================================================================
 
-/// Helper to get raster array from ColumnarValue
-fn get_raster_array(arg: &ColumnarValue) -> Result<RasterStructArray<'_>> {
-    match arg {
-        ColumnarValue::Array(array) => {
-            let struct_array = array
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("Expected StructArray for raster".to_string())
-                })?;
-            Ok(RasterStructArray::new(struct_array))
-        }
-        ColumnarValue::Scalar(ScalarValue::Struct(arc_struct)) => {
-            Ok(RasterStructArray::new(arc_struct.as_ref()))
-        }
-        _ => Err(DataFusionError::Internal(
-            "Expected raster argument".to_string(),
-        )),
-    }
-}
-
-/// Helper to get binary array from ColumnarValue
-fn get_binary_array(arg: &ColumnarValue) -> Result<Arc<BinaryArray>> {
-    match arg {
-        ColumnarValue::Array(array) => {
-            let binary_array = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("Expected BinaryArray for geometry".to_string())
-                })?;
-            Ok(Arc::new(binary_array.clone()))
-        }
-        ColumnarValue::Scalar(scalar) => {
-            let array = scalar.to_array()?;
-            let binary_array = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("Expected BinaryArray for geometry".to_string())
-                })?;
-            Ok(Arc::new(binary_array.clone()))
-        }
-    }
-}
-
 /// Helper to extract i32 scalar value
-fn extract_i32_scalar(arg: &ColumnarValue) -> Result<Option<i32>> {
-    match arg {
-        ColumnarValue::Scalar(ScalarValue::Int32(v)) => Ok(*v),
-        ColumnarValue::Scalar(ScalarValue::Int64(v)) => Ok(v.map(|x| x as i32)),
-        ColumnarValue::Scalar(ScalarValue::Int16(v)) => Ok(v.map(|x| x as i32)),
-        ColumnarValue::Scalar(ScalarValue::Int8(v)) => Ok(v.map(|x| x as i32)),
-        _ => Ok(None),
-    }
-}
-
-/// Helper to extract bool scalar value
-fn extract_bool_scalar(arg: &ColumnarValue) -> Result<Option<bool>> {
-    match arg {
-        ColumnarValue::Scalar(ScalarValue::Boolean(v)) => Ok(*v),
-        _ => Ok(None),
-    }
-}
-
 /// Helper to extract string scalar value
 fn extract_string_scalar(arg: &ColumnarValue) -> Result<Option<String>> {
     match arg {
@@ -824,19 +934,6 @@ fn calc_num_iterations(args: &[ColumnarValue]) -> usize {
         }
     }
     1
-}
-
-/// Convert result to appropriate ColumnarValue
-fn finish_result(args: &[ColumnarValue], out: ArrayRef) -> Result<ColumnarValue> {
-    for arg in args {
-        if let ColumnarValue::Array(_) = arg {
-            return Ok(ColumnarValue::Array(out));
-        }
-    }
-    Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
-        out.as_ref(),
-        0,
-    )?))
 }
 
 #[cfg(test)]
@@ -898,6 +995,7 @@ mod tests {
     fn test_rs_zonal_stats_with_test_raster() {
         use crate::rs_from_gdal_raster::RsFromGDALRaster;
         use gdal::vector::Geometry;
+        use sedona_raster::array::RasterStructArray;
 
         let test_file = sedona_testing::data::test_raster("test4.tiff").unwrap();
         let content = std::fs::read(&test_file).unwrap();

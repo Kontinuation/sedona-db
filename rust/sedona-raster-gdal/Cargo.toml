@@ -43,6 +43,7 @@ lru = { workspace = true }
 sedona-common = { workspace = true }
 sedona-expr = { workspace = true }
 sedona-raster = { workspace = true }
+sedona-raster-functions = { workspace = true }
 sedona-schema = { workspace = true }
 
 [dev-dependencies]
