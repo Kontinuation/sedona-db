@@ -37,6 +37,7 @@ arrow-schema = { workspace = true }
 async-trait = { workspace = true }
 datafusion = { workspace = true, default_features = false }
 datafusion-common = { workspace = true }
+datafusion-common-runtime = { workspace = true }
 datafusion-expr = { workspace = true }
 evalexpr = "13"
 futures = { workspace = true }
@@ -48,13 +49,13 @@ sedona-expr = { workspace = true }
 sedona-raster = { workspace = true }
 sedona-raster-functions = { workspace = true }
 sedona-schema = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
 walkdir = "2"
 
 [dev-dependencies]
 criterion = { workspace = true }
 sedona-testing = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [[bench]]
 harness = false

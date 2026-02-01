@@ -4996,6 +4996,7 @@ dependencies = [
  "sedona-geos",
  "sedona-proj",
  "sedona-raster-functions",
+ "sedona-raster-gdal",
  "sedona-s2geography",
  "sedona-schema",
  "sedona-spatial-join",
@@ -5388,10 +5389,14 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
+ "async-trait",
  "criterion",
+ "datafusion",
  "datafusion-common",
+ "datafusion-common-runtime",
  "datafusion-expr",
  "evalexpr",
+ "futures",
  "gdal",
  "gdal-sys",
  "lru",
@@ -5401,6 +5406,9 @@ dependencies = [
  "sedona-raster-functions",
  "sedona-schema",
  "sedona-testing",
+ "tempfile",
+ "tokio",
+ "walkdir",
 ]
 
 [[package]]

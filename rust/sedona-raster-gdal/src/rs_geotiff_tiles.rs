@@ -46,6 +46,7 @@ use datafusion::{
     prelude::Expr,
 };
 use datafusion_common::{DataFusionError, ScalarValue};
+use datafusion_common_runtime::SpawnedTask;
 use futures::StreamExt;
 use gdal::spatial_ref::SpatialRef;
 use gdal::{Dataset, DatasetOptions, GdalOpenFlags};
@@ -235,7 +236,7 @@ impl ExecutionPlan for GeoTiffTilesExec {
         let stream = futures::stream::iter(paths)
             .map(move |path| {
                 let schema = schema_worker.clone();
-                tokio::task::spawn_blocking(move || build_batch_for_file(path, schema))
+                SpawnedTask::spawn_blocking(move || build_batch_for_file(path, schema))
             })
             .buffered(4) // Run up to 4 concurrent GDAL opens/reads
             .map(move |res| match res {
