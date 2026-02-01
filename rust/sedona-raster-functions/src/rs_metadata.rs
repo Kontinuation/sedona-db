@@ -21,7 +21,6 @@ use arrow_array::builder::{Float64Builder, Int32Builder, UInt64Builder};
 use arrow_array::StructArray;
 use arrow_schema::{DataType, Field, Fields};
 use datafusion_common::error::Result;
-use datafusion_common::DataFusionError;
 use datafusion_expr::{
     scalar_doc_sections::DOC_SECTION_OTHER, ColumnarValue, Documentation, Volatility,
 };
@@ -136,25 +135,12 @@ impl SedonaScalarKernel for RsMetaData {
                     // Extract SRID from CRS
                     let srid = match raster.crs() {
                         None => 0i32,
-                        Some(crs_str) => {
-                            let crs = deserialize_crs(crs_str).map_err(|e| {
-                                DataFusionError::Execution(format!(
-                                    "Failed to deserialize CRS: {e}"
-                                ))
-                            })?;
-
-                            match crs {
-                                Some(crs_ref) => {
-                                    let srid_opt = crs_ref.srid().map_err(|e| {
-                                        DataFusionError::Execution(format!(
-                                            "Failed to get SRID from CRS: {e}"
-                                        ))
-                                    })?;
-                                    srid_opt.map(|s| s as i32).unwrap_or(0)
-                                }
-                                None => 0i32,
+                        Some(crs_str) => match deserialize_crs(crs_str) {
+                            Ok(Some(crs_ref)) => {
+                                crs_ref.srid().ok().flatten().map(|s| s as i32).unwrap_or(0)
                             }
-                        }
+                            _ => 0i32,
+                        },
                     };
                     srid_builder.append_value(srid);
 

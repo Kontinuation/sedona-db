@@ -134,25 +134,12 @@ impl SedonaScalarKernel for RsMetaData {
 
                     let srid = match raster.crs() {
                         None => 0i32,
-                        Some(crs_str) => {
-                            let crs = deserialize_crs(crs_str).map_err(|e| {
-                                DataFusionError::Execution(format!(
-                                    "Failed to deserialize CRS: {e}"
-                                ))
-                            })?;
-
-                            match crs {
-                                Some(crs_ref) => {
-                                    let srid_opt = crs_ref.srid().map_err(|e| {
-                                        DataFusionError::Execution(format!(
-                                            "Failed to get SRID from CRS: {e}"
-                                        ))
-                                    })?;
-                                    srid_opt.map(|s| s as i32).unwrap_or(0)
-                                }
-                                None => 0i32,
+                        Some(crs_str) => match deserialize_crs(crs_str) {
+                            Ok(Some(crs_ref)) => {
+                                crs_ref.srid().ok().flatten().map(|s| s as i32).unwrap_or(0)
                             }
-                        }
+                            _ => 0i32,
+                        },
                     };
                     srid_builder.append_value(srid);
 
@@ -196,5 +183,55 @@ impl SedonaScalarKernel for RsMetaData {
         );
 
         executor.finish(Arc::new(struct_array))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::cast::AsArray;
+    use datafusion_expr::ScalarUDF;
+    use sedona_raster::array::RasterStructArray;
+    use sedona_schema::datatypes::RASTER;
+    use sedona_testing::testers::ScalarUdfTester;
+
+    #[test]
+    fn rs_metadata_udf_docs() {
+        let udf: ScalarUDF = rs_metadata_udf().into();
+        assert_eq!(udf.name(), "rs_metadata");
+        assert!(udf.documentation().is_some());
+    }
+
+    #[test]
+    fn rs_metadata_tile_dimensions_from_gdal() {
+        use crate::rs_from_gdal_raster::RsFromGDALRaster;
+
+        let test_file = sedona_testing::data::test_raster("test4.tiff").unwrap();
+        let content = std::fs::read(&test_file).unwrap();
+        let raster_array = RsFromGDALRaster::parse_gdal_raster(&content).unwrap();
+
+        let raster_struct = RasterStructArray::new(&raster_array);
+        let raster = raster_struct.get(0).unwrap();
+        let provider = thread_local_provider().unwrap();
+        let dataset = provider.raster_ref_to_gdal(&raster).unwrap();
+        let band1 = dataset.as_dataset().rasterband(1).unwrap();
+        let (block_x, block_y) = band1.block_size();
+
+        let udf: ScalarUDF = rs_metadata_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER]);
+        let result = tester.invoke_array(Arc::new(raster_array)).unwrap();
+        let struct_array = result.as_struct();
+
+        let tile_width = struct_array
+            .column(10)
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .value(0);
+        let tile_height = struct_array
+            .column(11)
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .value(0);
+
+        assert_eq!(tile_width, block_x.max(1) as u64);
+        assert_eq!(tile_height, block_y.max(1) as u64);
     }
 }
