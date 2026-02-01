@@ -234,4 +234,37 @@ mod tests {
         assert_eq!(tile_width, block_x.max(1) as u64);
         assert_eq!(tile_height, block_y.max(1) as u64);
     }
+
+    #[test]
+    fn rs_metadata_tile_dimensions_golden() {
+        use crate::rs_from_gdal_raster::RsFromGDALRaster;
+
+        let test_file = sedona_testing::data::test_raster("test5.tiff").unwrap();
+        let content = std::fs::read(&test_file).unwrap();
+        let raster_array = RsFromGDALRaster::parse_gdal_raster(&content).unwrap();
+
+        let raster_struct = RasterStructArray::new(&raster_array);
+        let raster = raster_struct.get(0).unwrap();
+        let provider = thread_local_provider().unwrap();
+        let dataset = provider.raster_ref_to_gdal(&raster).unwrap();
+        let band1 = dataset.as_dataset().rasterband(1).unwrap();
+        let (block_x, block_y) = band1.block_size();
+
+        let udf: ScalarUDF = rs_metadata_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER]);
+        let result = tester.invoke_array(Arc::new(raster_array)).unwrap();
+        let struct_array = result.as_struct();
+
+        let tile_width = struct_array
+            .column(10)
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .value(0);
+        let tile_height = struct_array
+            .column(11)
+            .as_primitive::<arrow_array::types::UInt64Type>()
+            .value(0);
+
+        assert_eq!(tile_width, block_x.max(1) as u64);
+        assert_eq!(tile_height, block_y.max(1) as u64);
+    }
 }
