@@ -222,167 +222,174 @@ impl ExecutionPlan for GeoTiffTilesExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        let schema = self.schema.clone();
-        let schema_for_stream = schema.clone();
+        let schema_worker = self.schema.clone();
+        let schema_empty = self.schema.clone();
+        let schema_adapter = self.schema.clone();
         let dir = self.dir.clone();
         let recursive = self.recursive;
 
-        let stream =
-            futures::stream::once(
-                async move { build_tiles_batch(&dir, recursive, schema_for_stream) },
-            )
-            .map(|rb| rb);
+        // Collect paths synchronously
+        let paths = list_geotiffs(&dir, recursive)?;
+
+        // Create a stream that processes files in parallel (bounded)
+        let stream = futures::stream::iter(paths)
+            .map(move |path| {
+                let schema = schema_worker.clone();
+                tokio::task::spawn_blocking(move || build_batch_for_file(path, schema))
+            })
+            .buffered(4) // Run up to 4 concurrent GDAL opens/reads
+            .map(move |res| match res {
+                Ok(Ok(Some(batch))) => Ok(batch),
+                Ok(Ok(None)) => Ok(RecordBatch::new_empty(schema_empty.clone())),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(DataFusionError::Execution(format!("Task failed: {e}"))),
+            });
+        //.try_filter(|batch| futures::future::ready(batch.num_rows() > 0));
+        // Removed filter to avoid trait imports; empty batches are handled by DataFusion.
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
+            schema_adapter,
             Box::pin(stream),
         )))
     }
 }
 
-fn build_tiles_batch(dir: &str, recursive: bool, schema: SchemaRef) -> Result<RecordBatch> {
-    let paths = list_geotiffs(dir, recursive)?;
-    if paths.is_empty() {
-        return Ok(RecordBatch::new_empty(schema));
+fn build_batch_for_file(path: PathBuf, schema: SchemaRef) -> Result<Option<RecordBatch>> {
+    let path_str = path.to_string_lossy().to_string();
+    let ds = open_geotiff(&path_str)?;
+    let (width, height) = ds.raster_size();
+
+    let band_count = ds.raster_count();
+    if band_count == 0 {
+        return Ok(None);
     }
 
-    // Upper bound for preallocation: avoid scanning all metadata twice.
-    // We keep it modest and let builders grow.
-    let mut path_builder = StringBuilder::with_capacity(0, 0);
-    let mut x_builder = UInt32Builder::with_capacity(0);
-    let mut y_builder = UInt32Builder::with_capacity(0);
-    let mut rast_builder = RasterBuilder::new(0);
+    let band1 = ds.rasterband(1).map_err(|e| {
+        DataFusionError::Execution(format!("Failed to get band 1 for {path_str}: {e}"))
+    })?;
+    let (block_x, block_y) = band1.block_size();
+    let block_x = block_x.max(1) as u32;
+    let block_y = block_y.max(1) as u32;
 
-    for path in paths {
-        let path_str = path.to_string_lossy().to_string();
-        let ds = open_geotiff(&path_str)?;
-        let (width, height) = ds.raster_size();
+    let tiles_x = div_ceil_u32(width as u32, block_x);
+    let tiles_y = div_ceil_u32(height as u32, block_y);
 
-        let band_count = ds.raster_count();
-        if band_count == 0 {
-            continue;
-        }
+    let geotransform = ds.geo_transform().map_err(|e| {
+        DataFusionError::Execution(format!("Failed to get geotransform for {path_str}: {e}"))
+    })?;
 
-        let band1 = ds.rasterband(1).map_err(|e| {
-            DataFusionError::Execution(format!("Failed to get band 1 for {path_str}: {e}"))
-        })?;
-        let (block_x, block_y) = band1.block_size();
-        let block_x = block_x.max(1) as u32;
-        let block_y = block_y.max(1) as u32;
+    let base_metadata = RasterMetadata {
+        width: width as u64,
+        height: height as u64,
+        upperleft_x: geotransform[0],
+        upperleft_y: geotransform[3],
+        scale_x: geotransform[1],
+        scale_y: geotransform[5],
+        skew_x: geotransform[2],
+        skew_y: geotransform[4],
+    };
 
-        let tiles_x = div_ceil_u32(width as u32, block_x);
-        let tiles_y = div_ceil_u32(height as u32, block_y);
+    let crs = ds
+        .spatial_ref()
+        .ok()
+        .and_then(|sr: SpatialRef| sr.to_wkt().ok());
 
-        let geotransform = ds.geo_transform().map_err(|e| {
-            DataFusionError::Execution(format!("Failed to get geotransform for {path_str}: {e}"))
-        })?;
+    // Estimate capacity
+    let total_tiles = (tiles_x * tiles_y) as usize;
+    let mut path_builder = StringBuilder::with_capacity(total_tiles, total_tiles * path_str.len());
+    let mut x_builder = UInt32Builder::with_capacity(total_tiles);
+    let mut y_builder = UInt32Builder::with_capacity(total_tiles);
+    let mut rast_builder = RasterBuilder::new(total_tiles);
 
-        let base_metadata = RasterMetadata {
-            width: width as u64,
-            height: height as u64,
-            upperleft_x: geotransform[0],
-            upperleft_y: geotransform[3],
-            scale_x: geotransform[1],
-            scale_y: geotransform[5],
-            skew_x: geotransform[2],
-            skew_y: geotransform[4],
-        };
+    for tile_y in 0..tiles_y {
+        for tile_x in 0..tiles_x {
+            let px = tile_x * block_x;
+            let py = tile_y * block_y;
 
-        let crs = ds
-            .spatial_ref()
-            .ok()
-            .and_then(|sr: SpatialRef| sr.to_wkt().ok());
+            let tw = (width as u32).saturating_sub(px).min(block_x);
+            let th = (height as u32).saturating_sub(py).min(block_y);
+            if tw == 0 || th == 0 {
+                continue;
+            }
 
-        for tile_y in 0..tiles_y {
-            for tile_x in 0..tiles_x {
-                let px = tile_x * block_x;
-                let py = tile_y * block_y;
+            // world coords of this tile's upper-left pixel
+            let tile_ulx = base_metadata.upperleft_x
+                + (px as f64) * base_metadata.scale_x
+                + (py as f64) * base_metadata.skew_x;
+            let tile_uly = base_metadata.upperleft_y
+                + (px as f64) * base_metadata.skew_y
+                + (py as f64) * base_metadata.scale_y;
 
-                let tw = (width as u32).saturating_sub(px).min(block_x);
-                let th = (height as u32).saturating_sub(py).min(block_y);
-                if tw == 0 || th == 0 {
-                    continue;
-                }
+            let tile_metadata = RasterMetadata {
+                width: tw as u64,
+                height: th as u64,
+                upperleft_x: tile_ulx,
+                upperleft_y: tile_uly,
+                scale_x: base_metadata.scale_x,
+                scale_y: base_metadata.scale_y,
+                skew_x: base_metadata.skew_x,
+                skew_y: base_metadata.skew_y,
+            };
 
-                // world coords of this tile's upper-left pixel
-                let tile_ulx = base_metadata.upperleft_x
-                    + (px as f64) * base_metadata.scale_x
-                    + (py as f64) * base_metadata.skew_x;
-                let tile_uly = base_metadata.upperleft_y
-                    + (px as f64) * base_metadata.skew_y
-                    + (py as f64) * base_metadata.scale_y;
+            path_builder.append_value(&path_str);
+            x_builder.append_value(tile_x);
+            y_builder.append_value(tile_y);
 
-                let tile_metadata = RasterMetadata {
-                    width: tw as u64,
-                    height: th as u64,
-                    upperleft_x: tile_ulx,
-                    upperleft_y: tile_uly,
-                    scale_x: base_metadata.scale_x,
-                    scale_y: base_metadata.scale_y,
-                    skew_x: base_metadata.skew_x,
-                    skew_y: base_metadata.skew_y,
+            rast_builder
+                .start_raster(&tile_metadata, crs.as_deref())
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to start raster for {path_str} tile ({tile_x},{tile_y}): {e}"
+                    ))
+                })?;
+
+            for band_idx in 1..=band_count {
+                let band = ds.rasterband(band_idx).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to get band {band_idx} for {path_str}: {e}"
+                    ))
+                })?;
+
+                let gdal_type = band.band_type();
+                let band_data_type = gdal_to_band_data_type(gdal_type).map_err(|_| {
+                    DataFusionError::Execution(format!(
+                        "Unsupported band data type {gdal_type:?} for {path_str} band {band_idx}"
+                    ))
+                })?;
+
+                let nodata_bytes = band
+                    .no_data_value()
+                    .map(|v| nodata_f64_to_bytes(v, &band_data_type));
+
+                let band_metadata = BandMetadata {
+                    nodata_value: nodata_bytes,
+                    storage_type: StorageType::OutDbRef,
+                    datatype: band_data_type,
+                    outdb_url: Some(path_str.clone()),
+                    outdb_band_id: Some(band_idx as u32),
                 };
 
-                path_builder.append_value(&path_str);
-                x_builder.append_value(tile_x);
-                y_builder.append_value(tile_y);
-
-                rast_builder
-                    .start_raster(&tile_metadata, crs.as_deref())
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "Failed to start raster for {path_str} tile ({tile_x},{tile_y}): {e}"
-                        ))
-                    })?;
-
-                for band_idx in 1..=band_count {
-                    let band = ds.rasterband(band_idx).map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "Failed to get band {band_idx} for {path_str}: {e}"
-                        ))
-                    })?;
-
-                    let gdal_type = band.band_type();
-                    let band_data_type = gdal_to_band_data_type(gdal_type).map_err(|_| {
-                        DataFusionError::Execution(format!(
-                            "Unsupported band data type {gdal_type:?} for {path_str} band {band_idx}"
-                        ))
-                    })?;
-
-                    let nodata_bytes = band
-                        .no_data_value()
-                        .map(|v| nodata_f64_to_bytes(v, &band_data_type));
-
-                    let band_metadata = BandMetadata {
-                        nodata_value: nodata_bytes,
-                        storage_type: StorageType::OutDbRef,
-                        datatype: band_data_type,
-                        outdb_url: Some(path_str.clone()),
-                        outdb_band_id: Some(band_idx as u32),
-                    };
-
-                    rast_builder.start_band(band_metadata).map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "Failed to start band {band_idx} for {path_str}: {e}"
-                        ))
-                    })?;
-
-                    // Placeholder for out-db pixel bytes.
-                    rast_builder.band_data_writer().append_value(&[]);
-
-                    rast_builder.finish_band().map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "Failed to finish band {band_idx} for {path_str}: {e}"
-                        ))
-                    })?;
-                }
-
-                rast_builder.finish_raster().map_err(|e| {
+                rast_builder.start_band(band_metadata).map_err(|e| {
                     DataFusionError::Execution(format!(
-                        "Failed to finish raster for {path_str} tile ({tile_x},{tile_y}): {e}"
+                        "Failed to start band {band_idx} for {path_str}: {e}"
+                    ))
+                })?;
+
+                // Placeholder for out-db pixel bytes.
+                rast_builder.band_data_writer().append_value(&[]);
+
+                rast_builder.finish_band().map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to finish band {band_idx} for {path_str}: {e}"
                     ))
                 })?;
             }
+
+            rast_builder.finish_raster().map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to finish raster for {path_str} tile ({tile_x},{tile_y}): {e}"
+                ))
+            })?;
         }
     }
 
@@ -395,8 +402,10 @@ fn build_tiles_batch(dir: &str, recursive: bool, schema: SchemaRef) -> Result<Re
     let x_array: ArrayRef = Arc::new(x_builder.finish());
     let y_array: ArrayRef = Arc::new(y_builder.finish());
 
-    RecordBatch::try_new(schema, vec![path_array, x_array, y_array, rast_array])
-        .map_err(|e| DataFusionError::External(Box::new(e)))
+    let batch = RecordBatch::try_new(schema, vec![path_array, x_array, y_array, rast_array])
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    Ok(Some(batch))
 }
 
 fn list_geotiffs(dir: &str, recursive: bool) -> Result<Vec<PathBuf>> {
@@ -499,7 +508,10 @@ mod tests {
             .expect("provider created");
 
         // Directly call the batch builder to validate schema + non-empty output.
-        let batch = build_tiles_batch(base.to_str().unwrap(), false, provider.schema()).unwrap();
+        let batch = build_batch_for_file(dst, provider.schema())
+            .expect("build success")
+            .expect("batch present");
+
         assert_eq!(batch.schema().fields().len(), 4);
         assert_eq!(batch.num_columns(), 4);
         // For a 10x10 raster, any reasonable tiling should produce at least one tile.
