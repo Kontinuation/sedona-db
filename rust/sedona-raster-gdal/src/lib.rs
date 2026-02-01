@@ -36,6 +36,7 @@ pub mod rs_as_raster;
 pub mod rs_clip;
 pub mod rs_from_gdal_raster;
 pub mod rs_from_path;
+pub mod rs_geotiff_tiles;
 pub mod rs_map_algebra;
 pub mod rs_polygonize;
 pub mod rs_value;
@@ -63,6 +64,9 @@ pub use rs_map_algebra::rs_map_algebra_udf;
 pub use rs_polygonize::rs_polygonize_udf;
 pub use rs_value::rs_value_udf;
 pub use rs_zonal_stats::{rs_zonal_stats_all_udf, rs_zonal_stats_udf, StatType, ZonalStatistics};
+
+// Re-export UDTF constructors
+pub use rs_geotiff_tiles::rs_geotiff_tiles_udtf;
 
 /// Returns all GDAL-based raster UDFs
 pub fn all_gdal_udfs() -> Vec<datafusion_expr::ScalarUDF> {

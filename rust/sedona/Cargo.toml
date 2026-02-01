@@ -42,6 +42,7 @@ http = ["object_store/http"]
 proj = ["sedona-proj/proj-sys"]
 spatial-join = ["dep:sedona-spatial-join"]
 s2geography = ["dep:sedona-s2geography"]
+raster-gdal = ["dep:sedona-raster-gdal"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -75,6 +76,7 @@ sedona-geoparquet = { workspace = true }
 sedona-geos = { workspace = true, optional = true }
 sedona-proj = { workspace = true }
 sedona-raster-functions = { workspace = true }
+sedona-raster-gdal = { workspace = true, optional = true }
 sedona-schema = { workspace = true }
 sedona-spatial-join = { workspace = true, optional = true }
 sedona-s2geography = { workspace = true, optional = true }

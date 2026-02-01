@@ -131,6 +131,13 @@ impl SedonaContext {
             sedona_raster_functions::rs_tile_explode::rs_tile_explode_udtf(),
         );
 
+        // Register GDAL-backed raster table functions (optional)
+        #[cfg(feature = "raster-gdal")]
+        out.ctx.register_udtf(
+            "rs_geotiff_tiles",
+            sedona_raster_gdal::rs_geotiff_tiles_udtf(),
+        );
+
         // Always register default function set
         out.register_function_set(sedona_functions::register::default_function_set());
 
