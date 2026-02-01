@@ -138,6 +138,11 @@ impl SedonaContext {
             sedona_raster_gdal::rs_geotiff_tiles_udtf(),
         );
 
+        #[cfg(feature = "raster-gdal")]
+        for udf in sedona_raster_gdal::all_gdal_udfs() {
+            out.ctx.register_udf(udf);
+        }
+
         // Always register default function set
         out.register_function_set(sedona_functions::register::default_function_set());
 

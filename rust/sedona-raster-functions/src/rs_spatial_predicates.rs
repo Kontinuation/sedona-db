@@ -339,39 +339,26 @@ fn evaluate_predicate_with_crs<Op: tg::BinaryPredicate>(
     wkb_b: &[u8],
     crs_b: Option<&str>,
 ) -> Result<bool> {
-    // Normalize CRS: None -> WGS84
     let crs_a_normalized = crs_a.unwrap_or(WGS84_CRS);
     let crs_b_normalized = crs_b.unwrap_or(WGS84_CRS);
 
-    // Check if CRSs are the same (simple string comparison)
-    // This handles common cases like "EPSG:4326" == "EPSG:4326"
-    let same_crs = are_crs_equivalent(crs_a_normalized, crs_b_normalized);
-
-    if same_crs {
-        // Same CRS - compare directly
-        evaluate_predicate::<Op>(wkb_a, wkb_b)
-    } else {
-        // Different CRS - for now, we do NOT transform (transformation requires sedona-proj)
-        // Instead, we issue a warning and compare directly
-        // In a full implementation, we would:
-        // 1. Transform wkb_a from crs_a to WGS84
-        // 2. Transform wkb_b from crs_b to WGS84
-        // 3. Compare the transformed geometries
-
-        // For now, just compare directly (this is a limitation)
-        // TODO: Add coordinate transformation support via sedona-proj
-        evaluate_predicate::<Op>(wkb_a, wkb_b)
+    if are_crs_equivalent(crs_a_normalized, crs_b_normalized) {
+        return evaluate_predicate::<Op>(wkb_a, wkb_b);
     }
+
+    let wkb_a =
+        crate::crs_utils::transform_wkb_to_crs(wkb_a, Some(crs_a_normalized), Some(WGS84_CRS))?;
+    let wkb_b =
+        crate::crs_utils::transform_wkb_to_crs(wkb_b, Some(crs_b_normalized), Some(WGS84_CRS))?;
+    evaluate_predicate::<Op>(&wkb_a, &wkb_b)
 }
 
 /// Check if two CRS identifiers are equivalent
 fn are_crs_equivalent(crs_a: &str, crs_b: &str) -> bool {
-    // Simple string comparison
     if crs_a == crs_b {
         return true;
     }
 
-    // Check for WGS84 equivalents
     let wgs84_codes = ["EPSG:4326", "OGC:CRS84", "CRS84", "WGS84"];
     let a_is_wgs84 = wgs84_codes.iter().any(|c| crs_a.eq_ignore_ascii_case(c));
     let b_is_wgs84 = wgs84_codes.iter().any(|c| crs_b.eq_ignore_ascii_case(c));
@@ -414,12 +401,24 @@ mod tests {
     use arrow_array::{create_array, ArrayRef};
     use datafusion_expr::ScalarUDF;
     use rstest::rstest;
+    use sedona_schema::datatypes::Edges;
     use sedona_schema::datatypes::RASTER;
     use sedona_schema::datatypes::WKB_GEOMETRY;
     use sedona_testing::compare::assert_array_equal;
     use sedona_testing::create::create_array as create_geom_array;
+    use sedona_testing::create::make_wkb;
     use sedona_testing::rasters::generate_test_rasters;
     use sedona_testing::testers::ScalarUdfTester;
+
+    fn web_mercator_from_lonlat(lon: f64, lat: f64) -> (f64, f64) {
+        let radius = 6378137.0_f64;
+        let x = lon.to_radians() * radius;
+        let y = (std::f64::consts::PI / 4.0 + lat.to_radians() / 2.0)
+            .tan()
+            .ln()
+            * radius;
+        (x, y)
+    }
 
     #[test]
     fn rs_intersects_udf_docs() {
@@ -463,6 +462,39 @@ mod tests {
             ],
             &WKB_GEOMETRY,
         );
+
+        let expected: ArrayRef = create_array!(Boolean, [None, Some(true), Some(false)]);
+
+        let result = tester
+            .invoke_arrays(vec![Arc::new(rasters), geoms])
+            .unwrap();
+
+        assert_array_equal(&result, &expected);
+    }
+
+    #[rstest]
+    fn rs_intersects_raster_geom_crs_mismatch() {
+        let probe = make_wkb("POINT (0 0)");
+        if let Err(err) =
+            crate::crs_utils::transform_wkb_to_crs(&probe, Some("EPSG:4326"), Some("EPSG:3857"))
+        {
+            let message = err.to_string();
+            if message.contains("proj-sys") {
+                return;
+            }
+            panic!("Unexpected CRS transform error: {message}");
+        }
+
+        let udf = rs_intersects_udf();
+        let geom_type = SedonaType::Wkb(Edges::Planar, deserialize_crs("EPSG:3857").unwrap());
+        let tester = ScalarUdfTester::new(udf.into(), vec![RASTER, geom_type.clone()]);
+
+        let rasters = generate_test_rasters(3, Some(0)).unwrap();
+        let (x, y) = web_mercator_from_lonlat(2.15, 2.75);
+        let point_3857 = format!("POINT ({} {})", x, y);
+        let wkt_values: [Option<&str>; 3] = [None, Some(point_3857.as_str()), Some("POINT (0 0)")];
+
+        let geoms = create_geom_array(&wkt_values, &geom_type);
 
         let expected: ArrayRef = create_array!(Boolean, [None, Some(true), Some(false)]);
 

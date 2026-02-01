@@ -389,7 +389,7 @@ pub fn configure_global_proj_engine(builder: ProjCrsEngineBuilder) -> Result<()>
 
 /// Do something with the global thread-local PROJ engine, creating it if it has not
 /// already been created.
-pub(crate) fn with_global_proj_engine(
+pub fn with_global_proj_engine(
     mut func: impl FnMut(&CachingCrsEngine<ProjCrsEngine>) -> Result<()>,
 ) -> Result<()> {
     PROJ_ENGINE.with(|engine_cell| {

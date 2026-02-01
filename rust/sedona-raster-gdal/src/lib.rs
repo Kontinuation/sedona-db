@@ -31,6 +31,7 @@
 //! - `RS_AsGeoTiff`: Export raster as GeoTiff binary
 
 // dataset module removed; utilities moved into `gdal_common` and `gdal_dataset_provider`
+mod crs_utils;
 pub mod rs_as_geotiff;
 pub mod rs_as_raster;
 pub mod rs_clip;
@@ -38,6 +39,7 @@ pub mod rs_from_gdal_raster;
 pub mod rs_from_path;
 pub mod rs_geotiff_tiles;
 pub mod rs_map_algebra;
+pub mod rs_metadata;
 pub mod rs_polygonize;
 pub mod rs_value;
 pub mod rs_zonal_stats;
@@ -61,6 +63,7 @@ pub use rs_clip::rs_clip_udf;
 pub use rs_from_gdal_raster::rs_from_gdal_raster_udf;
 pub use rs_from_path::rs_from_path_udf;
 pub use rs_map_algebra::rs_map_algebra_udf;
+pub use rs_metadata::rs_metadata_udf;
 pub use rs_polygonize::rs_polygonize_udf;
 pub use rs_value::rs_value_udf;
 pub use rs_zonal_stats::{rs_zonal_stats_all_udf, rs_zonal_stats_udf, StatType, ZonalStatistics};
@@ -81,5 +84,6 @@ pub fn all_gdal_udfs() -> Vec<datafusion_expr::ScalarUDF> {
         rs_zonal_stats_udf().into(),
         rs_zonal_stats_all_udf().into(),
         rs_map_algebra_udf().into(),
+        rs_metadata_udf().into(),
     ]
 }

@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use arrow_array::builder::Float64Builder;
-use arrow_array::{Array, ArrayRef, BinaryArray, Int32Array, StructArray};
+use arrow_array::{ArrayRef, Int32Array, StructArray};
 use arrow_schema::DataType;
 use datafusion_common::error::Result;
 use datafusion_common::{DataFusionError, ScalarValue};
@@ -36,9 +36,12 @@ use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_raster::affine_transformation::to_raster_coordinate;
 use sedona_raster::array::{RasterRefImpl, RasterStructArray};
 use sedona_raster::traits::RasterRef;
+use sedona_raster_functions::RasterExecutor;
 use sedona_schema::datatypes::SedonaType;
 use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::BandDataType;
+
+use crate::crs_utils;
 
 /// RS_Value() scalar UDF implementation
 ///
@@ -98,45 +101,59 @@ impl SedonaScalarKernel for RsValuePoint {
 
     fn invoke_batch(
         &self,
-        _arg_types: &[SedonaType],
+        arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
         let num_iterations = calc_num_iterations(args);
         let mut builder = Float64Builder::with_capacity(num_iterations);
 
-        // Get the band number (1-based, defaults to 1)
-        let band_num = if self.with_band {
-            extract_i32_scalar(&args[2])?.unwrap_or(1) as usize
+        let band_array = if self.with_band {
+            args[2]
+                .clone()
+                .cast_to(&DataType::Int32, None)?
+                .into_array(num_iterations)?
         } else {
-            1
+            ScalarValue::Int32(Some(1)).to_array_of_size(num_iterations)?
         };
+        let band_array = band_array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| DataFusionError::Internal("Expected Int32Array for band".to_string()))?
+            .clone();
+        let mut band_iter = band_array.iter();
 
-        // Get raster array
-        let raster_array = get_raster_array(&args[0])?;
+        let exec_arg_types = vec![arg_types[0].clone(), arg_types[1].clone()];
+        let exec_args = vec![args[0].clone(), args[1].clone()];
+        let executor =
+            RasterExecutor::new_with_num_iterations(&exec_arg_types, &exec_args, num_iterations);
 
-        // Get point geometry array
-        let point_array = get_binary_array(&args[1])?;
+        executor.execute_raster_wkb_crs_void(|raster_opt, wkb_opt, maybe_point_crs| {
+            let band_num = band_iter.next().flatten().unwrap_or(1) as usize;
+            let (raster, point_wkb) = match (raster_opt, wkb_opt) {
+                (Some(raster), Some(point_wkb)) => (raster, point_wkb),
+                _ => {
+                    builder.append_null();
+                    return Ok(());
+                }
+            };
 
-        for i in 0..num_iterations {
-            let raster_idx = if raster_array.len() == 1 { 0 } else { i };
-            let point_idx = if point_array.len() == 1 { 0 } else { i };
+            let raster_crs = raster.crs();
+            let point_wkb = if crs_utils::crs_equivalent(raster_crs, maybe_point_crs)? {
+                point_wkb.to_vec()
+            } else {
+                crs_utils::transform_wkb_to_crs(point_wkb, maybe_point_crs, raster_crs)?
+            };
 
-            if raster_array.is_null(raster_idx) || point_array.is_null(point_idx) {
-                builder.append_null();
-                continue;
-            }
-
-            let raster = raster_array.get(raster_idx)?;
-            let point_wkb = point_array.value(point_idx);
-
-            match get_value_at_point(&raster, point_wkb, band_num) {
+            match get_value_at_point(raster, &point_wkb, band_num) {
                 Ok(Some(value)) => builder.append_value(value),
                 Ok(None) => builder.append_null(),
                 Err(_) => builder.append_null(),
             }
-        }
 
-        finish_result(args, Arc::new(builder.finish()))
+            Ok(())
+        })?;
+
+        executor.finish(Arc::new(builder.finish()))
     }
 }
 
@@ -205,9 +222,6 @@ fn get_value_at_point(
 ) -> Result<Option<f64>> {
     // Parse point from WKB
     let (x, y) = parse_point_from_wkb(point_wkb)?;
-
-    // TODO: CRS transformation if point CRS differs from raster CRS
-    // For now, we assume the point is already in the raster's CRS
 
     // Convert world coordinates to raster coordinates
     let (col, row) = to_raster_coordinate(raster, x, y)
@@ -473,31 +487,6 @@ fn get_raster_array(arg: &ColumnarValue) -> Result<RasterStructArray<'_>> {
     }
 }
 
-/// Helper to get binary array from ColumnarValue
-fn get_binary_array(arg: &ColumnarValue) -> Result<Arc<BinaryArray>> {
-    match arg {
-        ColumnarValue::Array(array) => {
-            let binary_array = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("Expected BinaryArray for geometry".to_string())
-                })?;
-            Ok(Arc::new(binary_array.clone()))
-        }
-        ColumnarValue::Scalar(scalar) => {
-            let array = scalar.to_array()?;
-            let binary_array = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("Expected BinaryArray for geometry".to_string())
-                })?;
-            Ok(Arc::new(binary_array.clone()))
-        }
-    }
-}
-
 /// Helper to extract i32 scalar value
 fn extract_i32_scalar(arg: &ColumnarValue) -> Result<Option<i32>> {
     match arg {
@@ -546,6 +535,21 @@ fn finish_result(args: &[ColumnarValue], out: ArrayRef) -> Result<ColumnarValue>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sedona_raster::affine_transformation::to_world_coordinate;
+    use sedona_raster::array::RasterStructArray;
+    use sedona_schema::crs::deserialize_crs;
+    use sedona_schema::datatypes::{Edges, RASTER};
+    use sedona_testing::create::make_wkb;
+
+    fn web_mercator_from_lonlat(lon: f64, lat: f64) -> (f64, f64) {
+        let radius = 6378137.0_f64;
+        let x = lon.to_radians() * radius;
+        let y = (std::f64::consts::PI / 4.0 + lat.to_radians() / 2.0)
+            .tan()
+            .ln()
+            * radius;
+        (x, y)
+    }
 
     #[test]
     fn test_parse_point_from_wkb() {
@@ -647,5 +651,78 @@ mod tests {
             }
             _ => panic!("Expected Float64 scalar result"),
         }
+    }
+
+    #[test]
+    fn test_rs_value_point_crs_transform() {
+        use crate::rs_from_gdal_raster::RsFromGDALRaster;
+
+        let probe = make_wkb("POINT (0 0)");
+        if let Err(err) =
+            crate::crs_utils::transform_wkb_to_crs(&probe, Some("EPSG:4326"), Some("EPSG:3857"))
+        {
+            let message = err.to_string();
+            if message.contains("proj-sys") {
+                return;
+            }
+            panic!("Unexpected CRS transform error: {message}");
+        }
+
+        let test_file = sedona_testing::data::test_raster("test4.tiff").unwrap();
+        let content = std::fs::read(&test_file).unwrap();
+        let raster_array = RsFromGDALRaster::parse_gdal_raster(&content).unwrap();
+
+        let raster_struct = RasterStructArray::new(&raster_array);
+        let raster = raster_struct.get(0).unwrap();
+        let width = raster.metadata().width() as i64;
+        let height = raster.metadata().height() as i64;
+        let col = width / 2;
+        let row = height / 2;
+        let (lon, lat) = to_world_coordinate(&raster, col, row);
+
+        let point_wkt = format!("POINT ({} {})", lon, lat);
+        let point_wkb = make_wkb(&point_wkt);
+        let (x_merc, y_merc) = web_mercator_from_lonlat(lon, lat);
+        let point_merc_wkt = format!("POINT ({} {})", x_merc, y_merc);
+        let point_merc_wkb = make_wkb(&point_merc_wkt);
+
+        let raster_scalar = ColumnarValue::Scalar(ScalarValue::Struct(Arc::new(raster_array)));
+
+        let geom_type_4326 = SedonaType::Wkb(Edges::Planar, deserialize_crs("EPSG:4326").unwrap());
+        let geom_type_3857 = SedonaType::Wkb(Edges::Planar, deserialize_crs("EPSG:3857").unwrap());
+
+        let kernel = RsValuePoint { with_band: false };
+
+        let result_4326 = kernel
+            .invoke_batch(
+                &vec![RASTER, geom_type_4326],
+                &vec![
+                    raster_scalar.clone(),
+                    ColumnarValue::Scalar(ScalarValue::Binary(Some(point_wkb))),
+                ],
+            )
+            .unwrap();
+
+        let value_4326 = match result_4326 {
+            ColumnarValue::Scalar(ScalarValue::Float64(Some(value))) => value,
+            _ => panic!("Expected Float64 scalar result"),
+        };
+
+        let result_3857 = kernel
+            .invoke_batch(
+                &vec![RASTER, geom_type_3857],
+                &vec![
+                    raster_scalar,
+                    ColumnarValue::Scalar(ScalarValue::Binary(Some(point_merc_wkb))),
+                ],
+            )
+            .unwrap();
+
+        let value_3857 = match result_3857 {
+            ColumnarValue::Scalar(ScalarValue::Float64(Some(value))) => value,
+            _ => panic!("Expected Float64 scalar result"),
+        };
+
+        assert_eq!(value_4326, value_3857);
     }
 }

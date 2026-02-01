@@ -46,9 +46,12 @@ gdal-sys = { workspace = true }
 lru = { workspace = true }
 sedona-common = { workspace = true }
 sedona-expr = { workspace = true }
+sedona-geometry = { workspace = true }
 sedona-raster = { workspace = true }
 sedona-raster-functions = { workspace = true }
 sedona-schema = { workspace = true }
+sedona-proj = { workspace = true }
+wkb = { workspace = true }
 walkdir = "2"
 
 [dev-dependencies]

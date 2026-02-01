@@ -206,7 +206,7 @@ impl SedonaScalarKernel for RsClip {
         let executor =
             RasterExecutor::new_with_num_iterations(&exec_arg_types, &exec_args, num_iterations);
 
-        executor.execute_raster_wkb_crs_void(|raster_opt, wkb_opt, _crs| {
+        executor.execute_raster_wkb_crs_void(|raster_opt, wkb_opt, geom_crs| {
             let band = band_iter.next().unwrap_or(Some(0)).unwrap_or(0);
             let nodata_value = nodata_iter.next().unwrap_or(None);
             let all_touched = all_touched_iter
@@ -222,7 +222,14 @@ impl SedonaScalarKernel for RsClip {
                 }
             };
 
-            match clip_raster(raster, geom_wkb, band as usize, nodata_value, all_touched) {
+            let raster_crs = raster.crs();
+            let geom_wkb = if crate::crs_utils::crs_equivalent(raster_crs, geom_crs)? {
+                geom_wkb.to_vec()
+            } else {
+                crate::crs_utils::transform_wkb_to_crs(geom_wkb, geom_crs, raster_crs)?
+            };
+
+            match clip_raster(raster, &geom_wkb, band as usize, nodata_value, all_touched) {
                 Ok(clipped_data) => build_clipped_raster(&mut builder, raster, &clipped_data)?,
                 Err(e) => {
                     eprintln!("RS_Clip error: {}", e);
@@ -521,6 +528,14 @@ fn calc_num_iterations(args: &[ColumnarValue]) -> usize {
 mod tests {
     use super::*;
     use sedona_raster::array::RasterStructArray;
+    use sedona_schema::crs::deserialize_crs;
+    use sedona_schema::datatypes::Edges;
+
+    fn web_mercator_from_lonlat(lon: f64, lat: f64) -> (f64, f64) {
+        let x = lon * 20037508.34 / 180.0;
+        let y = (90.0 + lat).to_radians().tan().ln() * 20037508.34 / std::f64::consts::PI;
+        (x, y)
+    }
 
     #[test]
     fn test_rs_clip_basic() {
@@ -568,6 +583,113 @@ mod tests {
             original_band.data().len(),
             "Clipped band should have same size as original"
         );
+    }
+
+    #[test]
+    fn test_rs_clip_crs_mismatch() {
+        use crate::rs_from_gdal_raster::RsFromGDALRaster;
+        use sedona_expr::scalar_udf::SedonaScalarKernel;
+
+        let probe = sedona_testing::create::make_wkb("POINT (0 0)");
+        if let Err(err) =
+            crate::crs_utils::transform_wkb_to_crs(&probe, Some("EPSG:4326"), Some("EPSG:3857"))
+        {
+            let message = err.to_string();
+            if message.contains("proj-sys") {
+                return;
+            }
+            panic!("Unexpected CRS transform error: {message}");
+        }
+
+        let test_file = sedona_testing::data::test_raster("test4.tiff").unwrap();
+        let content = std::fs::read(&test_file).unwrap();
+        let raster_array = RsFromGDALRaster::parse_gdal_raster(&content).unwrap();
+
+        let raster_struct = RasterStructArray::new(&raster_array);
+        let raster = raster_struct.get(0).unwrap();
+
+        let metadata = raster.metadata();
+        let min_x = metadata.upper_left_x();
+        let max_y = metadata.upper_left_y();
+        let max_x = min_x + (metadata.width() as f64 * metadata.scale_x()) / 2.0;
+        let min_y = max_y + (metadata.height() as f64 * metadata.scale_y()) / 2.0;
+
+        let wkt = format!(
+            "POLYGON(({} {}, {} {}, {} {}, {} {}, {} {}))",
+            min_x, min_y, max_x, min_y, max_x, max_y, min_x, max_y, min_x, min_y
+        );
+        let geometry = Geometry::from_wkt(&wkt).unwrap();
+        let geom_wkb = geometry.wkb().unwrap();
+
+        let (min_x_merc, min_y_merc) = web_mercator_from_lonlat(min_x, min_y);
+        let (max_x_merc, max_y_merc) = web_mercator_from_lonlat(max_x, max_y);
+        let wkt_merc = format!(
+            "POLYGON(({} {}, {} {}, {} {}, {} {}, {} {}))",
+            min_x_merc,
+            min_y_merc,
+            max_x_merc,
+            min_y_merc,
+            max_x_merc,
+            max_y_merc,
+            min_x_merc,
+            max_y_merc,
+            min_x_merc,
+            min_y_merc
+        );
+        let geometry_merc = Geometry::from_wkt(&wkt_merc).unwrap();
+        let geom_wkb_merc = geometry_merc.wkb().unwrap();
+
+        let kernel = RsClip {
+            with_band: false,
+            with_nodata: false,
+            with_all_touched: false,
+        };
+
+        let raster_scalar = ColumnarValue::Scalar(ScalarValue::Struct(Arc::new(raster_array)));
+        let geom_type_4326 = SedonaType::Wkb(Edges::Planar, deserialize_crs("EPSG:4326").unwrap());
+        let geom_type_3857 = SedonaType::Wkb(Edges::Planar, deserialize_crs("EPSG:3857").unwrap());
+
+        let result_4326 = kernel
+            .invoke_batch(
+                &vec![RASTER, geom_type_4326],
+                &vec![
+                    raster_scalar.clone(),
+                    ColumnarValue::Scalar(ScalarValue::Binary(Some(geom_wkb))),
+                ],
+            )
+            .unwrap();
+
+        let result_3857 = kernel
+            .invoke_batch(
+                &vec![RASTER, geom_type_3857],
+                &vec![
+                    raster_scalar,
+                    ColumnarValue::Scalar(ScalarValue::Binary(Some(geom_wkb_merc))),
+                ],
+            )
+            .unwrap();
+
+        let band_data_4326 = match result_4326 {
+            ColumnarValue::Scalar(ScalarValue::Struct(struct_array)) => {
+                let array = RasterStructArray::new(struct_array.as_ref());
+                let raster = array.get(0).unwrap();
+                let data = raster.bands().band(1).unwrap().data().to_vec();
+                data
+            }
+            _ => panic!("Expected raster scalar result"),
+        };
+
+        let band_data_3857 = match result_3857 {
+            ColumnarValue::Scalar(ScalarValue::Struct(struct_array)) => {
+                let array = RasterStructArray::new(struct_array.as_ref());
+                let raster = array.get(0).unwrap();
+                let data = raster.bands().band(1).unwrap().data().to_vec();
+                data
+            }
+            _ => panic!("Expected raster scalar result"),
+        };
+
+        assert_eq!(band_data_4326, band_data_3857);
     }
 
     #[test]

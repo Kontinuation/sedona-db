@@ -314,7 +314,7 @@ impl SedonaScalarKernel for RsZonalStats {
         let executor =
             RasterExecutor::new_with_num_iterations(&exec_arg_types, &exec_args, num_iterations);
 
-        executor.execute_raster_wkb_crs_void(|raster_opt, wkb_opt, _crs| {
+        executor.execute_raster_wkb_crs_void(|raster_opt, wkb_opt, geom_crs| {
             let band = band_iter.next().flatten().unwrap_or(1) as usize;
             let all_touched = all_touched_iter.next().flatten().unwrap_or(false);
             let exclude_nodata = exclude_nodata_iter.next().flatten().unwrap_or(true);
@@ -327,7 +327,14 @@ impl SedonaScalarKernel for RsZonalStats {
                 }
             };
 
-            match compute_zonal_stats(raster, geom_wkb, band, all_touched, exclude_nodata) {
+            let raster_crs = raster.crs();
+            let geom_wkb = if crate::crs_utils::crs_equivalent(raster_crs, geom_crs)? {
+                geom_wkb.to_vec()
+            } else {
+                crate::crs_utils::transform_wkb_to_crs(geom_wkb, geom_crs, raster_crs)?
+            };
+
+            match compute_zonal_stats(raster, &geom_wkb, band, all_touched, exclude_nodata) {
                 Ok(stats) => builder.append_value(stats.get(stat_type)),
                 Err(e) => {
                     eprintln!("RS_ZonalStats error: {}", e);
@@ -590,7 +597,7 @@ impl SedonaScalarKernel for RsZonalStatsAll {
         let executor =
             RasterExecutor::new_with_num_iterations(&exec_arg_types, &exec_args, num_iterations);
 
-        executor.execute_raster_wkb_crs_void(|raster_opt, wkb_opt, _crs| {
+        executor.execute_raster_wkb_crs_void(|raster_opt, wkb_opt, geom_crs| {
             let band = band_iter.next().flatten().unwrap_or(1) as usize;
             let all_touched = all_touched_iter.next().flatten().unwrap_or(false);
             let exclude_nodata = exclude_nodata_iter.next().flatten().unwrap_or(true);
@@ -603,7 +610,14 @@ impl SedonaScalarKernel for RsZonalStatsAll {
                 }
             };
 
-            match compute_zonal_stats(raster, geom_wkb, band, all_touched, exclude_nodata) {
+            let raster_crs = raster.crs();
+            let geom_wkb = if crate::crs_utils::crs_equivalent(raster_crs, geom_crs)? {
+                geom_wkb.to_vec()
+            } else {
+                crate::crs_utils::transform_wkb_to_crs(geom_wkb, geom_crs, raster_crs)?
+            };
+
+            match compute_zonal_stats(raster, &geom_wkb, band, all_touched, exclude_nodata) {
                 Ok(stats) => append_stats(&mut builder, stats),
                 Err(e) => {
                     eprintln!("RS_ZonalStatsAll error: {}", e);
@@ -939,6 +953,22 @@ fn calc_num_iterations(args: &[ColumnarValue]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sedona_raster::affine_transformation::to_world_coordinate;
+    use sedona_raster::array::RasterStructArray;
+    use sedona_schema::crs::deserialize_crs;
+    use sedona_schema::datatypes::Edges;
+    use sedona_schema::datatypes::RASTER;
+    use sedona_testing::create::make_wkb;
+
+    fn web_mercator_from_lonlat(lon: f64, lat: f64) -> (f64, f64) {
+        let radius = 6378137.0_f64;
+        let x = lon.to_radians() * radius;
+        let y = (std::f64::consts::PI / 4.0 + lat.to_radians() / 2.0)
+            .tan()
+            .ln()
+            * radius;
+        (x, y)
+    }
 
     #[test]
     fn test_stat_type_from_str() {
@@ -1033,5 +1063,84 @@ mod tests {
             stats.min <= stats.mean && stats.mean <= stats.max,
             "Mean should be between min and max"
         );
+    }
+
+    #[test]
+    fn test_rs_zonal_stats_crs_mismatch() {
+        use crate::rs_from_gdal_raster::RsFromGDALRaster;
+        use sedona_expr::scalar_udf::SedonaScalarKernel;
+
+        let probe = make_wkb("POINT (0 0)");
+        if let Err(err) =
+            crate::crs_utils::transform_wkb_to_crs(&probe, Some("EPSG:4326"), Some("EPSG:3857"))
+        {
+            let message = err.to_string();
+            if message.contains("proj-sys") {
+                return;
+            }
+            panic!("Unexpected CRS transform error: {message}");
+        }
+
+        let test_file = sedona_testing::data::test_raster("test4.tiff").unwrap();
+        let content = std::fs::read(&test_file).unwrap();
+        let raster_array = RsFromGDALRaster::parse_gdal_raster(&content).unwrap();
+
+        let raster_struct = RasterStructArray::new(&raster_array);
+        let raster = raster_struct.get(0).unwrap();
+        let width = raster.metadata().width() as i64;
+        let height = raster.metadata().height() as i64;
+        let col = width / 2;
+        let row = height / 2;
+        let (lon, lat) = to_world_coordinate(&raster, col, row);
+
+        let point_wkt = format!("POINT ({} {})", lon, lat);
+        let point_wkb = make_wkb(&point_wkt);
+        let (x_merc, y_merc) = web_mercator_from_lonlat(lon, lat);
+        let point_merc_wkt = format!("POINT ({} {})", x_merc, y_merc);
+        let point_merc_wkb = make_wkb(&point_merc_wkt);
+
+        let raster_scalar = ColumnarValue::Scalar(ScalarValue::Struct(Arc::new(raster_array)));
+        let geom_type_4326 = SedonaType::Wkb(Edges::Planar, deserialize_crs("EPSG:4326").unwrap());
+        let geom_type_3857 = SedonaType::Wkb(Edges::Planar, deserialize_crs("EPSG:3857").unwrap());
+
+        let kernel = RsZonalStats {
+            with_band: false,
+            with_options: false,
+        };
+
+        let stat_type = ColumnarValue::Scalar(ScalarValue::Utf8(Some("count".to_string())));
+
+        let result_4326 = kernel
+            .invoke_batch(
+                &vec![RASTER, geom_type_4326, SedonaType::Arrow(DataType::Utf8)],
+                &vec![
+                    raster_scalar.clone(),
+                    ColumnarValue::Scalar(ScalarValue::Binary(Some(point_wkb))),
+                    stat_type.clone(),
+                ],
+            )
+            .unwrap();
+
+        let result_3857 = kernel
+            .invoke_batch(
+                &vec![RASTER, geom_type_3857, SedonaType::Arrow(DataType::Utf8)],
+                &vec![
+                    raster_scalar,
+                    ColumnarValue::Scalar(ScalarValue::Binary(Some(point_merc_wkb))),
+                    stat_type,
+                ],
+            )
+            .unwrap();
+
+        let value_4326 = match result_4326 {
+            ColumnarValue::Scalar(ScalarValue::Float64(Some(value))) => value,
+            _ => panic!("Expected Float64 scalar result"),
+        };
+        let value_3857 = match result_3857 {
+            ColumnarValue::Scalar(ScalarValue::Float64(Some(value))) => value,
+            _ => panic!("Expected Float64 scalar result"),
+        };
+
+        assert_eq!(value_4326, value_3857);
     }
 }

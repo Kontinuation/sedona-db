@@ -17,6 +17,7 @@
 
 mod executor;
 pub use executor::RasterExecutor;
+pub mod crs_utils;
 pub mod register;
 pub mod rs_bandpath;
 pub mod rs_convexhull;
