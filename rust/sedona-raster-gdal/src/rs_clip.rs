@@ -533,12 +533,6 @@ mod tests {
     use sedona_schema::crs::deserialize_crs;
     use sedona_schema::datatypes::Edges;
 
-    fn web_mercator_from_lonlat(lon: f64, lat: f64) -> (f64, f64) {
-        let x = lon * 20037508.34 / 180.0;
-        let y = (90.0 + lat).to_radians().tan().ln() * 20037508.34 / std::f64::consts::PI;
-        (x, y)
-    }
-
     #[test]
     fn test_rs_clip_basic() {
         // Load test raster
@@ -597,11 +591,7 @@ mod tests {
         if let Err(err) =
             crate::crs_utils::transform_wkb_to_crs(&probe, Some("EPSG:4326"), Some("EPSG:3857"))
         {
-            let message = err.to_string();
-            if message.contains("proj-sys") {
-                return;
-            }
-            panic!("Unexpected CRS transform error: {message}");
+            panic!("Unexpected CRS transform error: {}", err);
         }
 
         let test_file = sedona_testing::data::test_raster("test4.tiff").unwrap();
@@ -624,23 +614,12 @@ mod tests {
         let geometry = Geometry::from_wkt(&wkt).unwrap();
         let geom_wkb = geometry.wkb().unwrap();
 
-        let (min_x_merc, min_y_merc) = web_mercator_from_lonlat(min_x, min_y);
-        let (max_x_merc, max_y_merc) = web_mercator_from_lonlat(max_x, max_y);
-        let wkt_merc = format!(
-            "POLYGON(({} {}, {} {}, {} {}, {} {}, {} {}))",
-            min_x_merc,
-            min_y_merc,
-            max_x_merc,
-            min_y_merc,
-            max_x_merc,
-            max_y_merc,
-            min_x_merc,
-            max_y_merc,
-            min_x_merc,
-            min_y_merc
-        );
-        let geometry_merc = Geometry::from_wkt(&wkt_merc).unwrap();
-        let geom_wkb_merc = geometry_merc.wkb().unwrap();
+        // Generate the EPSG:3857 geometry using the same PROJ engine that the
+        // UDF uses for CRS transforms. This makes the test robust to axis-order
+        // and normalization differences between build configurations.
+        let geom_wkb_merc =
+            crate::crs_utils::transform_wkb_to_crs(&geom_wkb, Some("EPSG:4326"), Some("EPSG:3857"))
+                .unwrap();
 
         let kernel = RsClip {
             with_band: false,

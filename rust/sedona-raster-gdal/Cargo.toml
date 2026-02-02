@@ -56,6 +56,7 @@ walkdir = "2"
 
 [dev-dependencies]
 criterion = { workspace = true }
+sedona-proj = { workspace = true, features = ["proj-sys"] }
 sedona-testing = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
