@@ -50,13 +50,15 @@ pub fn deserialize_crs(crs_str: &str) -> Result<Crs> {
         return Ok(cached);
     }
 
-    // Handle JSON strings "OGC:CRS84", "EPSG:4326", "{AUTH}:{CODE}" and "0"
+    // Handle JSON strings "OGC:CRS84", "EPSG:4326", "{AUTH}:{CODE}", WKT CRS strings and "0"
     let crs = if LngLat::is_str_lnglat(crs_str) {
         lnglat()
     } else if crs_str == "0" {
         None
     } else if AuthorityCode::is_authority_code(crs_str) {
         AuthorityCode::crs(crs_str)
+    } else if looks_like_wkt_crs(crs_str) {
+        Some(Arc::new(WktCrs::new(crs_str)) as Arc<dyn CoordinateReferenceSystem + Send + Sync>)
     } else {
         // Try to parse as PROJJSON string
         let projjson: ProjJSON = crs_str.parse()?;
@@ -78,9 +80,19 @@ pub fn deserialize_crs_from_obj(crs_value: &serde_json::Value) -> Result<Crs> {
     }
 
     if let Some(crs_str) = crs_value.as_str() {
+        if crs_str.is_empty() || crs_str == "0" {
+            return Ok(None);
+        }
+
         // Handle JSON strings "OGC:CRS84" and "EPSG:4326"
         if LngLat::is_str_lnglat(crs_str) {
             return Ok(lnglat());
+        }
+
+        if looks_like_wkt_crs(crs_str) {
+            return Ok(Some(
+                Arc::new(WktCrs::new(crs_str)) as Arc<dyn CoordinateReferenceSystem + Send + Sync>
+            ));
         }
 
         if AuthorityCode::is_authority_code(crs_str) {
@@ -390,6 +402,269 @@ impl CoordinateReferenceSystem for ProjJSON {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WktCrs {
+    wkt: String,
+    authority_code: Option<String>,
+}
+
+impl WktCrs {
+    fn new(wkt: &str) -> Self {
+        Self {
+            wkt: wkt.to_string(),
+            authority_code: extract_top_level_authority_code(wkt),
+        }
+    }
+}
+
+impl CoordinateReferenceSystem for WktCrs {
+    fn to_json(&self) -> String {
+        // Return a JSON string value.
+        serde_json::to_string(&self.wkt).unwrap_or_else(|_| "\"\"".to_string())
+    }
+
+    fn to_authority_code(&self) -> Result<Option<String>> {
+        Ok(self.authority_code.clone())
+    }
+
+    fn crs_equals(&self, other: &dyn CoordinateReferenceSystem) -> bool {
+        match (
+            self.authority_code.as_deref(),
+            other.to_authority_code().ok().flatten(),
+        ) {
+            (Some(this_ac), Some(other_ac)) => this_ac == other_ac,
+            _ => other.to_crs_string() == self.wkt,
+        }
+    }
+
+    fn srid(&self) -> Result<Option<u32>> {
+        if let Some(auth_code) = &self.authority_code {
+            if LngLat::is_authority_code_lnglat(auth_code) {
+                return Ok(LngLat::srid());
+            }
+
+            if let Some(colon_pos) = auth_code.find(':') {
+                if auth_code[..colon_pos].eq_ignore_ascii_case("EPSG") {
+                    return Ok(auth_code[colon_pos + 1..].parse::<u32>().ok());
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn to_crs_string(&self) -> String {
+        // Preserve the original WKT string so consumers (e.g., PROJ) see exactly what was provided.
+        self.wkt.clone()
+    }
+}
+
+fn looks_like_wkt_crs(crs_str: &str) -> bool {
+    let s = crs_str.trim_start();
+    // WKT1 prefixes
+    const WKT1: [&str; 6] = [
+        "GEOGCS[",
+        "PROJCS[",
+        "GEOCCS[",
+        "VERT_CS[",
+        "LOCAL_CS[",
+        "COMPD_CS[",
+    ];
+    // WKT2 prefixes
+    const WKT2: [&str; 6] = [
+        "GEOGCRS[",
+        "PROJCRS[",
+        "VERTCRS[",
+        "COMPOUNDCRS[",
+        "BOUNDCRS[",
+        "ENGCRS[",
+    ];
+    WKT1.iter().any(|p| {
+        s.get(0..p.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(p))
+    }) || WKT2.iter().any(|p| {
+        s.get(0..p.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(p))
+    })
+}
+
+/// Extract a trustworthy top-level authority:code from a WKT CRS.
+///
+/// This intentionally only considers AUTHORITY[] (WKT1) / ID[] (WKT2) nodes that are direct
+/// children of the root CRS node to avoid accidentally selecting nested IDs (e.g., unit EPSG:9001).
+fn extract_top_level_authority_code(wkt: &str) -> Option<String> {
+    let s = wkt.trim_start();
+    let root_open = s.find('[')?;
+    let bytes = s.as_bytes();
+
+    let mut depth: i32;
+    let mut in_quotes = false;
+    let mut i = root_open;
+    // Move to just after root '['
+    depth = 1;
+    i += 1;
+
+    let mut first_any: Option<String> = None;
+    let mut first_epsg: Option<String> = None;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if b == b'"' {
+            // WKT uses "" to escape a literal quote.
+            if in_quotes && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                i += 2;
+                continue;
+            }
+            in_quotes = !in_quotes;
+            i += 1;
+            continue;
+        }
+
+        if !in_quotes {
+            if b == b'[' {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            if b == b']' {
+                depth -= 1;
+                if depth <= 0 {
+                    break;
+                }
+                i += 1;
+                continue;
+            }
+
+            if depth == 1 {
+                // Skip separators
+                if b.is_ascii_whitespace() || b == b',' {
+                    i += 1;
+                    continue;
+                }
+
+                if is_wkt_keyword_start(b) {
+                    let start = i;
+                    i += 1;
+                    while i < bytes.len() && is_wkt_keyword_cont(bytes[i]) {
+                        i += 1;
+                    }
+
+                    let keyword = &s[start..i];
+                    let mut j = i;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+
+                    if j < bytes.len()
+                        && bytes[j] == b'['
+                        && (keyword.eq_ignore_ascii_case("AUTHORITY")
+                            || keyword.eq_ignore_ascii_case("ID"))
+                    {
+                        if let Some(ac) = parse_authority_code_node(s, j) {
+                            if first_any.is_none() {
+                                first_any = Some(ac.clone());
+                            }
+                            if ac.to_ascii_uppercase().starts_with("EPSG:") && first_epsg.is_none()
+                            {
+                                first_epsg = Some(ac);
+                            }
+                        }
+                    }
+
+                    // Continue scanning from end of keyword (not j), depth tracking will advance on '['.
+                    continue;
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    first_epsg.or(first_any)
+}
+
+fn is_wkt_keyword_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+fn is_wkt_keyword_cont(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn parse_authority_code_node(s: &str, bracket_open: usize) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = bracket_open + 1;
+
+    // Parse first argument
+    skip_wkt_ws(bytes, &mut i);
+    let authority = parse_wkt_atom(s, bytes, &mut i)?;
+    skip_wkt_ws(bytes, &mut i);
+    if i < bytes.len() && bytes[i] == b',' {
+        i += 1;
+    }
+    skip_wkt_ws(bytes, &mut i);
+    let code = parse_wkt_atom(s, bytes, &mut i)?;
+
+    let authority_trimmed = authority.trim();
+    let code_trimmed = code.trim();
+    if authority_trimmed.is_empty() || code_trimmed.is_empty() {
+        return None;
+    }
+
+    Some(format!("{}:{}", authority_trimmed, code_trimmed))
+}
+
+fn skip_wkt_ws(bytes: &[u8], i: &mut usize) {
+    while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
+        *i += 1;
+    }
+}
+
+fn parse_wkt_atom(s: &str, bytes: &[u8], i: &mut usize) -> Option<String> {
+    if *i >= bytes.len() {
+        return None;
+    }
+
+    if bytes[*i] == b'"' {
+        // Quoted string
+        *i += 1;
+        let mut out = String::new();
+        while *i < bytes.len() {
+            let b = bytes[*i];
+            if b == b'"' {
+                if *i + 1 < bytes.len() && bytes[*i + 1] == b'"' {
+                    // Escaped quote
+                    out.push('"');
+                    *i += 2;
+                    continue;
+                }
+                *i += 1;
+                break;
+            }
+            // WKT is ASCII; treat bytes as chars.
+            out.push(char::from(b));
+            *i += 1;
+        }
+        return Some(out);
+    }
+
+    // Unquoted atom: parse until comma/whitespace/closing bracket
+    let start = *i;
+    while *i < bytes.len() {
+        let b = bytes[*i];
+        if b == b',' || b == b']' || b.is_ascii_whitespace() {
+            break;
+        }
+        *i += 1;
+    }
+    if *i == start {
+        None
+    } else {
+        Some(s[start..*i].to_string())
+    }
+}
+
 pub const OGC_CRS84_PROJJSON: &str = r#"{"$schema":"https://proj.org/schemas/v0.7/projjson.schema.json","type":"GeographicCRS","name":"WGS 84 (CRS84)","datum_ensemble":{"name":"World Geodetic System 1984 ensemble","members":[{"name":"World Geodetic System 1984 (Transit)","id":{"authority":"EPSG","code":1166}},{"name":"World Geodetic System 1984 (G730)","id":{"authority":"EPSG","code":1152}},{"name":"World Geodetic System 1984 (G873)","id":{"authority":"EPSG","code":1153}},{"name":"World Geodetic System 1984 (G1150)","id":{"authority":"EPSG","code":1154}},{"name":"World Geodetic System 1984 (G1674)","id":{"authority":"EPSG","code":1155}},{"name":"World Geodetic System 1984 (G1762)","id":{"authority":"EPSG","code":1156}},{"name":"World Geodetic System 1984 (G2139)","id":{"authority":"EPSG","code":1309}},{"name":"World Geodetic System 1984 (G2296)","id":{"authority":"EPSG","code":1383}}],"ellipsoid":{"name":"WGS 84","semi_major_axis":6378137,"inverse_flattening":298.257223563},"accuracy":"2.0","id":{"authority":"EPSG","code":6326}},"coordinate_system":{"subtype":"ellipsoidal","axis":[{"name":"Geodetic longitude","abbreviation":"Lon","direction":"east","unit":"degree"},{"name":"Geodetic latitude","abbreviation":"Lat","direction":"north","unit":"degree"}]},"scope":"Not known.","area":"World.","bbox":{"south_latitude":-90,"west_longitude":-180,"north_latitude":90,"east_longitude":180},"id":{"authority":"OGC","code":"CRS84"}}"#;
 
 #[cfg(test)]
@@ -420,6 +695,18 @@ mod test {
 
         assert!(deserialize_crs_from_obj(&Value::Null).unwrap().is_none());
         assert!(deserialize_crs_from_obj(&serde_json::Value::String("[]".to_string())).is_err());
+
+        // WKT CRS strings should be accepted.
+        let wkt1 = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433],AUTHORITY[\"EPSG\",\"4326\"]]";
+        let wkt_crs = deserialize_crs(wkt1).unwrap().unwrap();
+        assert_eq!(wkt_crs.to_authority_code().unwrap().unwrap(), "EPSG:4326");
+        assert_eq!(wkt_crs.srid().unwrap(), Some(4326));
+        assert_eq!(wkt_crs.to_crs_string(), wkt1);
+
+        // Nested IDs should not be treated as the top-level CRS identifier.
+        let wkt_nested = "GEOGCS[\"WGS 84\",UNIT[\"metre\",1,ID[\"EPSG\",9001]]]";
+        let nested = deserialize_crs(wkt_nested).unwrap().unwrap();
+        assert!(nested.to_authority_code().unwrap().is_none());
     }
 
     #[test]

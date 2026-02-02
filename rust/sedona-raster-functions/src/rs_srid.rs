@@ -123,11 +123,7 @@ impl SedonaScalarKernel for RsSrid {
 
                                     match srid {
                                         Some(srid_val) => builder.append_value(srid_val),
-                                        None => {
-                                            return Err(DataFusionError::Execution(
-                                                "CRS has no SRID".to_string(),
-                                            ))
-                                        }
+                                        None => builder.append_null(),
                                     }
                                 }
                                 None => builder.append_value(0),
@@ -200,7 +196,10 @@ mod tests {
     use arrow_array::{StringArray, UInt32Array};
     use datafusion_common::ScalarValue;
     use datafusion_expr::ScalarUDF;
+    use sedona_raster::builder::RasterBuilder;
+    use sedona_raster::traits::{BandMetadata, RasterMetadata};
     use sedona_schema::datatypes::RASTER;
+    use sedona_schema::raster::{BandDataType, StorageType};
     use sedona_testing::compare::assert_array_equal;
     use sedona_testing::rasters::generate_test_rasters;
     use sedona_testing::testers::ScalarUdfTester;
@@ -234,6 +233,49 @@ mod tests {
         // Test with null scalar
         let result = tester.invoke_scalar(ScalarValue::Null).unwrap();
         tester.assert_scalar_result_equals(result, ScalarValue::UInt32(None));
+    }
+
+    #[test]
+    fn udf_srid_missing_srid_returns_null() {
+        let udf: ScalarUDF = rs_srid_udf().into();
+        let tester = ScalarUdfTester::new(udf, vec![RASTER]);
+
+        // A WKT CRS without a trustworthy top-level EPSG identifier should yield NULL.
+        let mut builder = RasterBuilder::new(1);
+        let raster_metadata = RasterMetadata {
+            width: 1,
+            height: 1,
+            upperleft_x: 0.0,
+            upperleft_y: 0.0,
+            scale_x: 1.0,
+            scale_y: -1.0,
+            skew_x: 0.0,
+            skew_y: 0.0,
+        };
+
+        // Minimal WKT-like string that should be treated as CRS but has no SRID.
+        let wkt_crs =
+            "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]]]";
+        builder
+            .start_raster(&raster_metadata, Some(wkt_crs))
+            .unwrap();
+        builder
+            .start_band(BandMetadata {
+                datatype: BandDataType::UInt8,
+                nodata_value: None,
+                storage_type: StorageType::InDb,
+                outdb_url: None,
+                outdb_band_id: None,
+            })
+            .unwrap();
+        builder.band_data_writer().append_value([0u8]);
+        builder.finish_band().unwrap();
+        builder.finish_raster().unwrap();
+        let rasters = builder.finish().unwrap();
+
+        let result = tester.invoke_array(Arc::new(rasters)).unwrap();
+        let expected: Arc<dyn arrow_array::Array> = Arc::new(UInt32Array::from(vec![None]));
+        assert_array_equal(&result, &expected);
     }
 
     #[test]

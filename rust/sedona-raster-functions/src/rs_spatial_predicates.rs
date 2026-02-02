@@ -320,7 +320,16 @@ fn get_crs_from_raster(raster: &dyn RasterRef) -> Result<Option<String>> {
                 DataFusionError::Execution(format!("Failed to deserialize CRS: {e}"))
             })?;
             match crs {
-                Some(crs_ref) => Ok(Some(crs_ref.to_crs_string())),
+                Some(crs_ref) => Ok(Some(
+                    crs_ref
+                        .to_authority_code()
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to extract CRS authority code: {e}"
+                            ))
+                        })?
+                        .unwrap_or_else(|| crs_ref.to_crs_string()),
+                )),
                 None => Ok(None),
             }
         }
@@ -401,9 +410,12 @@ mod tests {
     use arrow_array::{create_array, ArrayRef};
     use datafusion_expr::ScalarUDF;
     use rstest::rstest;
+    use sedona_raster::builder::RasterBuilder;
+    use sedona_raster::traits::{BandMetadata, RasterMetadata};
     use sedona_schema::datatypes::Edges;
     use sedona_schema::datatypes::RASTER;
     use sedona_schema::datatypes::WKB_GEOMETRY;
+    use sedona_schema::raster::{BandDataType, StorageType};
     use sedona_testing::compare::assert_array_equal;
     use sedona_testing::create::create_array as create_geom_array;
     use sedona_testing::create::make_wkb;
@@ -502,6 +514,57 @@ mod tests {
             .invoke_arrays(vec![Arc::new(rasters), geoms])
             .unwrap();
 
+        assert_array_equal(&result, &expected);
+    }
+
+    #[test]
+    fn rs_intersects_raster_geom_wkt_crs() {
+        // Ensure we can handle rasters whose CRS is stored as WKT (e.g., from rs_geotiff_tiles).
+        // This specifically covers the previous failure mode where predicates errored while
+        // deserializing raster.crs() before any CRS transform attempt.
+
+        let wkt_crs = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433],AUTHORITY[\"EPSG\",\"4326\"]]";
+        // Use an authority code at the geometry type-level so we don't need PROJ for this test.
+        // The raster side exercises WKT CRS deserialization.
+        let geom_type = SedonaType::Wkb(Edges::Planar, deserialize_crs("EPSG:4326").unwrap());
+
+        let udf = rs_intersects_udf();
+        let tester = ScalarUdfTester::new(udf.into(), vec![RASTER, geom_type.clone()]);
+
+        // 1x1 raster whose convex hull covers (0,0) to (1,1)
+        let mut builder = RasterBuilder::new(1);
+        let raster_metadata = RasterMetadata {
+            width: 1,
+            height: 1,
+            upperleft_x: 0.0,
+            upperleft_y: 1.0,
+            scale_x: 1.0,
+            scale_y: -1.0,
+            skew_x: 0.0,
+            skew_y: 0.0,
+        };
+        builder
+            .start_raster(&raster_metadata, Some(wkt_crs))
+            .unwrap();
+        builder
+            .start_band(BandMetadata {
+                datatype: BandDataType::UInt8,
+                nodata_value: None,
+                storage_type: StorageType::InDb,
+                outdb_url: None,
+                outdb_band_id: None,
+            })
+            .unwrap();
+        builder.band_data_writer().append_value([0u8]);
+        builder.finish_band().unwrap();
+        builder.finish_raster().unwrap();
+        let rasters = builder.finish().unwrap();
+
+        let geoms = create_geom_array(&[Some("POINT (0.5 0.5)")], &geom_type);
+        let expected: ArrayRef = create_array!(Boolean, [Some(true)]);
+        let result = tester
+            .invoke_arrays(vec![Arc::new(rasters), geoms])
+            .unwrap();
         assert_array_equal(&result, &expected);
     }
 
