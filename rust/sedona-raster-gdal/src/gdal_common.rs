@@ -131,7 +131,7 @@ pub(crate) fn convert_gdal_err(e: GdalError) -> DataFusionError {
 /// - Any band uses OutDb storage
 /// - GDAL driver operations fail
 /// - Accessing RasterRef fails
-pub unsafe fn raster_ref_to_gdal_mem<R: RasterRef>(
+pub unsafe fn raster_ref_to_gdal_mem<R: RasterRef + ?Sized>(
     raster: &R,
     band_indices: &[usize],
 ) -> Result<gdal::Dataset> {
@@ -228,7 +228,7 @@ pub unsafe fn raster_ref_to_gdal_mem<R: RasterRef>(
     Ok(dataset)
 }
 
-pub fn raster_ref_to_gdal_empty<R: RasterRef>(raster: &R) -> Result<gdal::Dataset> {
+pub fn raster_ref_to_gdal_empty<R: RasterRef + ?Sized>(raster: &R) -> Result<gdal::Dataset> {
     unsafe {
         // SAFETY: raster_ref_to_gdal_mem is safe to call with an empty band list. The
         // returned dataset will have zero bands and references no external memory.
@@ -327,7 +327,7 @@ mod tests {
         );
 
         // Float64
-        let val: f64 = std::f64::NAN;
+        let val: f64 = f64::NAN;
         let result = bytes_to_f64(&val.to_le_bytes(), &BandDataType::Float64);
         assert!(result.unwrap().is_nan());
 

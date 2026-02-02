@@ -42,6 +42,7 @@ use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::BandDataType;
 
 use crate::crs_utils;
+use crate::raster_band_reader::RasterBandReader;
 
 /// RS_Value() scalar UDF implementation
 ///
@@ -260,13 +261,8 @@ fn get_value_at_grid(
     })?;
 
     let band_metadata = band.metadata();
-    let data = band.data();
-
-    // Calculate pixel offset
-    let pixel_offset = row as usize * width as usize + col as usize;
-
-    // Read value based on data type
-    let value = read_pixel_value(data, pixel_offset, band_metadata.data_type())?;
+    let mut band_reader = RasterBandReader::new(raster);
+    let value = band_reader.read_pixel_f64(band_num, col as usize, row as usize)?;
 
     // Check for nodata
     if let Some(nodata_bytes) = band_metadata.nodata_value() {
@@ -332,57 +328,6 @@ fn parse_point_from_wkb(wkb: &[u8]) -> Result<(f64, f64)> {
     };
 
     Ok((x, y))
-}
-
-/// Read pixel value from band data
-fn read_pixel_value(data: &[u8], offset: usize, data_type: BandDataType) -> Result<f64> {
-    let byte_offset = offset * data_type_byte_size(&data_type);
-
-    if byte_offset + data_type_byte_size(&data_type) > data.len() {
-        return Err(DataFusionError::Execution(
-            "Pixel offset out of bounds".to_string(),
-        ));
-    }
-
-    let value = match data_type {
-        BandDataType::UInt8 => data[byte_offset] as f64,
-        BandDataType::UInt16 => {
-            u16::from_le_bytes([data[byte_offset], data[byte_offset + 1]]) as f64
-        }
-        BandDataType::Int16 => {
-            i16::from_le_bytes([data[byte_offset], data[byte_offset + 1]]) as f64
-        }
-        BandDataType::UInt32 => u32::from_le_bytes([
-            data[byte_offset],
-            data[byte_offset + 1],
-            data[byte_offset + 2],
-            data[byte_offset + 3],
-        ]) as f64,
-        BandDataType::Int32 => i32::from_le_bytes([
-            data[byte_offset],
-            data[byte_offset + 1],
-            data[byte_offset + 2],
-            data[byte_offset + 3],
-        ]) as f64,
-        BandDataType::Float32 => f32::from_le_bytes([
-            data[byte_offset],
-            data[byte_offset + 1],
-            data[byte_offset + 2],
-            data[byte_offset + 3],
-        ]) as f64,
-        BandDataType::Float64 => f64::from_le_bytes([
-            data[byte_offset],
-            data[byte_offset + 1],
-            data[byte_offset + 2],
-            data[byte_offset + 3],
-            data[byte_offset + 4],
-            data[byte_offset + 5],
-            data[byte_offset + 6],
-            data[byte_offset + 7],
-        ]),
-    };
-
-    Ok(value)
 }
 
 /// Read nodata value from bytes
@@ -453,16 +398,6 @@ fn read_nodata_value(bytes: &[u8], data_type: BandDataType) -> Result<f64> {
                 ))
             }
         }
-    }
-}
-
-/// Get byte size of data type
-fn data_type_byte_size(data_type: &BandDataType) -> usize {
-    match data_type {
-        BandDataType::UInt8 => 1,
-        BandDataType::UInt16 | BandDataType::Int16 => 2,
-        BandDataType::UInt32 | BandDataType::Int32 | BandDataType::Float32 => 4,
-        BandDataType::Float64 => 8,
     }
 }
 
@@ -539,6 +474,7 @@ mod tests {
     use sedona_raster::array::RasterStructArray;
     use sedona_schema::crs::deserialize_crs;
     use sedona_schema::datatypes::{Edges, RASTER};
+    use sedona_schema::raster::BandDataType;
     use sedona_testing::create::make_wkb;
 
     fn web_mercator_from_lonlat(lon: f64, lat: f64) -> (f64, f64) {
@@ -569,7 +505,17 @@ mod tests {
     #[test]
     fn test_read_pixel_value_uint8() {
         let data = vec![42u8, 100, 200];
-        let value = read_pixel_value(&data, 1, BandDataType::UInt8).unwrap();
+        let raster_array = sedona_testing::rasters::raster_from_single_band(
+            3,
+            1,
+            BandDataType::UInt8,
+            &data,
+            None,
+        );
+        let raster_struct = RasterStructArray::new(&raster_array);
+        let raster = raster_struct.get(0).unwrap();
+        let mut reader = RasterBandReader::new(&raster);
+        let value = reader.read_pixel_f64(1, 1, 0).unwrap();
         assert!((value - 100.0).abs() < f64::EPSILON);
     }
 
@@ -580,7 +526,17 @@ mod tests {
         for (i, &v) in values.iter().enumerate() {
             data[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
         }
-        let value = read_pixel_value(&data, 1, BandDataType::Float32).unwrap();
+        let raster_array = sedona_testing::rasters::raster_from_single_band(
+            3,
+            1,
+            BandDataType::Float32,
+            &data,
+            None,
+        );
+        let raster_struct = RasterStructArray::new(&raster_array);
+        let raster = raster_struct.get(0).unwrap();
+        let mut reader = RasterBandReader::new(&raster);
+        let value = reader.read_pixel_f64(1, 1, 0).unwrap();
         assert!((value - 2.5).abs() < f64::EPSILON);
     }
 
@@ -695,8 +651,8 @@ mod tests {
 
         let result_4326 = kernel
             .invoke_batch(
-                &vec![RASTER, geom_type_4326],
-                &vec![
+                &[RASTER, geom_type_4326],
+                &[
                     raster_scalar.clone(),
                     ColumnarValue::Scalar(ScalarValue::Binary(Some(point_wkb))),
                 ],
@@ -710,8 +666,8 @@ mod tests {
 
         let result_3857 = kernel
             .invoke_batch(
-                &vec![RASTER, geom_type_3857],
-                &vec![
+                &[RASTER, geom_type_3857],
+                &[
                     raster_scalar,
                     ColumnarValue::Scalar(ScalarValue::Binary(Some(point_merc_wkb))),
                 ],

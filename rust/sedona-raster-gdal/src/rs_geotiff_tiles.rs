@@ -275,7 +275,10 @@ impl ExecutionPlan for GeoTiffTilesExec {
     }
 }
 
-fn build_batch_for_file(path: PathBuf, schema: SchemaRef) -> Result<Option<RecordBatch>> {
+pub(crate) fn build_batch_for_file(
+    path: PathBuf,
+    schema: SchemaRef,
+) -> Result<Option<RecordBatch>> {
     let path_str = path.to_string_lossy().to_string();
     let ds = open_geotiff(&path_str)?;
     let (width, height) = ds.raster_size();

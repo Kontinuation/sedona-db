@@ -77,12 +77,12 @@ fn rs_from_path_doc() -> Documentation {
 
 /// Kernel implementation for RS_FromPath
 #[derive(Debug)]
-struct RsFromPath {
+pub(crate) struct RsFromPath {
     with_params: bool,
 }
 
 impl RsFromPath {
-    fn new(with_params: bool) -> Self {
+    pub(crate) fn new(with_params: bool) -> Self {
         Self { with_params }
     }
 

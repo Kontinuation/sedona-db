@@ -32,6 +32,7 @@
 
 // dataset module removed; utilities moved into `gdal_common` and `gdal_dataset_provider`
 mod crs_utils;
+pub mod raster_band_reader;
 pub mod rs_as_geotiff;
 pub mod rs_as_raster;
 pub mod rs_clip;

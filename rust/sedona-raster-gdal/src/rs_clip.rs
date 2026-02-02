@@ -44,6 +44,7 @@ use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::{BandDataType, StorageType};
 
 use crate::gdal_common::{nodata_bytes_to_f64, nodata_f64_to_bytes};
+use crate::raster_band_reader::RasterBandReader;
 
 /// RS_Clip() scalar UDF implementation
 ///
@@ -262,6 +263,7 @@ fn clip_raster(
 ) -> Result<ClippedRasterData> {
     let metadata = raster.metadata();
     let bands = raster.bands();
+    let mut band_reader = RasterBandReader::new(raster);
     let width = metadata.width() as usize;
     let height = metadata.height() as usize;
 
@@ -367,7 +369,7 @@ fn clip_raster(
 
         let band_metadata = band.metadata();
         let data_type = band_metadata.data_type();
-        let original_data = band.data();
+        let original_data = band_reader.read_band_bytes(band_idx)?;
 
         // Determine nodata value
         let nodata = custom_nodata
@@ -376,7 +378,7 @@ fn clip_raster(
 
         // Apply mask to band data
         let clipped_data =
-            apply_mask_to_band(original_data, mask, width, height, &data_type, nodata)?;
+            apply_mask_to_band(&original_data, mask, width, height, &data_type, nodata)?;
 
         // Build band metadata
         let new_band_metadata = BandMetadata {
@@ -577,10 +579,11 @@ mod tests {
         );
 
         // Verify band data size matches original
-        let original_band = raster.bands().band(1).unwrap();
+        let mut reader = RasterBandReader::new(&raster);
+        let original_len = reader.read_band_bytes(1).unwrap().len();
         assert_eq!(
             clipped.band_data[0].len(),
-            original_band.data().len(),
+            original_len,
             "Clipped band should have same size as original"
         );
     }
@@ -651,8 +654,8 @@ mod tests {
 
         let result_4326 = kernel
             .invoke_batch(
-                &vec![RASTER, geom_type_4326],
-                &vec![
+                &[RASTER, geom_type_4326],
+                &[
                     raster_scalar.clone(),
                     ColumnarValue::Scalar(ScalarValue::Binary(Some(geom_wkb))),
                 ],
@@ -661,8 +664,8 @@ mod tests {
 
         let result_3857 = kernel
             .invoke_batch(
-                &vec![RASTER, geom_type_3857],
-                &vec![
+                &[RASTER, geom_type_3857],
+                &[
                     raster_scalar,
                     ColumnarValue::Scalar(ScalarValue::Binary(Some(geom_wkb_merc))),
                 ],

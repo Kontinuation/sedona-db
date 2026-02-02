@@ -127,7 +127,10 @@ impl GDALDatasetProvider {
         })
     }
 
-    pub fn raster_ref_to_gdal<'a, R: RasterRef>(&self, raster: &'a R) -> Result<RasterDataset<'a>> {
+    pub fn raster_ref_to_gdal<'a, R: RasterRef + ?Sized>(
+        &self,
+        raster: &'a R,
+    ) -> Result<RasterDataset<'a>> {
         let metadata = raster.metadata();
         let bands = raster.bands();
         let num_bands = bands.len();
@@ -256,7 +259,10 @@ impl GDALDatasetProvider {
                         .map_err(convert_gdal_err)?;
 
                     vrt_band
-                        .add_simple_source(&source_band, src_window, dst_window, None, nodata_value)
+                        // Avoid passing per-source NODATA to VRT simple sources; some GDAL builds
+                        // warn that NODATA isn't supported for neighbour-sampled simple sources
+                        // on virtual datasources. We set band-level NODATA via set_no_data_value.
+                        .add_simple_source(&source_band, src_window, dst_window, None, None)
                         .map_err(convert_gdal_err)?;
 
                     outdb_sources.push(source_dataset);
@@ -276,7 +282,7 @@ impl GDALDatasetProvider {
                             (0, 0, width, height),
                             (0, 0, width, height),
                             None,
-                            nodata_value,
+                            None,
                         )
                         .map_err(convert_gdal_err)?;
                 }

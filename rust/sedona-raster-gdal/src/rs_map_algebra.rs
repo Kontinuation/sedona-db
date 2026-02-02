@@ -65,6 +65,7 @@ use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::{BandDataType, StorageType};
 
 use crate::gdal_common::nodata_f64_to_bytes;
+use crate::raster_band_reader::RasterBandReader;
 
 /// RS_MapAlgebra() scalar UDF implementation
 ///
@@ -332,8 +333,9 @@ fn apply_map_algebra(
 
     // Read all band data from first raster
     let bands0 = raster0.bands();
+    let mut reader0 = RasterBandReader::new(raster0);
     let band_data0: Vec<Vec<f64>> = (1..=bands0.len())
-        .map(|i| read_band_as_f64(raster0, i))
+        .map(|i| reader0.read_band_f64(i))
         .collect::<Result<Vec<_>>>()?;
 
     // Read all band data from second raster (if present)
@@ -346,9 +348,10 @@ fn apply_map_algebra(
             ));
         }
         let bands1 = r1.bands();
+        let mut reader1 = RasterBandReader::new(r1);
         Some(
             (1..=bands1.len())
-                .map(|i| read_band_as_f64(r1, i))
+                .map(|i| reader1.read_band_f64(i))
                 .collect::<Result<Vec<_>>>()?,
         )
     } else {
@@ -492,83 +495,6 @@ fn value_to_f64(value: &Value) -> Result<f64> {
             value
         ))),
     }
-}
-
-/// Read a band as f64 values
-fn read_band_as_f64(raster: &RasterRefImpl<'_>, band_num: usize) -> Result<Vec<f64>> {
-    let bands = raster.bands();
-    let band = bands.band(band_num).map_err(|e| {
-        DataFusionError::Execution(format!("Failed to get band {}: {}", band_num, e))
-    })?;
-
-    let metadata = band.metadata();
-    let data_type = metadata.data_type();
-    let data = band.data();
-
-    let width = raster.metadata().width() as usize;
-    let height = raster.metadata().height() as usize;
-    let pixel_count = width * height;
-
-    let mut result = Vec::with_capacity(pixel_count);
-
-    for i in 0..pixel_count {
-        let value = read_pixel_value(data, i, &data_type)?;
-        result.push(value);
-    }
-
-    Ok(result)
-}
-
-/// Read a single pixel value as f64
-fn read_pixel_value(data: &[u8], offset: usize, data_type: &BandDataType) -> Result<f64> {
-    let byte_size = data_type_byte_size(data_type);
-    let byte_offset = offset * byte_size;
-
-    if byte_offset + byte_size > data.len() {
-        return Err(DataFusionError::Execution(
-            "Pixel offset out of bounds".to_string(),
-        ));
-    }
-
-    let value = match data_type {
-        BandDataType::UInt8 => data[byte_offset] as f64,
-        BandDataType::UInt16 => {
-            u16::from_le_bytes([data[byte_offset], data[byte_offset + 1]]) as f64
-        }
-        BandDataType::Int16 => {
-            i16::from_le_bytes([data[byte_offset], data[byte_offset + 1]]) as f64
-        }
-        BandDataType::UInt32 => u32::from_le_bytes([
-            data[byte_offset],
-            data[byte_offset + 1],
-            data[byte_offset + 2],
-            data[byte_offset + 3],
-        ]) as f64,
-        BandDataType::Int32 => i32::from_le_bytes([
-            data[byte_offset],
-            data[byte_offset + 1],
-            data[byte_offset + 2],
-            data[byte_offset + 3],
-        ]) as f64,
-        BandDataType::Float32 => f32::from_le_bytes([
-            data[byte_offset],
-            data[byte_offset + 1],
-            data[byte_offset + 2],
-            data[byte_offset + 3],
-        ]) as f64,
-        BandDataType::Float64 => f64::from_le_bytes([
-            data[byte_offset],
-            data[byte_offset + 1],
-            data[byte_offset + 2],
-            data[byte_offset + 3],
-            data[byte_offset + 4],
-            data[byte_offset + 5],
-            data[byte_offset + 6],
-            data[byte_offset + 7],
-        ]),
-    };
-
-    Ok(value)
 }
 
 /// Write a pixel value to band data
@@ -755,7 +681,8 @@ mod tests {
 
     #[test]
     fn test_value_to_f64() {
-        assert!((value_to_f64(&Value::Float(3.14)).unwrap() - 3.14).abs() < f64::EPSILON);
+        let pi = std::f64::consts::PI;
+        assert!((value_to_f64(&Value::Float(pi)).unwrap() - pi).abs() < f64::EPSILON);
         assert_eq!(value_to_f64(&Value::Int(42)).unwrap(), 42.0);
         assert_eq!(value_to_f64(&Value::Boolean(true)).unwrap(), 1.0);
         assert_eq!(value_to_f64(&Value::Boolean(false)).unwrap(), 0.0);
@@ -771,11 +698,12 @@ mod tests {
 
         // Test Float64
         let mut data64 = vec![0u8; 8];
-        write_pixel_value(&mut data64, 0, &BandDataType::Float64, 3.14159);
+        let pi = std::f64::consts::PI;
+        write_pixel_value(&mut data64, 0, &BandDataType::Float64, pi);
         let read_back = f64::from_le_bytes([
             data64[0], data64[1], data64[2], data64[3], data64[4], data64[5], data64[6], data64[7],
         ]);
-        assert!((read_back - 3.14159).abs() < 1e-10);
+        assert!((read_back - pi).abs() < 1e-10);
     }
 
     #[test]
