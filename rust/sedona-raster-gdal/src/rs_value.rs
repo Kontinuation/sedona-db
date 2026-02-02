@@ -21,11 +21,13 @@
 //! it defaults to 1. If the CRS of the input point differs from the raster CRS,
 //! the point will be transformed to match the raster CRS.
 
+use std::convert::TryInto;
 use std::sync::Arc;
 
 use arrow_array::builder::Float64Builder;
 use arrow_array::{ArrayRef, Int32Array, StructArray};
 use arrow_schema::DataType;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{
@@ -42,6 +44,7 @@ use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::BandDataType;
 
 use crate::crs_utils;
+use crate::gdal_dataset_provider::configure_thread_local_cache_size;
 use crate::raster_band_reader::RasterBandReader;
 
 /// RS_Value() scalar UDF implementation
@@ -105,6 +108,18 @@ impl SedonaScalarKernel for RsValuePoint {
         arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
+        self.invoke_batch_from_args(arg_types, args, &SedonaType::Arrow(DataType::Null), 0, None)
+    }
+
+    fn invoke_batch_from_args(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+        _return_type: &SedonaType,
+        _num_rows: usize,
+        config_options: Option<&ConfigOptions>,
+    ) -> Result<ColumnarValue> {
+        configure_thread_local_cache_size(config_options)?;
         let num_iterations = calc_num_iterations(args);
         let mut builder = Float64Builder::with_capacity(num_iterations);
 
@@ -129,7 +144,13 @@ impl SedonaScalarKernel for RsValuePoint {
             RasterExecutor::new_with_num_iterations(&exec_arg_types, &exec_args, num_iterations);
 
         executor.execute_raster_wkb_crs_void(|raster_opt, wkb_opt, maybe_point_crs| {
-            let band_num = band_iter.next().flatten().unwrap_or(1) as usize;
+            let band_num = band_iter
+                .next()
+                .flatten()
+                .unwrap_or(1)
+                .max(1)
+                .try_into()
+                .unwrap_or(1);
             let (raster, point_wkb) = match (raster_opt, wkb_opt) {
                 (Some(raster), Some(point_wkb)) => (raster, point_wkb),
                 _ => {
@@ -178,16 +199,32 @@ impl SedonaScalarKernel for RsValueGrid {
 
     fn invoke_batch(
         &self,
-        _arg_types: &[SedonaType],
+        arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
+        self.invoke_batch_from_args(arg_types, args, &SedonaType::Arrow(DataType::Null), 0, None)
+    }
+
+    fn invoke_batch_from_args(
+        &self,
+        _arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+        _return_type: &SedonaType,
+        _num_rows: usize,
+        config_options: Option<&ConfigOptions>,
+    ) -> Result<ColumnarValue> {
+        configure_thread_local_cache_size(config_options)?;
         let num_iterations = calc_num_iterations(args);
         let mut builder = Float64Builder::with_capacity(num_iterations);
 
         // Get scalar values for col_x, row_y, band
         let col_x = extract_i32_scalar(&args[1])?;
         let row_y = extract_i32_scalar(&args[2])?;
-        let band_num = extract_i32_scalar(&args[3])?.unwrap_or(1) as usize;
+        let band_num: usize = extract_i32_scalar(&args[3])?
+            .unwrap_or(1)
+            .max(1)
+            .try_into()
+            .unwrap_or(1);
 
         // Get raster array
         let raster_array = get_raster_array(&args[0])?;

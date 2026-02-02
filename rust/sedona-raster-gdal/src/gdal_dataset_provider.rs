@@ -15,12 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{cell::RefCell, marker::PhantomData, num::NonZeroUsize, rc::Rc};
+use std::convert::TryInto;
+use std::{cell::OnceCell, cell::RefCell, marker::PhantomData, num::NonZeroUsize, rc::Rc};
 
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::{arrow_datafusion_err, DataFusionError, Result};
 
 use gdal::GeoTransformEx;
 
+use sedona_common::{
+    gdal_per_thread_max_cached_datasets_from_config, DEFAULT_GDAL_PER_THREAD_MAX_CACHED_DATASETS,
+};
 use sedona_raster::traits::RasterRef;
 use sedona_schema::raster::StorageType;
 
@@ -74,6 +79,32 @@ impl<'a> RasterDataset<'a> {
 thread_local! {
     /// Thread-local lazily-initialized `GDALDatasetProvider`.
     static TL_GDAL_PROVIDER: RefCell<Option<Rc<GDALDatasetProvider>>> = const { RefCell::new(None) };
+    static TL_GDAL_CACHE_SIZE: OnceCell<usize> = const { OnceCell::new() };
+}
+
+pub(crate) fn configure_thread_local_cache_size(
+    config_options: Option<&ConfigOptions>,
+) -> Result<()> {
+    let Some(cache_size) = gdal_per_thread_max_cached_datasets_from_config(config_options) else {
+        return Ok(());
+    };
+
+    if cache_size == 0 {
+        return Err(DataFusionError::Configuration(
+            "gdal.per_thread_max_cached_datasets must be greater than 0".to_string(),
+        ));
+    }
+
+    TL_GDAL_CACHE_SIZE.with(|cell| {
+        if cell.get().is_some() {
+            return Ok(());
+        }
+        cell.set(cache_size).map_err(|_| {
+            DataFusionError::Configuration(
+                "Failed to set thread-local GDAL cache size configuration".to_string(),
+            )
+        })
+    })
 }
 
 /// Get or create the thread-local `GDALDatasetProvider`.
@@ -83,8 +114,13 @@ pub(crate) fn thread_local_provider() -> Result<Rc<GDALDatasetProvider>> {
         if let Some(rc) = opt.as_ref() {
             Ok(Rc::clone(rc))
         } else {
-            // Cache size chosen modestly; can be tuned per workload.
-            let provider = Rc::new(GDALDatasetProvider::try_new(32)?);
+            let cache_size = TL_GDAL_CACHE_SIZE.with(|cache| {
+                cache
+                    .get()
+                    .copied()
+                    .unwrap_or(DEFAULT_GDAL_PER_THREAD_MAX_CACHED_DATASETS)
+            });
+            let provider = Rc::new(GDALDatasetProvider::try_new(cache_size)?);
             *opt = Some(Rc::clone(&provider));
             Ok(provider)
         }
@@ -224,12 +260,21 @@ impl GDALDatasetProvider {
                             i
                         ))
                     })?;
-                    let source_band_num = band_metadata.outdb_band_id().ok_or_else(|| {
-                        DataFusionError::Execution(format!(
-                            "Band {} is out-db but missing band_id",
-                            i
-                        ))
-                    })?;
+                    let source_band_num: usize = band_metadata
+                        .outdb_band_id()
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "Band {} is out-db but missing band_id",
+                                i
+                            ))
+                        })?
+                        .try_into()
+                        .map_err(|_| {
+                            DataFusionError::Execution(format!(
+                                "Band {} out-db band_id is too large",
+                                i
+                            ))
+                        })?;
 
                     let source_dataset = self.get_or_create_outdb_source(url, None)?;
 
@@ -255,7 +300,7 @@ impl GDALDatasetProvider {
                     };
 
                     let source_band = source_dataset
-                        .rasterband(source_band_num as usize)
+                        .rasterband(source_band_num)
                         .map_err(convert_gdal_err)?;
 
                     vrt_band

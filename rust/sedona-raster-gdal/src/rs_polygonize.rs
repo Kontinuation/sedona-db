@@ -19,11 +19,13 @@
 //!
 //! Returns a list of polygons for all connected regions of pixels with the same
 //! value in the specified band.
+use std::convert::TryInto;
 use std::sync::Arc;
 
 use arrow_array::builder::{BinaryBuilder, Float64Builder, ListBuilder, StructBuilder};
 use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::{DataType, Field, Fields};
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{
@@ -41,6 +43,7 @@ use sedona_schema::datatypes::SedonaType;
 use sedona_schema::matchers::ArgMatcher;
 
 // `dataset` removed; the provider is used instead when creating GDAL datasets.
+use crate::gdal_dataset_provider::configure_thread_local_cache_size;
 
 /// RS_Polygonize() scalar UDF implementation
 ///
@@ -82,13 +85,29 @@ impl SedonaScalarKernel for RsPolygonize {
 
     fn invoke_batch(
         &self,
-        _arg_types: &[SedonaType],
+        arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
+        self.invoke_batch_from_args(arg_types, args, &SedonaType::Arrow(DataType::Null), 0, None)
+    }
+
+    fn invoke_batch_from_args(
+        &self,
+        _arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+        _return_type: &SedonaType,
+        _num_rows: usize,
+        config_options: Option<&ConfigOptions>,
+    ) -> Result<ColumnarValue> {
+        configure_thread_local_cache_size(config_options)?;
         let num_iterations = calc_num_iterations(args);
 
         // Get the band number
-        let band_num = extract_i32_scalar(&args[1])?.unwrap_or(1) as usize;
+        let band_num = extract_i32_scalar(&args[1])?
+            .unwrap_or(1)
+            .max(1)
+            .try_into()
+            .unwrap_or(1);
 
         // Get raster array
         let raster_array = get_raster_array(&args[0])?;
@@ -392,7 +411,15 @@ mod tests {
             ColumnarValue::Scalar(ScalarValue::Int32(Some(1))), // band
         ];
 
-        let result = kernel.invoke_batch(&arg_types, &args).unwrap();
+        let result = kernel
+            .invoke_batch_from_args(
+                &arg_types,
+                &args,
+                &SedonaType::Arrow(DataType::Null),
+                0,
+                None,
+            )
+            .unwrap();
 
         // Result should be a scalar (since input was scalar)
         match result {

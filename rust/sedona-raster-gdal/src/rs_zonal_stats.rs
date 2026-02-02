@@ -23,12 +23,14 @@
 //! RS_ZonalStatsAll computes all statistics and returns them as a struct.
 
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::sync::Arc;
 
 use arrow_array::builder::{Float64Builder, Int64Builder, StructBuilder};
 use arrow_array::{Array, ArrayRef};
 use arrow_array::{BooleanArray, Int32Array};
 use arrow_schema::{DataType, Field, Fields};
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{
@@ -46,6 +48,7 @@ use sedona_schema::datatypes::SedonaType;
 use sedona_schema::matchers::ArgMatcher;
 
 use crate::gdal_common::nodata_bytes_to_f64;
+use crate::gdal_dataset_provider::configure_thread_local_cache_size;
 use crate::raster_band_reader::RasterBandReader;
 
 /// Statistics types supported by RS_ZonalStats
@@ -198,6 +201,18 @@ impl SedonaScalarKernel for RsZonalStats {
         arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
+        self.invoke_batch_from_args(arg_types, args, &SedonaType::Arrow(DataType::Null), 0, None)
+    }
+
+    fn invoke_batch_from_args(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+        _return_type: &SedonaType,
+        _num_rows: usize,
+        config_options: Option<&ConfigOptions>,
+    ) -> Result<ColumnarValue> {
+        configure_thread_local_cache_size(config_options)?;
         let num_iterations = calc_num_iterations(args);
 
         let (geom_arg_idx, stat_arg_idx, band_arg_idx, all_touched_arg_idx, exclude_nodata_arg_idx) =
@@ -315,7 +330,13 @@ impl SedonaScalarKernel for RsZonalStats {
             RasterExecutor::new_with_num_iterations(&exec_arg_types, &exec_args, num_iterations);
 
         executor.execute_raster_wkb_crs_void(|raster_opt, wkb_opt, geom_crs| {
-            let band = band_iter.next().flatten().unwrap_or(1) as usize;
+            let band = band_iter
+                .next()
+                .flatten()
+                .unwrap_or(1)
+                .max(1)
+                .try_into()
+                .unwrap_or(1);
             let all_touched = all_touched_iter.next().flatten().unwrap_or(false);
             let exclude_nodata = exclude_nodata_iter.next().flatten().unwrap_or(true);
 
@@ -432,6 +453,18 @@ impl SedonaScalarKernel for RsZonalStatsAll {
         arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
+        self.invoke_batch_from_args(arg_types, args, &SedonaType::Arrow(DataType::Null), 0, None)
+    }
+
+    fn invoke_batch_from_args(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+        _return_type: &SedonaType,
+        _num_rows: usize,
+        config_options: Option<&ConfigOptions>,
+    ) -> Result<ColumnarValue> {
+        configure_thread_local_cache_size(config_options)?;
         let num_iterations = calc_num_iterations(args);
 
         let (geom_arg_idx, band_arg_idx, all_touched_arg_idx, exclude_nodata_arg_idx) =
@@ -598,7 +631,13 @@ impl SedonaScalarKernel for RsZonalStatsAll {
             RasterExecutor::new_with_num_iterations(&exec_arg_types, &exec_args, num_iterations);
 
         executor.execute_raster_wkb_crs_void(|raster_opt, wkb_opt, geom_crs| {
-            let band = band_iter.next().flatten().unwrap_or(1) as usize;
+            let band = band_iter
+                .next()
+                .flatten()
+                .unwrap_or(1)
+                .max(1)
+                .try_into()
+                .unwrap_or(1);
             let all_touched = all_touched_iter.next().flatten().unwrap_or(false);
             let exclude_nodata = exclude_nodata_iter.next().flatten().unwrap_or(true);
 

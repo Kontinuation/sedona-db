@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BinaryArray, StructArray};
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::DataFusionError;
 use datafusion_expr::{
@@ -33,6 +34,7 @@ use gdal::spatial_ref::SpatialRef;
 use gdal::vsi::{create_mem_file, unlink_mem_file};
 use gdal::{Dataset, DatasetOptions, GdalOpenFlags};
 
+use arrow_schema::DataType;
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_raster::builder::RasterBuilder;
 use sedona_raster::traits::{BandMetadata, RasterMetadata};
@@ -41,6 +43,7 @@ use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::{BandDataType, StorageType};
 
 use crate::gdal_common::{gdal_to_band_data_type, nodata_f64_to_bytes};
+use crate::gdal_dataset_provider::configure_thread_local_cache_size;
 
 /// Counter for generating unique VSI memory file names
 static VSI_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -310,9 +313,21 @@ impl SedonaScalarKernel for RsFromGDALRaster {
 
     fn invoke_batch(
         &self,
-        _arg_types: &[SedonaType],
+        arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
+        self.invoke_batch_from_args(arg_types, args, &SedonaType::Arrow(DataType::Null), 0, None)
+    }
+
+    fn invoke_batch_from_args(
+        &self,
+        _arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+        _return_type: &SedonaType,
+        _num_rows: usize,
+        config_options: Option<&ConfigOptions>,
+    ) -> Result<ColumnarValue> {
+        configure_thread_local_cache_size(config_options)?;
         // Get the binary content argument
         let content_array = match &args[0] {
             ColumnarValue::Scalar(scalar) => scalar.to_array().map_err(|e| {
@@ -448,7 +463,7 @@ mod tests {
         // Invoke the UDF
         let kernel = RsFromGDALRaster;
         let result = kernel
-            .invoke_batch(&[], &[input])
+            .invoke_batch_from_args(&[], &[input], &SedonaType::Arrow(DataType::Null), 0, None)
             .expect("Should invoke successfully");
 
         // Verify result

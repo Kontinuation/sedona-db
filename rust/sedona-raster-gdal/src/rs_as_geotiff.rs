@@ -30,6 +30,7 @@ use std::sync::Arc;
 use arrow_array::builder::BinaryBuilder;
 use arrow_array::{Array, Float64Array, StringArray, StructArray, UInt32Array};
 use arrow_schema::DataType;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{
@@ -45,6 +46,7 @@ use sedona_schema::datatypes::SedonaType;
 use sedona_schema::matchers::ArgMatcher;
 
 // Use thread-local provider to create GDAL datasets from `RasterRef`.
+use crate::gdal_dataset_provider::configure_thread_local_cache_size;
 
 /// Counter for generating unique VSI memory file names
 static VSI_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -349,9 +351,21 @@ impl SedonaScalarKernel for RsAsGeoTiff {
 
     fn invoke_batch(
         &self,
-        _arg_types: &[SedonaType],
+        arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
+        self.invoke_batch_from_args(arg_types, args, &SedonaType::Arrow(DataType::Null), 0, None)
+    }
+
+    fn invoke_batch_from_args(
+        &self,
+        _arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+        _return_type: &SedonaType,
+        _num_rows: usize,
+        config_options: Option<&ConfigOptions>,
+    ) -> Result<ColumnarValue> {
+        configure_thread_local_cache_size(config_options)?;
         // Get the raster argument
         let raster_col = &args[0];
 

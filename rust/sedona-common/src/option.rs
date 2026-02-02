@@ -18,6 +18,7 @@ use std::fmt::Display;
 
 use datafusion::config::{ConfigEntry, ConfigExtension, ConfigField, ExtensionOptions, Visit};
 use datafusion::prelude::SessionConfig;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::config_namespace;
 use datafusion_common::Result;
 use regex::Regex;
@@ -29,6 +30,12 @@ pub const DEFAULT_SPECULATIVE_THRESHOLD: usize = 1000;
 /// Default minimum number of points per geometry to use prepared geometries for the build side.
 pub const DEFAULT_MIN_POINTS_FOR_BUILD_PREPARATION: usize = 50;
 
+/// Default maximum number of PROJ transform items cached per thread.
+pub const DEFAULT_PROJ_PER_THREAD_MAX_CACHED_ITEMS: usize = 100;
+
+/// Default maximum number of GDAL datasets cached per thread.
+pub const DEFAULT_GDAL_PER_THREAD_MAX_CACHED_DATASETS: usize = 32;
+
 /// Helper function to register the spatial join optimizer with a session config
 pub fn add_sedona_option_extension(config: SessionConfig) -> SessionConfig {
     config.with_option_extension(SedonaOptions::default())
@@ -39,6 +46,28 @@ config_namespace! {
     pub struct SedonaOptions {
         /// Options for spatial join
         pub spatial_join: SpatialJoinOptions, default = SpatialJoinOptions::default()
+
+        /// Options for configuring PROJ usage
+        pub proj: ProjOptions, default = ProjOptions::default()
+
+        /// Options for configuring GDAL usage
+        pub gdal: GdalOptions, default = GdalOptions::default()
+    }
+}
+
+config_namespace! {
+    /// Configuration options for PROJ usage.
+    pub struct ProjOptions {
+        /// Maximum number of PROJ transform items cached per thread
+        pub per_thread_max_cached_items: usize, default = DEFAULT_PROJ_PER_THREAD_MAX_CACHED_ITEMS
+    }
+}
+
+config_namespace! {
+    /// Configuration options for GDAL usage.
+    pub struct GdalOptions {
+        /// Maximum number of GDAL datasets cached per thread
+        pub per_thread_max_cached_datasets: usize, default = DEFAULT_GDAL_PER_THREAD_MAX_CACHED_DATASETS
     }
 }
 
@@ -398,6 +427,24 @@ impl ConfigField for TgIndexType {
         *self = index_type;
         Ok(())
     }
+}
+
+/// Returns the configured PROJ cache size when available.
+pub fn proj_per_thread_max_cached_items_from_config(
+    config_options: Option<&ConfigOptions>,
+) -> Option<usize> {
+    config_options
+        .and_then(|options| options.extensions.get::<SedonaOptions>())
+        .map(|options| options.proj.per_thread_max_cached_items)
+}
+
+/// Returns the configured GDAL cache size when available.
+pub fn gdal_per_thread_max_cached_datasets_from_config(
+    config_options: Option<&ConfigOptions>,
+) -> Option<usize> {
+    config_options
+        .and_then(|options| options.extensions.get::<SedonaOptions>())
+        .map(|options| options.gdal.per_thread_max_cached_datasets)
 }
 
 #[cfg(test)]

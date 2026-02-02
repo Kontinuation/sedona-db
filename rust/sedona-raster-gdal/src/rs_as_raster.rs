@@ -23,6 +23,7 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BinaryArray, StructArray};
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{
@@ -32,6 +33,7 @@ use gdal::raster::{rasterize, Buffer, RasterizeOptions};
 use gdal::vector::Geometry;
 use gdal::DriverManager;
 
+use arrow_schema::DataType;
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_raster::array::{RasterRefImpl, RasterStructArray};
 use sedona_raster::builder::RasterBuilder;
@@ -41,6 +43,7 @@ use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::{BandDataType, StorageType};
 
 use crate::gdal_common::nodata_f64_to_bytes;
+use crate::gdal_dataset_provider::configure_thread_local_cache_size;
 
 /// RS_AsRaster() scalar UDF implementation
 pub fn rs_as_raster_udf() -> SedonaScalarUDF {
@@ -126,9 +129,21 @@ impl SedonaScalarKernel for RsAsRaster {
 
     fn invoke_batch(
         &self,
-        _arg_types: &[SedonaType],
+        arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
+        self.invoke_batch_from_args(arg_types, args, &SedonaType::Arrow(DataType::Null), 0, None)
+    }
+
+    fn invoke_batch_from_args(
+        &self,
+        _arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+        _return_type: &SedonaType,
+        _num_rows: usize,
+        config_options: Option<&ConfigOptions>,
+    ) -> Result<ColumnarValue> {
+        configure_thread_local_cache_size(config_options)?;
         let num_iterations = calc_num_iterations(args);
 
         // Required arguments

@@ -22,9 +22,11 @@
 //! The output raster has the same extent as the geometry's bounding box (within the
 //! original raster bounds) with pixels outside the geometry masked.
 
+use std::convert::TryFrom;
 use std::sync::Arc;
 
 use arrow_array::Array;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{
@@ -34,6 +36,7 @@ use gdal::raster::{rasterize, Buffer, RasterizeOptions};
 use gdal::vector::Geometry;
 use gdal::DriverManager;
 
+use arrow_schema::DataType;
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_raster::array::RasterRefImpl;
 use sedona_raster::builder::RasterBuilder;
@@ -44,6 +47,7 @@ use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::{BandDataType, StorageType};
 
 use crate::gdal_common::{nodata_bytes_to_f64, nodata_f64_to_bytes};
+use crate::gdal_dataset_provider::configure_thread_local_cache_size;
 use crate::raster_band_reader::RasterBandReader;
 
 /// RS_Clip() scalar UDF implementation
@@ -141,6 +145,18 @@ impl SedonaScalarKernel for RsClip {
         arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
+        self.invoke_batch_from_args(arg_types, args, &SedonaType::Arrow(DataType::Null), 0, None)
+    }
+
+    fn invoke_batch_from_args(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+        _return_type: &SedonaType,
+        _num_rows: usize,
+        config_options: Option<&ConfigOptions>,
+    ) -> Result<ColumnarValue> {
+        configure_thread_local_cache_size(config_options)?;
         let num_iterations = calc_num_iterations(args);
 
         // Parse arguments based on signature.
@@ -230,7 +246,8 @@ impl SedonaScalarKernel for RsClip {
                 crate::crs_utils::transform_wkb_to_crs(geom_wkb, geom_crs, raster_crs)?
             };
 
-            match clip_raster(raster, &geom_wkb, band as usize, nodata_value, all_touched) {
+            let band_index = usize::try_from(band.max(1)).unwrap_or(1);
+            match clip_raster(raster, &geom_wkb, band_index, nodata_value, all_touched) {
                 Ok(clipped_data) => build_clipped_raster(&mut builder, raster, &clipped_data)?,
                 Err(e) => {
                     eprintln!("RS_Clip error: {}", e);

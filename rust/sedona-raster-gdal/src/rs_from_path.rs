@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, StringArray, StructArray};
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::DataFusionError;
 use datafusion_expr::{
@@ -34,6 +35,7 @@ use datafusion_expr::{
 use gdal::spatial_ref::SpatialRef;
 use gdal::{Dataset, DatasetOptions, GdalOpenFlags};
 
+use arrow_schema::DataType;
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_raster::builder::RasterBuilder;
 use sedona_raster::traits::{BandMetadata, RasterMetadata};
@@ -42,6 +44,7 @@ use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::StorageType;
 
 use crate::gdal_common::{gdal_to_band_data_type, nodata_f64_to_bytes};
+use crate::gdal_dataset_provider::configure_thread_local_cache_size;
 
 /// RS_FromPath() scalar UDF implementation
 ///
@@ -214,9 +217,21 @@ impl SedonaScalarKernel for RsFromPath {
 
     fn invoke_batch(
         &self,
-        _arg_types: &[SedonaType],
+        arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
+        self.invoke_batch_from_args(arg_types, args, &SedonaType::Arrow(DataType::Null), 0, None)
+    }
+
+    fn invoke_batch_from_args(
+        &self,
+        _arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+        _return_type: &SedonaType,
+        _num_rows: usize,
+        config_options: Option<&ConfigOptions>,
+    ) -> Result<ColumnarValue> {
+        configure_thread_local_cache_size(config_options)?;
         // Get the path argument
         let (paths, params_opt) = match &args[0] {
             ColumnarValue::Scalar(scalar) => {
@@ -458,7 +473,7 @@ mod tests {
         // Invoke the UDF
         let kernel = RsFromPath { with_params: false };
         let result = kernel
-            .invoke_batch(&[], &[input])
+            .invoke_batch_from_args(&[], &[input], &SedonaType::Arrow(DataType::Null), 0, None)
             .expect("Should invoke successfully");
 
         // Verify result

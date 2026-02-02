@@ -22,7 +22,10 @@ use datafusion_common::cast::{as_string_view_array, as_struct_array};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{exec_err, DataFusionError, Result, ScalarValue};
 use datafusion_expr::ColumnarValue;
-use sedona_common::{sedona_internal_datafusion_err, sedona_internal_err};
+use sedona_common::{
+    proj_per_thread_max_cached_items_from_config, sedona_internal_datafusion_err,
+    sedona_internal_err, DEFAULT_PROJ_PER_THREAD_MAX_CACHED_ITEMS,
+};
 use sedona_expr::item_crs::make_item_crs;
 use sedona_expr::scalar_udf::{ScalarKernelRef, SedonaScalarKernel};
 use sedona_functions::executor::WkbExecutor;
@@ -100,8 +103,9 @@ impl SedonaScalarKernel for STTransform {
         args: &[ColumnarValue],
         _return_type: &SedonaType,
         _num_rows: usize,
-        _config_options: Option<&ConfigOptions>,
+        config_options: Option<&ConfigOptions>,
     ) -> Result<ColumnarValue> {
+        maybe_configure_proj_cache(config_options)?;
         let inputs = zip(arg_types, args)
             .map(|(arg_type, arg)| ArgInput::from_arg(arg_type, arg))
             .collect::<Vec<_>>();
@@ -414,8 +418,14 @@ pub fn with_global_proj_engine(
             .build()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
+        let cache_size = PROJ_CACHE_SIZE.with(|cell| {
+            cell.get()
+                .copied()
+                .unwrap_or(DEFAULT_PROJ_PER_THREAD_MAX_CACHED_ITEMS)
+        });
+
         engine_cell
-            .set(CachingCrsEngine::new(proj_engine))
+            .set(CachingCrsEngine::with_cache_size(proj_engine, cache_size))
             .map_err(|_| sedona_internal_datafusion_err!("Failed to set cached PROJ transform"))?;
         func(engine_cell.get().unwrap())?;
         Ok(())
@@ -427,12 +437,37 @@ pub fn with_global_proj_engine(
 static PROJ_ENGINE_BUILDER: RwLock<Option<ProjCrsEngineBuilder>> =
     RwLock::<Option<ProjCrsEngineBuilder>>::new(None);
 
+thread_local! {
+    static PROJ_CACHE_SIZE: OnceCell<usize> = const { OnceCell::new() };
+}
+
 // CrsTransform backed by PROJ is not thread safe, so we define the cache as thread-local
 // to avoid race conditions.
 thread_local! {
     static PROJ_ENGINE: OnceCell<CachingCrsEngine<ProjCrsEngine>> = const {
         OnceCell::<CachingCrsEngine<ProjCrsEngine>>::new()
     };
+}
+
+fn maybe_configure_proj_cache(config_options: Option<&ConfigOptions>) -> Result<()> {
+    if let Some(cache_size) = proj_per_thread_max_cached_items_from_config(config_options) {
+        if cache_size == 0 {
+            return Err(DataFusionError::Configuration(
+                "proj.per_thread_max_cached_items must be greater than 0".to_string(),
+            ));
+        }
+        PROJ_CACHE_SIZE.with(|cell| {
+            if cell.get().is_some() {
+                return Ok(());
+            }
+            cell.set(cache_size).map_err(|_| {
+                sedona_internal_datafusion_err!(
+                    "Failed to set thread-local PROJ cache size configuration"
+                )
+            })
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

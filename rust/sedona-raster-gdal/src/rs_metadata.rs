@@ -20,6 +20,7 @@ use std::{sync::Arc, vec};
 use arrow_array::builder::{Float64Builder, Int32Builder, UInt64Builder};
 use arrow_array::StructArray;
 use arrow_schema::{DataType, Field, Fields};
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::DataFusionError;
 use datafusion_expr::{
@@ -30,7 +31,7 @@ use sedona_raster::traits::RasterRef;
 use sedona_schema::crs::deserialize_crs;
 use sedona_schema::{datatypes::SedonaType, matchers::ArgMatcher};
 
-use crate::gdal_dataset_provider::thread_local_provider;
+use crate::gdal_dataset_provider::{configure_thread_local_cache_size, thread_local_provider};
 
 /// RS_MetaData() scalar UDF implementation (GDAL-backed)
 pub fn rs_metadata_udf() -> SedonaScalarUDF {
@@ -88,6 +89,18 @@ impl SedonaScalarKernel for RsMetaData {
         arg_types: &[SedonaType],
         args: &[ColumnarValue],
     ) -> Result<ColumnarValue> {
+        self.invoke_batch_from_args(arg_types, args, &SedonaType::Arrow(DataType::Null), 0, None)
+    }
+
+    fn invoke_batch_from_args(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+        _return_type: &SedonaType,
+        _num_rows: usize,
+        config_options: Option<&ConfigOptions>,
+    ) -> Result<ColumnarValue> {
+        configure_thread_local_cache_size(config_options)?;
         let executor = sedona_raster_functions::RasterExecutor::new(arg_types, args);
         let capacity = executor.num_iterations();
 
