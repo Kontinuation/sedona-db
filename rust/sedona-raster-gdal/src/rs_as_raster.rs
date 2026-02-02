@@ -444,9 +444,7 @@ fn initialize_band(
         BandDataType::Float32 => {
             initialize_band_t::<f32>(dataset, width, height, init_value as f32)
         }
-        BandDataType::Float64 => {
-            initialize_band_t::<f64>(dataset, width, height, init_value as f64)
-        }
+        BandDataType::Float64 => initialize_band_t::<f64>(dataset, width, height, init_value),
     }
 }
 

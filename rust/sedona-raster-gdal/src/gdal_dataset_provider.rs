@@ -73,7 +73,7 @@ impl<'a> RasterDataset<'a> {
 
 thread_local! {
     /// Thread-local lazily-initialized `GDALDatasetProvider`.
-    static TL_GDAL_PROVIDER: RefCell<Option<Rc<GDALDatasetProvider>>> = RefCell::new(None);
+    static TL_GDAL_PROVIDER: RefCell<Option<Rc<GDALDatasetProvider>>> = const { RefCell::new(None) };
 }
 
 /// Get or create the thread-local `GDALDatasetProvider`.
@@ -309,12 +309,15 @@ impl GDALDatasetProvider {
     }
 }
 
+type PixelWindow = (i32, i32, i32, i32);
+type PixelWindowOverlap = Option<(PixelWindow, PixelWindow)>;
+
 fn compute_vrt_simple_source_windows(
     dst_gt: &gdal::GeoTransform,
     dst_size: (i32, i32),
     src_gt: &gdal::GeoTransform,
     src_size: (i32, i32),
-) -> Result<Option<((i32, i32, i32, i32), (i32, i32, i32, i32))>> {
+) -> Result<PixelWindowOverlap> {
     let (dst_w, dst_h) = dst_size;
     let (src_w, src_h) = src_size;
     if dst_w <= 0 || dst_h <= 0 || src_w <= 0 || src_h <= 0 {

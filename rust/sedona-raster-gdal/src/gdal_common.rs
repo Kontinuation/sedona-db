@@ -240,10 +240,7 @@ pub fn raster_ref_to_gdal_empty<R: RasterRef>(raster: &R) -> Result<gdal::Datase
 /// Returns `None` if `nodata_bytes` is `None` or cannot be parsed for the given type.
 pub fn nodata_bytes_to_f64(nodata_bytes: Option<&[u8]>, band_type: &BandDataType) -> Option<f64> {
     let bytes = nodata_bytes?;
-    match bytes_to_f64(bytes, band_type) {
-        Ok(v) => Some(v),
-        Err(_) => None,
-    }
+    bytes_to_f64(bytes, band_type).ok()
 }
 
 /// Convert a f64 nodata value into a byte vector appropriate for the given band type.
@@ -255,7 +252,7 @@ pub fn nodata_f64_to_bytes(nodata: f64, band_type: &BandDataType) -> Vec<u8> {
         BandDataType::UInt32 => (nodata as u32).to_le_bytes().to_vec(),
         BandDataType::Int32 => (nodata as i32).to_le_bytes().to_vec(),
         BandDataType::Float32 => (nodata as f32).to_le_bytes().to_vec(),
-        BandDataType::Float64 => (nodata as f64).to_le_bytes().to_vec(),
+        BandDataType::Float64 => nodata.to_le_bytes().to_vec(),
     }
 }
 

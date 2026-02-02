@@ -24,10 +24,8 @@ const WGS84_CRS: &str = "EPSG:4326";
 
 pub fn normalize_crs_string(crs: Option<&str>) -> Result<String> {
     let crs_str = crs.unwrap_or(WGS84_CRS);
-    if let Ok(parsed) = deserialize_crs(crs_str) {
-        if let Some(crs_ref) = parsed {
-            return Ok(crs_ref.to_crs_string());
-        }
+    if let Ok(Some(crs_ref)) = deserialize_crs(crs_str) {
+        return Ok(crs_ref.to_crs_string());
     }
     Ok(crs_str.to_string())
 }

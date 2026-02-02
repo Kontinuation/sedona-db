@@ -310,7 +310,7 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
     where
         F: FnMut(usize, Option<&RasterRefImpl<'_>>, Option<&RasterRefImpl<'_>>) -> Result<()>,
     {
-        if self.arg_types.get(0) != Some(&RASTER) || self.arg_types.get(1) != Some(&RASTER) {
+        if self.arg_types.first() != Some(&RASTER) || self.arg_types.get(1) != Some(&RASTER) {
             return sedona_internal_err!("Expected (raster, raster) argument types");
         }
         if self.args.len() < 2 {
@@ -483,7 +483,7 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
     where
         F: FnMut(Option<&RasterRefImpl<'_>>, Option<&[u8]>, Option<&str>) -> Result<()>,
     {
-        if self.arg_types.get(0) != Some(&RASTER) {
+        if self.arg_types.first() != Some(&RASTER) {
             return sedona_internal_err!("First argument must be a raster type");
         }
         if self.args.len() < 2 {

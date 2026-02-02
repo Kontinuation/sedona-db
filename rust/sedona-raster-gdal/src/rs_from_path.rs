@@ -180,7 +180,7 @@ impl RsFromPath {
             // but the schema requires the `data` field to be non-null.
             // Use an empty (0-length) value as a placeholder; readers must consult
             // `storage_type` + `outdb_*` metadata to load the actual pixels.
-            builder.band_data_writer().append_value(&[]);
+            builder.band_data_writer().append_value([]);
 
             builder
                 .finish_band()

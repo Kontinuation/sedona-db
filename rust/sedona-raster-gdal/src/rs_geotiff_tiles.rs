@@ -36,8 +36,12 @@ use async_trait::async_trait;
 use datafusion::catalog::TableFunctionImpl;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::expressions::Column;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr,
+};
 use datafusion::{
     common::{plan_err, Result},
     datasource::TableType,
@@ -52,7 +56,7 @@ use gdal::spatial_ref::SpatialRef;
 use gdal::{Dataset, DatasetOptions, GdalOpenFlags};
 use sedona_raster::builder::RasterBuilder;
 use sedona_raster::traits::{BandMetadata, RasterMetadata};
-use sedona_schema::raster::{RasterSchema, StorageType};
+use sedona_schema::raster::StorageType;
 use walkdir::WalkDir;
 
 use crate::gdal_common::{gdal_to_band_data_type, nodata_f64_to_bytes};
@@ -109,12 +113,14 @@ pub struct GeoTiffTilesProvider {
 
 impl GeoTiffTilesProvider {
     pub fn try_new(dir: String, recursive: bool) -> Result<Self> {
-        let rast_type = DataType::Struct(RasterSchema::fields());
+        let rast_field = sedona_schema::datatypes::RASTER
+            .to_storage_field("rast", false)
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
         let schema = Schema::new(vec![
             Field::new("path", DataType::Utf8, false),
             Field::new("x", DataType::UInt32, false),
             Field::new("y", DataType::UInt32, false),
-            Field::new("rast", rast_type, false),
+            rast_field,
         ]);
 
         Ok(Self {
@@ -142,15 +148,29 @@ impl datafusion::catalog::TableProvider for GeoTiffTilesProvider {
     async fn scan(
         &self,
         _state: &dyn datafusion::catalog::Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(GeoTiffTilesExec::new(
+        let exec = Arc::new(GeoTiffTilesExec::new(
             self.dir.clone(),
             self.recursive,
             self.schema.clone(),
-        )))
+        ));
+
+        if let Some(projection) = projection {
+            let schema = self.schema();
+            let exprs: Vec<_> = projection
+                .iter()
+                .map(|index| -> (Arc<dyn PhysicalExpr>, String) {
+                    let name = schema.field(*index).name();
+                    (Arc::new(Column::new(name, *index)), name.clone())
+                })
+                .collect();
+            Ok(Arc::new(ProjectionExec::try_new(exprs, exec)?))
+        } else {
+            Ok(exec)
+        }
     }
 }
 
@@ -377,7 +397,7 @@ fn build_batch_for_file(path: PathBuf, schema: SchemaRef) -> Result<Option<Recor
                 })?;
 
                 // Placeholder for out-db pixel bytes.
-                rast_builder.band_data_writer().append_value(&[]);
+                rast_builder.band_data_writer().append_value([]);
 
                 rast_builder.finish_band().map_err(|e| {
                     DataFusionError::Execution(format!(
@@ -466,7 +486,7 @@ fn div_ceil_u32(n: u32, d: u32) -> u32 {
     if d == 0 {
         return 0;
     }
-    (n + d - 1) / d
+    n.div_ceil(d)
 }
 
 #[cfg(test)]
@@ -517,5 +537,22 @@ mod tests {
         assert_eq!(batch.num_columns(), 4);
         // For a 10x10 raster, any reasonable tiling should produce at least one tile.
         assert!(batch.num_rows() >= 1);
+    }
+
+    #[test]
+    fn rast_field_has_raster_metadata() {
+        let provider = GeoTiffTilesProvider::try_new("/tmp".to_string(), false).unwrap();
+        let schema = provider.schema();
+        let rast_field = schema.field_with_name("rast").unwrap();
+        let sedona_type = sedona_schema::datatypes::SedonaType::from_storage_field(rast_field)
+            .expect("sedona type");
+        assert_eq!(sedona_type, sedona_schema::datatypes::RASTER);
+        assert_eq!(
+            rast_field
+                .metadata()
+                .get("ARROW:extension:name")
+                .map(|s| s.as_str()),
+            Some("sedona.raster")
+        );
     }
 }
