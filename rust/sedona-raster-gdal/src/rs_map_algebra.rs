@@ -487,7 +487,7 @@ fn apply_map_algebra(
         .map(|_| BandMetadata {
             nodata_value: nodata.map(|v| nodata_f64_to_bytes(v, output_type)),
             storage_type: StorageType::InDb,
-            datatype: output_type.clone(),
+            datatype: *output_type,
             outdb_url: None,
             outdb_band_id: None,
         })

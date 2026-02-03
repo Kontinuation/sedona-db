@@ -265,7 +265,7 @@ impl RsFromGDALRaster {
             let band_metadata = BandMetadata {
                 nodata_value: nodata_bytes,
                 storage_type: StorageType::InDb,
-                datatype: band_data_type.clone(),
+                datatype: band_data_type,
                 outdb_url: None,
                 outdb_band_id: None,
             };

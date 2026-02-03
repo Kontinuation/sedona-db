@@ -24,10 +24,11 @@ use datafusion_common::{arrow_datafusion_err, DataFusionError, Result};
 use gdal::GeoTransformEx;
 
 use sedona_common::{
-    gdal_per_thread_max_cached_datasets_from_config, DEFAULT_GDAL_PER_THREAD_MAX_CACHED_DATASETS,
+    SedonaOptions, DEFAULT_GDAL_PER_THREAD_MAX_CACHED_DATASETS,
+    DEFAULT_GDAL_PER_THREAD_MAX_CACHED_VRT_DATASETS,
 };
 use sedona_raster::traits::RasterRef;
-use sedona_schema::raster::StorageType;
+use sedona_schema::raster::{BandDataType, StorageType};
 
 use crate::gdal_common::{
     band_data_type_to_gdal, bytes_to_f64, convert_gdal_err, create_outdb_source,
@@ -61,9 +62,9 @@ use crate::gdal_common::{
 ///    - `_gdal_outdb_sources`: contains the opened external GDAL datasets (kept alive via `Rc`).
 pub(crate) struct RasterDataset<'a> {
     /// The dataset to use for further GDAL operations.
-    dataset: gdal::Dataset,
+    dataset: Rc<gdal::Dataset>,
     /// A MEM dataset holding in-db band data when `dataset` is a VRT that references it.
-    _gdal_mem_source: Option<gdal::Dataset>,
+    _gdal_mem_source: Option<Rc<gdal::Dataset>>,
     /// External datasets referenced by the VRT; kept alive for the lifetime of this struct.
     _gdal_outdb_sources: Vec<Rc<gdal::Dataset>>,
     _phantom: PhantomData<&'a ()>,
@@ -80,18 +81,31 @@ thread_local! {
     /// Thread-local lazily-initialized `GDALDatasetProvider`.
     static TL_GDAL_PROVIDER: RefCell<Option<Rc<GDALDatasetProvider>>> = const { RefCell::new(None) };
     static TL_GDAL_CACHE_SIZE: OnceCell<usize> = const { OnceCell::new() };
+    static TL_GDAL_VRT_CACHE_SIZE: OnceCell<usize> = const { OnceCell::new() };
 }
 
 pub(crate) fn configure_thread_local_cache_size(
     config_options: Option<&ConfigOptions>,
 ) -> Result<()> {
-    let Some(cache_size) = gdal_per_thread_max_cached_datasets_from_config(config_options) else {
-        return Ok(());
-    };
+    let cache_size = config_options
+        .and_then(|options| options.extensions.get::<SedonaOptions>())
+        .map(|options| options.gdal.per_thread_max_cached_datasets)
+        .unwrap_or(DEFAULT_GDAL_PER_THREAD_MAX_CACHED_DATASETS);
+
+    let vrt_cache_size = config_options
+        .and_then(|options| options.extensions.get::<SedonaOptions>())
+        .map(|options| options.gdal.per_thread_max_cached_vrt_datasets)
+        .unwrap_or(DEFAULT_GDAL_PER_THREAD_MAX_CACHED_VRT_DATASETS);
 
     if cache_size == 0 {
         return Err(DataFusionError::Configuration(
             "gdal.per_thread_max_cached_datasets must be greater than 0".to_string(),
+        ));
+    }
+
+    if vrt_cache_size == 0 {
+        return Err(DataFusionError::Configuration(
+            "gdal.per_thread_max_cached_vrt_datasets must be greater than 0".to_string(),
         ));
     }
 
@@ -102,6 +116,17 @@ pub(crate) fn configure_thread_local_cache_size(
         cell.set(cache_size).map_err(|_| {
             DataFusionError::Configuration(
                 "Failed to set thread-local GDAL cache size configuration".to_string(),
+            )
+        })
+    })?;
+
+    TL_GDAL_VRT_CACHE_SIZE.with(|cell| {
+        if cell.get().is_some() {
+            return Ok(());
+        }
+        cell.set(vrt_cache_size).map_err(|_| {
+            DataFusionError::Configuration(
+                "Failed to set thread-local GDAL VRT cache size configuration".to_string(),
             )
         })
     })
@@ -120,7 +145,13 @@ pub(crate) fn thread_local_provider() -> Result<Rc<GDALDatasetProvider>> {
                     .copied()
                     .unwrap_or(DEFAULT_GDAL_PER_THREAD_MAX_CACHED_DATASETS)
             });
-            let provider = Rc::new(GDALDatasetProvider::try_new(cache_size)?);
+            let vrt_cache_size = TL_GDAL_VRT_CACHE_SIZE.with(|cache| {
+                cache
+                    .get()
+                    .copied()
+                    .unwrap_or(DEFAULT_GDAL_PER_THREAD_MAX_CACHED_VRT_DATASETS)
+            });
+            let provider = Rc::new(GDALDatasetProvider::try_new(cache_size, vrt_cache_size)?);
             *opt = Some(Rc::clone(&provider));
             Ok(provider)
         }
@@ -148,18 +179,26 @@ impl OutDbSourceKey {
 
 pub(crate) struct GDALDatasetProvider {
     cached_sources: RefCell<lru::LruCache<OutDbSourceKey, Rc<gdal::Dataset>>>,
+    cached_vrts: RefCell<lru::LruCache<VrtKey, Rc<CachedVrt>>>,
 }
 
 impl GDALDatasetProvider {
-    pub fn try_new(cache_capacity: usize) -> Result<Self> {
+    pub fn try_new(cache_capacity: usize, vrt_cache_capacity: usize) -> Result<Self> {
         let Some(cap) = NonZeroUsize::new(cache_capacity) else {
             return Err(DataFusionError::Configuration(
                 "Raster source cache size should be greater than 0".to_string(),
             ));
         };
+        let Some(vrt_cap) = NonZeroUsize::new(vrt_cache_capacity) else {
+            return Err(DataFusionError::Configuration(
+                "Raster VRT cache size should be greater than 0".to_string(),
+            ));
+        };
         let cache = lru::LruCache::new(cap);
+        let vrt_cache = lru::LruCache::new(vrt_cap);
         Ok(Self {
             cached_sources: RefCell::new(cache),
+            cached_vrts: RefCell::new(vrt_cache),
         })
     }
 
@@ -167,14 +206,13 @@ impl GDALDatasetProvider {
         &self,
         raster: &'a R,
     ) -> Result<RasterDataset<'a>> {
-        let metadata = raster.metadata();
         let bands = raster.bands();
         let num_bands = bands.len();
 
         if num_bands == 0 {
             let dataset = raster_ref_to_gdal_empty(raster)?;
             return Ok(RasterDataset {
-                dataset,
+                dataset: Rc::new(dataset),
                 _gdal_mem_source: None,
                 _gdal_outdb_sources: Vec::new(),
                 _phantom: PhantomData,
@@ -192,7 +230,9 @@ impl GDALDatasetProvider {
         }
 
         let mut gdal_mem_source = if !indb_band_indices.is_empty() {
-            Some(unsafe { raster_ref_to_gdal_mem(raster, &indb_band_indices)? })
+            Some(Rc::new(unsafe {
+                raster_ref_to_gdal_mem(raster, &indb_band_indices)?
+            }))
         } else {
             None
         };
@@ -208,7 +248,78 @@ impl GDALDatasetProvider {
             });
         }
 
-        // Mixed or pure out-db: build a VRT dataset referencing sources.
+        if indb_band_indices.is_empty() {
+            let vrt_key = VrtKey::from_raster(raster)?;
+            if let Some(cached) = self.cached_vrts.borrow_mut().get(&vrt_key) {
+                return Ok(RasterDataset {
+                    dataset: Rc::clone(&cached.dataset),
+                    _gdal_mem_source: None,
+                    _gdal_outdb_sources: cached.outdb_sources.clone(),
+                    _phantom: PhantomData,
+                });
+            }
+
+            let (dataset, outdb_sources) = self.build_outdb_vrt(raster)?;
+            let cached = Rc::new(CachedVrt {
+                dataset: Rc::clone(&dataset),
+                outdb_sources: outdb_sources.clone(),
+            });
+            self.cached_vrts
+                .borrow_mut()
+                .put(vrt_key, Rc::clone(&cached));
+
+            return Ok(RasterDataset {
+                dataset,
+                _gdal_mem_source: None,
+                _gdal_outdb_sources: outdb_sources,
+                _phantom: PhantomData,
+            });
+        }
+
+        let (dataset, outdb_sources) =
+            self.build_vrt_from_sources(raster, gdal_mem_source.as_ref())?;
+
+        Ok(RasterDataset {
+            dataset,
+            _gdal_mem_source: gdal_mem_source,
+            _gdal_outdb_sources: outdb_sources,
+            _phantom: PhantomData,
+        })
+    }
+
+    fn get_or_create_outdb_source(
+        &self,
+        path: &str,
+        options: Option<&[&str]>,
+    ) -> Result<Rc<gdal::Dataset>> {
+        let cache_key = OutDbSourceKey::new(path, options);
+        let mut cache = self.cached_sources.borrow_mut();
+        if let Some(cached_source) = cache.get(&cache_key) {
+            Ok(Rc::clone(cached_source))
+        } else {
+            let source_dataset = create_outdb_source(path, options)?;
+            let rc_dataset = Rc::new(source_dataset);
+            cache.put(cache_key, Rc::clone(&rc_dataset));
+            Ok(rc_dataset)
+        }
+    }
+
+    fn build_outdb_vrt<R: RasterRef + ?Sized>(
+        &self,
+        raster: &R,
+    ) -> Result<(Rc<gdal::Dataset>, Vec<Rc<gdal::Dataset>>)> {
+        self.build_vrt_from_sources(raster, None)
+    }
+
+    fn build_vrt_from_sources<R: RasterRef + ?Sized>(
+        &self,
+        raster: &R,
+        gdal_mem_source: Option<&Rc<gdal::Dataset>>,
+    ) -> Result<(Rc<gdal::Dataset>, Vec<Rc<gdal::Dataset>>)> {
+        let metadata = raster.metadata();
+        let bands = raster.bands();
+        let num_bands = bands.len();
+
         let width = metadata.width() as i32;
         let height = metadata.height() as i32;
         let mut vrt =
@@ -334,29 +445,165 @@ impl GDALDatasetProvider {
             }
         }
 
-        Ok(RasterDataset {
-            dataset: vrt.as_dataset(),
-            _gdal_mem_source: gdal_mem_source,
-            _gdal_outdb_sources: outdb_sources,
-            _phantom: PhantomData,
+        Ok((Rc::new(vrt.as_dataset()), outdb_sources))
+    }
+}
+
+#[derive(Hash, Eq, PartialEq)]
+struct VrtBandKey {
+    storage_type: StorageType,
+    data_type: BandDataType,
+    nodata_bits: Option<u64>,
+    outdb_url: Option<String>,
+    outdb_band_id: Option<u32>,
+}
+
+#[derive(Hash, Eq, PartialEq)]
+struct VrtKey {
+    width: u64,
+    height: u64,
+    geotransform_bits: [u64; 6],
+    crs: Option<String>,
+    bands: Vec<VrtBandKey>,
+}
+
+impl VrtKey {
+    fn from_raster<R: RasterRef + ?Sized>(raster: &R) -> Result<Self> {
+        let metadata = raster.metadata();
+        let bands = raster.bands();
+        let num_bands = bands.len();
+
+        let geotransform = [
+            metadata.upper_left_x(),
+            metadata.scale_x(),
+            metadata.skew_x(),
+            metadata.upper_left_y(),
+            metadata.skew_y(),
+            metadata.scale_y(),
+        ];
+        let geotransform_bits = geotransform.map(f64::to_bits);
+
+        let mut band_keys = Vec::with_capacity(num_bands);
+        for i in 1..=num_bands {
+            let band = bands.band(i).map_err(|e| arrow_datafusion_err!(e))?;
+            let band_metadata = band.metadata();
+            let band_type = band_metadata.data_type();
+            let nodata_bits = band_metadata
+                .nodata_value()
+                .map(|bytes| bytes_to_f64(bytes, &band_type))
+                .transpose()?
+                .map(f64::to_bits);
+            band_keys.push(VrtBandKey {
+                storage_type: band_metadata.storage_type(),
+                data_type: band_type,
+                nodata_bits,
+                outdb_url: band_metadata.outdb_url().map(|s| s.to_string()),
+                outdb_band_id: band_metadata.outdb_band_id(),
+            });
+        }
+
+        Ok(Self {
+            width: metadata.width(),
+            height: metadata.height(),
+            geotransform_bits,
+            crs: raster.crs().map(|s| s.to_string()),
+            bands: band_keys,
         })
     }
+}
 
-    fn get_or_create_outdb_source(
-        &self,
-        path: &str,
-        options: Option<&[&str]>,
-    ) -> Result<Rc<gdal::Dataset>> {
-        let cache_key = OutDbSourceKey::new(path, options);
-        let mut cache = self.cached_sources.borrow_mut();
-        if let Some(cached_source) = cache.get(&cache_key) {
-            Ok(Rc::clone(cached_source))
-        } else {
-            let source_dataset = create_outdb_source(path, options)?;
-            let rc_dataset = Rc::new(source_dataset);
-            cache.put(cache_key, Rc::clone(&rc_dataset));
-            Ok(rc_dataset)
-        }
+struct CachedVrt {
+    dataset: Rc<gdal::Dataset>,
+    outdb_sources: Vec<Rc<gdal::Dataset>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GDALDatasetProvider;
+    use std::sync::Once;
+
+    use gdal::raster::Buffer;
+    use gdal::DriverManager;
+    use sedona_raster::array::RasterStructArray;
+    use sedona_raster::builder::RasterBuilder;
+    use sedona_raster::traits::{BandMetadata, RasterMetadata};
+    use sedona_schema::raster::{BandDataType, StorageType};
+    use tempfile::TempDir;
+
+    static GDAL_INIT: Once = Once::new();
+
+    fn ensure_gdal_drivers() {
+        GDAL_INIT.call_once(|| {
+            let _ = DriverManager::get_driver_by_name("GTiff");
+            let _ = DriverManager::get_driver_by_name("VRT");
+        });
+    }
+
+    fn create_source_tiff(temp_dir: &TempDir) -> String {
+        let path = temp_dir.path().join("source.tif");
+        let path_str = path.to_string_lossy().to_string();
+
+        let driver = DriverManager::get_driver_by_name("GTiff").unwrap();
+        let mut dataset = driver
+            .create_with_band_type::<u8, _>(&path_str, 8, 8, 1)
+            .unwrap();
+        dataset
+            .set_geo_transform(&[0.0, 1.0, 0.0, 8.0, 0.0, -1.0])
+            .unwrap();
+        let mut band = dataset.rasterband(1).unwrap();
+        band.set_no_data_value(Some(0.0)).unwrap();
+        let mut buffer = Buffer::new((8, 8), vec![1u8; 8 * 8]);
+        band.write((0, 0), (8, 8), &mut buffer).unwrap();
+
+        path_str
+    }
+
+    fn build_outdb_raster(path: &str) -> arrow_array::StructArray {
+        let mut builder = RasterBuilder::new(1);
+        let metadata = RasterMetadata {
+            width: 8,
+            height: 8,
+            upperleft_x: 0.0,
+            upperleft_y: 8.0,
+            scale_x: 1.0,
+            scale_y: -1.0,
+            skew_x: 0.0,
+            skew_y: 0.0,
+        };
+        builder.start_raster(&metadata, None).unwrap();
+
+        let band_metadata = BandMetadata {
+            nodata_value: Some(vec![0u8]),
+            storage_type: StorageType::OutDbRef,
+            datatype: BandDataType::UInt8,
+            outdb_url: Some(path.to_string()),
+            outdb_band_id: Some(1),
+        };
+        builder.start_band(band_metadata).unwrap();
+        builder.band_data_writer().append_value([]);
+        builder.finish_band().unwrap();
+        builder.finish_raster().unwrap();
+
+        builder.finish().unwrap()
+    }
+
+    #[test]
+    fn test_outdb_vrt_cache_reuse() {
+        ensure_gdal_drivers();
+        let temp_dir = TempDir::new().unwrap();
+        let path = create_source_tiff(&temp_dir);
+        let raster_struct = build_outdb_raster(&path);
+        let raster_array = RasterStructArray::new(&raster_struct);
+        let raster = raster_array.get(0).unwrap();
+
+        let provider = GDALDatasetProvider::try_new(4, 4).unwrap();
+        let first = provider.raster_ref_to_gdal(&raster).unwrap();
+        let second = provider.raster_ref_to_gdal(&raster).unwrap();
+
+        assert_eq!(
+            first.as_dataset().c_dataset(),
+            second.as_dataset().c_dataset()
+        );
     }
 }
 

@@ -194,7 +194,7 @@ impl SedonaScalarKernel for RsAsRaster {
             match as_raster(
                 geom_wkb,
                 &raster,
-                band_type.clone(),
+                band_type,
                 all_touched,
                 burn_value,
                 nodata_value,

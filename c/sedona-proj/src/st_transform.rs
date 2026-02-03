@@ -23,8 +23,8 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::{exec_err, DataFusionError, Result, ScalarValue};
 use datafusion_expr::ColumnarValue;
 use sedona_common::{
-    proj_per_thread_max_cached_items_from_config, sedona_internal_datafusion_err,
-    sedona_internal_err, DEFAULT_PROJ_PER_THREAD_MAX_CACHED_ITEMS,
+    sedona_internal_datafusion_err, sedona_internal_err, SedonaOptions,
+    DEFAULT_PROJ_PER_THREAD_MAX_CACHED_ITEMS,
 };
 use sedona_expr::item_crs::make_item_crs;
 use sedona_expr::scalar_udf::{ScalarKernelRef, SedonaScalarKernel};
@@ -450,23 +450,26 @@ thread_local! {
 }
 
 fn maybe_configure_proj_cache(config_options: Option<&ConfigOptions>) -> Result<()> {
-    if let Some(cache_size) = proj_per_thread_max_cached_items_from_config(config_options) {
-        if cache_size == 0 {
-            return Err(DataFusionError::Configuration(
-                "proj.per_thread_max_cached_items must be greater than 0".to_string(),
-            ));
-        }
-        PROJ_CACHE_SIZE.with(|cell| {
-            if cell.get().is_some() {
-                return Ok(());
-            }
-            cell.set(cache_size).map_err(|_| {
-                sedona_internal_datafusion_err!(
-                    "Failed to set thread-local PROJ cache size configuration"
-                )
-            })
-        })?;
+    let cache_size = config_options
+        .and_then(|options| options.extensions.get::<SedonaOptions>())
+        .map(|options| options.proj.per_thread_max_cached_items)
+        .unwrap_or(DEFAULT_PROJ_PER_THREAD_MAX_CACHED_ITEMS);
+
+    if cache_size == 0 {
+        return Err(DataFusionError::Configuration(
+            "proj.per_thread_max_cached_items must be greater than 0".to_string(),
+        ));
     }
+    PROJ_CACHE_SIZE.with(|cell| {
+        if cell.get().is_some() {
+            return Ok(());
+        }
+        cell.set(cache_size).map_err(|_| {
+            sedona_internal_datafusion_err!(
+                "Failed to set thread-local PROJ cache size configuration"
+            )
+        })
+    })?;
     Ok(())
 }
 

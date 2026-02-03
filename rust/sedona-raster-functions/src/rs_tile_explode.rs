@@ -655,14 +655,14 @@ fn generate_tiles(
                         || {
                             // If no nodata value is set and we need to pad, use the provided nodata_val
                             if pad_with_nodata {
-                                nodata_val.map(|v| nodata_to_bytes(v, data_type.clone()))
+                                nodata_val.map(|v| nodata_to_bytes(v, data_type))
                             } else {
                                 None
                             }
                         },
                     ),
-                    storage_type: storage_type.clone(),
-                    datatype: data_type.clone(),
+                    storage_type,
+                    datatype: data_type,
                     outdb_url: band_meta.outdb_url().map(|s: &str| s.to_string()),
                     outdb_band_id: band_meta.outdb_band_id(),
                 };
@@ -686,9 +686,9 @@ fn generate_tiles(
                         actual_height,
                         bytes_per_pixel,
                         pad_with_nodata,
-                        band_meta.nodata_value().or(nodata_val
-                            .map(|v| nodata_to_bytes(v, data_type.clone()))
-                            .as_deref()),
+                        band_meta
+                            .nodata_value()
+                            .or(nodata_val.map(|v| nodata_to_bytes(v, data_type)).as_deref()),
                     );
 
                     raster_builder.band_data_writer().append_value(&tile_data);

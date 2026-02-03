@@ -18,7 +18,6 @@ use std::fmt::Display;
 
 use datafusion::config::{ConfigEntry, ConfigExtension, ConfigField, ExtensionOptions, Visit};
 use datafusion::prelude::SessionConfig;
-use datafusion_common::config::ConfigOptions;
 use datafusion_common::config_namespace;
 use datafusion_common::Result;
 use regex::Regex;
@@ -35,6 +34,10 @@ pub const DEFAULT_PROJ_PER_THREAD_MAX_CACHED_ITEMS: usize = 100;
 
 /// Default maximum number of GDAL datasets cached per thread.
 pub const DEFAULT_GDAL_PER_THREAD_MAX_CACHED_DATASETS: usize = 32;
+
+/// Default maximum number of GDAL VRT datasets cached per thread.
+pub const DEFAULT_GDAL_PER_THREAD_MAX_CACHED_VRT_DATASETS: usize =
+    DEFAULT_GDAL_PER_THREAD_MAX_CACHED_DATASETS;
 
 /// Helper function to register the spatial join optimizer with a session config
 pub fn add_sedona_option_extension(config: SessionConfig) -> SessionConfig {
@@ -68,6 +71,9 @@ config_namespace! {
     pub struct GdalOptions {
         /// Maximum number of GDAL datasets cached per thread
         pub per_thread_max_cached_datasets: usize, default = DEFAULT_GDAL_PER_THREAD_MAX_CACHED_DATASETS
+
+        /// Maximum number of GDAL VRT datasets cached per thread
+        pub per_thread_max_cached_vrt_datasets: usize, default = DEFAULT_GDAL_PER_THREAD_MAX_CACHED_VRT_DATASETS
     }
 }
 
@@ -427,24 +433,6 @@ impl ConfigField for TgIndexType {
         *self = index_type;
         Ok(())
     }
-}
-
-/// Returns the configured PROJ cache size when available.
-pub fn proj_per_thread_max_cached_items_from_config(
-    config_options: Option<&ConfigOptions>,
-) -> Option<usize> {
-    config_options
-        .and_then(|options| options.extensions.get::<SedonaOptions>())
-        .map(|options| options.proj.per_thread_max_cached_items)
-}
-
-/// Returns the configured GDAL cache size when available.
-pub fn gdal_per_thread_max_cached_datasets_from_config(
-    config_options: Option<&ConfigOptions>,
-) -> Option<usize> {
-    config_options
-        .and_then(|options| options.extensions.get::<SedonaOptions>())
-        .map(|options| options.gdal.per_thread_max_cached_datasets)
 }
 
 #[cfg(test)]

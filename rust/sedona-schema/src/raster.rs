@@ -92,7 +92,7 @@ impl RasterSchema {
 /// In future versions, consider support for complex types used in
 /// radar and other wave-based data.
 #[repr(u16)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy)]
 pub enum BandDataType {
     UInt8 = 0,
     UInt16 = 1,
@@ -118,7 +118,7 @@ pub enum BandDataType {
 ///   - Best for: Large satellite imagery, time series data, cloud-native workflows
 ///   - Supported backends: S3, GCS, Azure Blob, local filesystem, HTTP endpoints
 #[repr(u16)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy)]
 pub enum StorageType {
     InDb = 0,
     OutDbRef = 1,
