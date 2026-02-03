@@ -41,6 +41,7 @@ use gdal::vector::Geometry;
 use gdal::DriverManager;
 
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
+use sedona_raster::affine_transformation::to_world_coordinate;
 use sedona_raster::array::RasterRefImpl;
 use sedona_raster::traits::RasterRef;
 use sedona_raster_functions::RasterExecutor;
@@ -704,8 +705,6 @@ fn compute_zonal_stats(
     exclude_nodata: bool,
 ) -> Result<ZonalStatistics> {
     let metadata = raster.metadata();
-    let width = metadata.width() as usize;
-    let height = metadata.height() as usize;
 
     let mut band_reader = RasterBandReader::new(raster);
 
@@ -713,6 +712,18 @@ fn compute_zonal_stats(
     let geometry = Geometry::from_wkb(geom_wkb).map_err(|e| {
         DataFusionError::Execution(format!("Failed to parse geometry from WKB: {}", e))
     })?;
+
+    let geom_bounds = bounds_from_envelope(geometry.envelope());
+    let raster_bounds = raster_bounds(raster);
+    let intersection = match geom_bounds.intersection(raster_bounds) {
+        Some(bounds) => bounds,
+        None => return compute_statistics(&[]),
+    };
+
+    let window = match bounds_to_window(raster, intersection)? {
+        Some(window) => window,
+        None => return compute_statistics(&[]),
+    };
 
     // Create GDAL dataset from raster (thread-local provider)
     let provider = crate::gdal_dataset_provider::thread_local_provider()
@@ -727,15 +738,17 @@ fn compute_zonal_stats(
         .map_err(|e| DataFusionError::Execution(format!("Failed to get MEM driver: {}", e)))?;
 
     let mut mask_dataset = mem_driver
-        .create_with_band_type::<u8, _>("", width, height, 1)
+        .create_with_band_type::<u8, _>("", window.width, window.height, 1)
         .map_err(|e| DataFusionError::Execution(format!("Failed to create mask dataset: {}", e)))?;
 
     // Set geotransform
+    let start_col = window.xoff as f64;
+    let start_row = window.yoff as f64;
     let geotransform = [
-        metadata.upper_left_x(),
+        metadata.upper_left_x() + start_col * metadata.scale_x() + start_row * metadata.skew_x(),
         metadata.scale_x(),
         metadata.skew_x(),
-        metadata.upper_left_y(),
+        metadata.upper_left_y() + start_col * metadata.skew_y() + start_row * metadata.scale_y(),
         metadata.skew_y(),
         metadata.scale_y(),
     ];
@@ -755,10 +768,10 @@ fn compute_zonal_stats(
         let mut mask_band = mask_dataset
             .rasterband(1)
             .map_err(|e| DataFusionError::Execution(format!("Failed to get mask band: {}", e)))?;
-        let zeros = vec![0u8; width * height];
-        let mut buffer = Buffer::new((width, height), zeros);
+        let zeros = vec![0u8; window.width * window.height];
+        let mut buffer = Buffer::new((window.width, window.height), zeros);
         mask_band
-            .write((0, 0), (width, height), &mut buffer)
+            .write((0, 0), (window.width, window.height), &mut buffer)
             .map_err(|e| DataFusionError::Execution(format!("Failed to initialize mask: {}", e)))?;
     }
 
@@ -782,7 +795,12 @@ fn compute_zonal_stats(
         .rasterband(1)
         .map_err(|e| DataFusionError::Execution(format!("Failed to get mask band: {}", e)))?;
     let mask_buffer = mask_band
-        .read_as::<u8>((0, 0), (width, height), (width, height), None)
+        .read_as::<u8>(
+            (0, 0),
+            (window.width, window.height),
+            (window.width, window.height),
+            None,
+        )
         .map_err(|e| DataFusionError::Execution(format!("Failed to read mask: {}", e)))?;
     let mask = mask_buffer.data();
 
@@ -805,9 +823,13 @@ fn compute_zonal_stats(
     // Collect pixel values within the geometry
     let mut values: Vec<f64> = Vec::new();
 
-    let band_values = band_reader.read_window_f64(band_num, (0, 0), (width, height))?;
+    let band_values = band_reader.read_window_f64(
+        band_num,
+        (window.xoff, window.yoff),
+        (window.width, window.height),
+    )?;
 
-    for (pixel_idx, &mask_val) in mask.iter().enumerate().take(width * height) {
+    for (pixel_idx, &mask_val) in mask.iter().enumerate().take(window.width * window.height) {
         if mask_val == 1 {
             let value = band_values[pixel_idx];
 
@@ -826,6 +848,157 @@ fn compute_zonal_stats(
 
     // Compute statistics
     compute_statistics(&values)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Bounds {
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+}
+
+impl Bounds {
+    fn intersection(self, other: Bounds) -> Option<Bounds> {
+        let min_x = self.min_x.max(other.min_x);
+        let max_x = self.max_x.min(other.max_x);
+        let min_y = self.min_y.max(other.min_y);
+        let max_y = self.max_y.min(other.max_y);
+
+        if min_x > max_x || min_y > max_y {
+            None
+        } else {
+            Some(Bounds {
+                min_x,
+                max_x,
+                min_y,
+                max_y,
+            })
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RasterWindow {
+    xoff: usize,
+    yoff: usize,
+    width: usize,
+    height: usize,
+}
+
+fn bounds_from_envelope(env: gdal::vector::Envelope) -> Bounds {
+    Bounds {
+        min_x: env.MinX,
+        max_x: env.MaxX,
+        min_y: env.MinY,
+        max_y: env.MaxY,
+    }
+}
+
+fn raster_bounds(raster: &RasterRefImpl<'_>) -> Bounds {
+    let metadata = raster.metadata();
+    let width = metadata.width() as i64;
+    let height = metadata.height() as i64;
+    let corners = [
+        to_world_coordinate(raster, 0, 0),
+        to_world_coordinate(raster, width, 0),
+        to_world_coordinate(raster, 0, height),
+        to_world_coordinate(raster, width, height),
+    ];
+
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+
+    for (x, y) in corners {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+
+    Bounds {
+        min_x,
+        max_x,
+        min_y,
+        max_y,
+    }
+}
+
+fn world_to_pixel_f64(
+    raster: &RasterRefImpl<'_>,
+    world_x: f64,
+    world_y: f64,
+) -> Result<(f64, f64)> {
+    let metadata = raster.metadata();
+    let det = metadata.scale_x() * metadata.scale_y() - metadata.skew_x() * metadata.skew_y();
+
+    if det.abs() < f64::EPSILON {
+        return Err(DataFusionError::Execution(
+            "Cannot compute coordinate: determinant is zero.".to_string(),
+        ));
+    }
+
+    let inv_scale_x = metadata.scale_y() / det;
+    let inv_scale_y = metadata.scale_x() / det;
+    let inv_skew_x = -metadata.skew_x() / det;
+    let inv_skew_y = -metadata.skew_y() / det;
+
+    let dx = world_x - metadata.upper_left_x();
+    let dy = world_y - metadata.upper_left_y();
+
+    let col = inv_scale_x * dx + inv_skew_x * dy;
+    let row = inv_skew_y * dx + inv_scale_y * dy;
+
+    Ok((col, row))
+}
+
+fn bounds_to_window(raster: &RasterRefImpl<'_>, bounds: Bounds) -> Result<Option<RasterWindow>> {
+    let metadata = raster.metadata();
+    let raster_w = metadata.width() as isize;
+    let raster_h = metadata.height() as isize;
+
+    let corners = [
+        (bounds.min_x, bounds.min_y),
+        (bounds.min_x, bounds.max_y),
+        (bounds.max_x, bounds.min_y),
+        (bounds.max_x, bounds.max_y),
+    ];
+
+    let mut min_col = f64::INFINITY;
+    let mut max_col = f64::NEG_INFINITY;
+    let mut min_row = f64::INFINITY;
+    let mut max_row = f64::NEG_INFINITY;
+
+    for (x, y) in corners {
+        let (col, row) = world_to_pixel_f64(raster, x, y)?;
+        min_col = min_col.min(col);
+        max_col = max_col.max(col);
+        min_row = min_row.min(row);
+        max_row = max_row.max(row);
+    }
+
+    let mut start_col = min_col.floor() as isize - 1;
+    let mut end_col = max_col.ceil() as isize + 1;
+    let mut start_row = min_row.floor() as isize - 1;
+    let mut end_row = max_row.ceil() as isize + 1;
+
+    start_col = start_col.max(0).min(raster_w);
+    end_col = end_col.max(0).min(raster_w);
+    start_row = start_row.max(0).min(raster_h);
+    end_row = end_row.max(0).min(raster_h);
+
+    if end_col <= start_col || end_row <= start_row {
+        return Ok(None);
+    }
+
+    Ok(Some(RasterWindow {
+        xoff: start_col as usize,
+        yoff: start_row as usize,
+        width: (end_col - start_col) as usize,
+        height: (end_row - start_row) as usize,
+    }))
 }
 
 /// Compute all statistics from a vector of values
