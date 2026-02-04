@@ -17,8 +17,8 @@
 
 //! rs_geotiff_tiles UDTF
 //!
-//! Read a directory of GeoTIFF files as a table where each row is one internal tile (block)
-//! of the source dataset.
+//! Read a GeoTIFF file or directory of GeoTIFF files as a table where each row is one
+//! internal tile (block) of the source dataset.
 //!
 //! Output schema:
 //! - path: string
@@ -73,7 +73,7 @@ impl TableFunctionImpl for RsGeoTiffTilesFunction {
     fn call(&self, exprs: &[Expr]) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
         if exprs.is_empty() || exprs.len() > 2 {
             return plan_err!(
-                "rs_geotiff_tiles() expected 1 or 2 arguments (dir[, recursive]) but got {}",
+                "rs_geotiff_tiles() expected 1 or 2 arguments (path[, recursive]) but got {}",
                 exprs.len()
             );
         }
@@ -83,7 +83,7 @@ impl TableFunctionImpl for RsGeoTiffTilesFunction {
             Expr::Literal(ScalarValue::Utf8View(Some(s)), _) => s.to_string(),
             Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => s.clone(),
             other => {
-                return plan_err!("rs_geotiff_tiles() expected literal string dir but got {other}")
+                return plan_err!("rs_geotiff_tiles() expected literal string path but got {other}")
             }
         };
 
@@ -204,7 +204,7 @@ impl DisplayAs for GeoTiffTilesExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "GeoTiffTilesExec: dir='{}', recursive={}",
+            "GeoTiffTilesExec: path='{}', recursive={}",
             self.dir, self.recursive
         )
     }
@@ -432,16 +432,24 @@ pub(crate) fn build_batch_for_file(
     Ok(Some(batch))
 }
 
-fn list_geotiffs(dir: &str, recursive: bool) -> Result<Vec<PathBuf>> {
-    let base = Path::new(dir);
+fn list_geotiffs(path: &str, recursive: bool) -> Result<Vec<PathBuf>> {
+    let base = Path::new(path);
     if !base.exists() {
         return Err(DataFusionError::Execution(format!(
-            "rs_geotiff_tiles(): directory does not exist: {dir}"
+            "rs_geotiff_tiles(): path does not exist: {path}"
         )));
+    }
+    if base.is_file() {
+        if !is_geotiff_path(base) {
+            return Err(DataFusionError::Execution(format!(
+                "rs_geotiff_tiles(): path is not a GeoTIFF file: {path}"
+            )));
+        }
+        return Ok(vec![base.to_path_buf()]);
     }
     if !base.is_dir() {
         return Err(DataFusionError::Execution(format!(
-            "rs_geotiff_tiles(): path is not a directory: {dir}"
+            "rs_geotiff_tiles(): path is not a directory: {path}"
         )));
     }
 
@@ -458,18 +466,23 @@ fn list_geotiffs(dir: &str, recursive: bool) -> Result<Vec<PathBuf>> {
         }
 
         let p = entry.into_path();
-        let ext = p
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_ascii_lowercase());
-
-        if matches!(ext.as_deref(), Some("tif") | Some("tiff")) {
+        if is_geotiff_path(&p) {
             out.push(p);
         }
     }
 
     out.sort();
     Ok(out)
+}
+
+fn is_geotiff_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some("tif") | Some("tiff")
+    )
 }
 
 fn open_geotiff(path: &str) -> Result<Dataset> {
@@ -517,6 +530,31 @@ mod tests {
         let files = list_geotiffs(base.to_str().unwrap(), false).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].to_string_lossy().ends_with("a.tif"));
+    }
+
+    #[test]
+    fn list_geotiffs_file_input_returns_single() {
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let file_path = base.join("single.tiff");
+        std::fs::write(&file_path, b"not a real tiff").unwrap();
+
+        let files = list_geotiffs(file_path.to_str().unwrap(), true).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], file_path);
+    }
+
+    #[test]
+    fn list_geotiffs_file_input_non_tiff_errors() {
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        let file_path = base.join("single.txt");
+        std::fs::write(&file_path, b"not a real tiff").unwrap();
+
+        let err = list_geotiffs(file_path.to_str().unwrap(), false).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("rs_geotiff_tiles(): path is not a GeoTIFF file"));
     }
 
     #[tokio::test]
