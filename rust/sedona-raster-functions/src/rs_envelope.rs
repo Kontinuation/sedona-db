@@ -17,12 +17,14 @@
 use std::sync::Arc;
 
 use crate::executor::RasterExecutor;
-use arrow_array::builder::BinaryBuilder;
+use arrow_array::builder::{BinaryBuilder, StringViewBuilder};
 use datafusion_common::DataFusionError;
 use datafusion_common::Result;
+use datafusion_common::ScalarValue;
 use datafusion_expr::{
     scalar_doc_sections::DOC_SECTION_OTHER, ColumnarValue, Documentation, Volatility,
 };
+use sedona_expr::item_crs::make_item_crs;
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_geometry::wkb_factory::write_wkb_polygon;
 use sedona_raster::affine_transformation::to_world_coordinate;
@@ -58,10 +60,8 @@ struct RsEnvelope {}
 
 impl SedonaScalarKernel for RsEnvelope {
     fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
-        let matcher = ArgMatcher::new(
-            vec![ArgMatcher::is_raster()],
-            SedonaType::Wkb(Edges::Planar, None),
-        );
+        let out_type = SedonaType::new_item_crs(&SedonaType::Wkb(Edges::Planar, None))?;
+        let matcher = ArgMatcher::new(vec![ArgMatcher::is_raster()], out_type);
 
         matcher.match_args(args)
     }
@@ -78,19 +78,38 @@ impl SedonaScalarKernel for RsEnvelope {
             executor.num_iterations(),
             executor.num_iterations() * bytes_per_poly,
         );
+        let mut crs_builder = StringViewBuilder::with_capacity(executor.num_iterations());
 
         executor.execute_raster_void(|_i, raster_opt| {
             match raster_opt {
                 Some(raster) => {
                     create_envelope_wkb(raster, &mut builder)?;
                     builder.append_value([]);
+                    crs_builder.append_value(raster.crs().unwrap_or("0"));
                 }
-                None => builder.append_null(),
+                None => {
+                    builder.append_null();
+                    crs_builder.append_null();
+                }
             }
             Ok(())
         })?;
 
-        executor.finish(Arc::new(builder.finish()))
+        let item_array = builder.finish();
+        let item_result = executor.finish(Arc::new(item_array))?;
+        let crs_array = crs_builder.finish();
+        let crs_value = if matches!(item_result, ColumnarValue::Scalar(_)) {
+            ColumnarValue::Scalar(ScalarValue::try_from_array(&crs_array, 0)?)
+        } else {
+            ColumnarValue::Array(Arc::new(crs_array))
+        };
+
+        make_item_crs(
+            &SedonaType::Wkb(Edges::Planar, None),
+            item_result,
+            &crs_value,
+            None,
+        )
     }
 }
 
@@ -127,7 +146,7 @@ mod tests {
     use sedona_schema::datatypes::RASTER;
     use sedona_schema::datatypes::WKB_GEOMETRY;
     use sedona_testing::compare::assert_array_equal;
-    use sedona_testing::create::create_array;
+    use sedona_testing::create::create_array_item_crs;
     use sedona_testing::rasters::generate_test_rasters;
     use sedona_testing::testers::ScalarUdfTester;
 
@@ -158,12 +177,13 @@ mod tests {
         // (3.60000000, 4.24000000)
         // (3.84000000, 2.64000000)
         // (3.24000000, 2.40000000)
-        let expected = &create_array(
+        let expected = &create_array_item_crs(
             &[
                 None,
                 Some("POLYGON ((2.0 3.0, 2.2 3.08, 2.29 2.48, 2.09 2.4, 2.0 3.0))"),
                 Some("POLYGON ((3.0 4.0, 3.6 4.24, 3.84 2.64, 3.24 2.4, 3.0 4.0))"),
             ],
+            [None, Some("OGC:CRS84"), Some("OGC:CRS84")],
             &WKB_GEOMETRY,
         );
 
