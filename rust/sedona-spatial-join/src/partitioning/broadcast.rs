@@ -24,6 +24,7 @@ use crate::partitioning::{SpatialPartition, SpatialPartitioner};
 /// A partitioner that assigns everything to the Multi partition.
 ///
 /// This partitioner is useful when we want to broadcast the data to all partitions.
+#[derive(Clone)]
 pub struct BroadcastPartitioner {
     num_partitions: usize,
 }
@@ -45,6 +46,10 @@ impl SpatialPartitioner for BroadcastPartitioner {
 
     fn partition_no_multi(&self, _bbox: &BoundingBox) -> Result<SpatialPartition> {
         sedona_internal_err!("BroadcastPartitioner does not support partition_no_multi")
+    }
+
+    fn box_clone(&self) -> Box<dyn SpatialPartitioner> {
+        Box::new(self.clone())
     }
 }
 
