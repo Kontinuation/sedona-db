@@ -129,7 +129,26 @@ pub(crate) fn configure_thread_local_cache_size(
                 "Failed to set thread-local GDAL VRT cache size configuration".to_string(),
             )
         })
-    })
+    })?;
+
+    // Set frequently requested GDAL config options as thread-local options to eliminate the
+    // need for acquiring configs from global config or environment variable, which is very
+    // likely to result in heavy contention in multi-threaded environments.
+    let thread_local_options = [
+        ("CPL_DEBUG", "OFF"),
+        ("OSR_DEFAULT_AXIS_MAPPING_STRATEGY", "AUTHORITY_COMPLIANT"),
+        ("GDAL_VALIDATE_CREATION_OPTIONS", "YES"),
+        ("CHECK_WITH_INVERT_PROJ", "NO"),
+        ("GDAL_FORCE_CACHING", "NO"),
+        ("GDAL_ENABLE_READ_WRITE_MUTEX", "YES"),
+    ];
+
+    for (key, value) in thread_local_options {
+        gdal::config::set_thread_local_config_option(key, value)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    }
+
+    Ok(())
 }
 
 /// Get or create the thread-local `GDALDatasetProvider`.

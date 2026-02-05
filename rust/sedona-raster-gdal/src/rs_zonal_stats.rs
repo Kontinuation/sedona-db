@@ -725,14 +725,6 @@ fn compute_zonal_stats(
         None => return compute_statistics(&[]),
     };
 
-    // Create GDAL dataset from raster (thread-local provider)
-    let provider = crate::gdal_dataset_provider::thread_local_provider()
-        .map_err(|e| DataFusionError::Execution(format!("Failed to init GDAL provider: {}", e)))?;
-    let raster_ds = provider
-        .raster_ref_to_gdal(raster)
-        .map_err(|e| DataFusionError::Execution(format!("Failed to create GDAL dataset: {}", e)))?;
-    let gdal_dataset = raster_ds.as_dataset();
-
     // Create a mask raster
     let mem_driver = DriverManager::get_driver_by_name("MEM")
         .map_err(|e| DataFusionError::Execution(format!("Failed to get MEM driver: {}", e)))?;
@@ -756,24 +748,15 @@ fn compute_zonal_stats(
         .set_geo_transform(&geotransform)
         .map_err(|e| DataFusionError::Execution(format!("Failed to set geotransform: {}", e)))?;
 
-    // Set spatial reference
-    if let Ok(srs) = gdal_dataset.spatial_ref() {
-        mask_dataset.set_spatial_ref(&srs).map_err(|e| {
-            DataFusionError::Execution(format!("Failed to set spatial reference: {}", e))
-        })?;
-    }
-
     // Initialize mask to 0
-    {
-        let mut mask_band = mask_dataset
-            .rasterband(1)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to get mask band: {}", e)))?;
-        let zeros = vec![0u8; window.width * window.height];
-        let mut buffer = Buffer::new((window.width, window.height), zeros);
-        mask_band
-            .write((0, 0), (window.width, window.height), &mut buffer)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to initialize mask: {}", e)))?;
-    }
+    let mut mask_band = mask_dataset
+        .rasterband(1)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to get mask band: {}", e)))?;
+    let zeros = vec![0u8; window.width * window.height];
+    let mut buffer = Buffer::new((window.width, window.height), zeros);
+    mask_band
+        .write((0, 0), (window.width, window.height), &mut buffer)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to initialize mask: {}", e)))?;
 
     // Rasterize geometry
     let rasterize_options = RasterizeOptions {

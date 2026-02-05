@@ -289,14 +289,6 @@ fn clip_raster(
         DataFusionError::Execution(format!("Failed to parse geometry from WKB: {}", e))
     })?;
 
-    // Create GDAL dataset from raster to use for spatial reference (thread-local provider)
-    let provider = crate::gdal_dataset_provider::thread_local_provider()
-        .map_err(|e| DataFusionError::Execution(format!("Failed to init GDAL provider: {}", e)))?;
-    let raster_ds = provider
-        .raster_ref_to_gdal(raster)
-        .map_err(|e| DataFusionError::Execution(format!("Failed to create GDAL dataset: {}", e)))?;
-    let gdal_dataset = raster_ds.as_dataset();
-
     // Create a mask raster (same dimensions as input)
     let mem_driver = DriverManager::get_driver_by_name("MEM")
         .map_err(|e| DataFusionError::Execution(format!("Failed to get MEM driver: {}", e)))?;
@@ -318,24 +310,15 @@ fn clip_raster(
         .set_geo_transform(&geotransform)
         .map_err(|e| DataFusionError::Execution(format!("Failed to set geotransform: {}", e)))?;
 
-    // Set spatial reference if available
-    if let Ok(srs) = gdal_dataset.spatial_ref() {
-        mask_dataset.set_spatial_ref(&srs).map_err(|e| {
-            DataFusionError::Execution(format!("Failed to set spatial reference: {}", e))
-        })?;
-    }
-
     // Initialize mask to 0 (outside)
-    {
-        let mut mask_band = mask_dataset
-            .rasterband(1)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to get mask band: {}", e)))?;
-        let zeros = vec![0u8; width * height];
-        let mut buffer = Buffer::new((width, height), zeros);
-        mask_band
-            .write((0, 0), (width, height), &mut buffer)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to initialize mask: {}", e)))?;
-    }
+    let mut mask_band = mask_dataset
+        .rasterband(1)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to get mask band: {}", e)))?;
+    let zeros = vec![0u8; width * height];
+    let mut buffer = Buffer::new((width, height), zeros);
+    mask_band
+        .write((0, 0), (width, height), &mut buffer)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to initialize mask: {}", e)))?;
 
     // Rasterize geometry onto mask (set to 1 inside geometry)
     let rasterize_options = RasterizeOptions {

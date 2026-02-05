@@ -19,7 +19,6 @@ use datafusion_common::{DataFusionError, Result};
 use gdal::raster::GdalDataType;
 use sedona_raster::traits::RasterRef;
 use sedona_schema::raster::{BandDataType, StorageType};
-use std::sync::OnceLock;
 
 use crate::gdal_common::band_data_type_to_gdal;
 use crate::gdal_dataset_provider::{thread_local_provider, RasterDataset};
@@ -27,29 +26,6 @@ use crate::gdal_dataset_provider::{thread_local_provider, RasterDataset};
 pub(crate) struct RasterBandReader<'a> {
     raster: &'a dyn RasterRef,
     dataset: Option<RasterDataset<'a>>,
-}
-
-fn debug_outdb_mapping_once(
-    raster_w: usize,
-    raster_h: usize,
-    raster_gt: [f64; 6],
-    dataset: &gdal::Dataset,
-) {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    if std::env::var("SEDONA_RASTER_DEBUG_OUTDB").is_err() {
-        return;
-    }
-
-    ONCE.get_or_init(|| {
-        let ds_size = dataset.raster_size();
-        let ds_gt = dataset.geo_transform().ok();
-        eprintln!(
-            "[sedona-raster-gdal][outdb] raster_size=({},{}) dataset_size=({},{})",
-            raster_w, raster_h, ds_size.0, ds_size.1
-        );
-        eprintln!("[sedona-raster-gdal][outdb] raster_gt={:?}", raster_gt);
-        eprintln!("[sedona-raster-gdal][outdb] dataset_gt={:?}", ds_gt);
-    });
 }
 
 impl<'a> RasterBandReader<'a> {
@@ -100,17 +76,8 @@ impl<'a> RasterBandReader<'a> {
                 let meta = self.raster.metadata();
                 let raster_w = meta.width() as usize;
                 let raster_h = meta.height() as usize;
-                let raster_gt = [
-                    meta.upper_left_x(),
-                    meta.scale_x(),
-                    meta.skew_x(),
-                    meta.upper_left_y(),
-                    meta.skew_y(),
-                    meta.scale_y(),
-                ];
 
                 let dataset = self.ensure_dataset()?;
-                debug_outdb_mapping_once(raster_w, raster_h, raster_gt, dataset.as_dataset());
                 let gdal_band = dataset
                     .as_dataset()
                     .rasterband(band_idx)
@@ -193,14 +160,6 @@ impl<'a> RasterBandReader<'a> {
                 let meta = self.raster.metadata();
                 let raster_w = meta.width() as usize;
                 let raster_h = meta.height() as usize;
-                let raster_gt = [
-                    meta.upper_left_x(),
-                    meta.scale_x(),
-                    meta.skew_x(),
-                    meta.upper_left_y(),
-                    meta.skew_y(),
-                    meta.scale_y(),
-                ];
 
                 let (xoff, yoff) = offset;
                 let (win_w, win_h) = size;
@@ -211,7 +170,6 @@ impl<'a> RasterBandReader<'a> {
                 }
 
                 let dataset = self.ensure_dataset()?;
-                debug_outdb_mapping_once(raster_w, raster_h, raster_gt, dataset.as_dataset());
                 let gdal_band = dataset
                     .as_dataset()
                     .rasterband(band_idx)
