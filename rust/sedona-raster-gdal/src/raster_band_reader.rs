@@ -48,6 +48,7 @@ impl<'a> RasterBandReader<'a> {
         Ok(self.dataset.as_ref())
     }
 
+    #[allow(unused)]
     pub fn gdal_dataset(&mut self) -> Result<Option<&gdal::Dataset>> {
         Ok(self.dataset()?.map(|dataset| dataset.as_dataset()))
     }

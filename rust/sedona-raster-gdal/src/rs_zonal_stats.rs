@@ -794,15 +794,7 @@ fn compute_zonal_stats(
         .map_err(|e| DataFusionError::Execution(format!("Failed to get band: {}", e)))?;
     let band_metadata = band.metadata();
     let data_type = band_metadata.data_type();
-
-    let nodata = nodata_bytes_to_f64(band_metadata.nodata_value(), &data_type).or_else(|| {
-        band_reader
-            .gdal_dataset()
-            .ok()
-            .flatten()
-            .and_then(|dataset| dataset.rasterband(band_num).ok())
-            .and_then(|band| band.no_data_value())
-    });
+    let nodata = nodata_bytes_to_f64(band_metadata.nodata_value(), &data_type);
 
     // Collect pixel values within the geometry
     let mut values: Vec<f64> = Vec::new();
