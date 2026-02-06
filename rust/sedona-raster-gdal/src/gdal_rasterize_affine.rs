@@ -208,10 +208,6 @@ mod tests {
     use crate::gdal_common::mem_driver;
     use gdal::raster::{Buffer, RasterizeOptions};
 
-    fn ensure_mem_driver() {
-        let _ = mem_driver().unwrap();
-    }
-
     fn make_dataset_u8(
         width: usize,
         height: usize,
@@ -261,7 +257,6 @@ mod tests {
 
     #[test]
     fn test_rasterize_affine_matches_baseline_north_up() {
-        ensure_mem_driver();
         let (w, h) = (32usize, 24usize);
         let gt: GeoTransform = [100.0, 2.0, 0.0, 200.0, 0.0, -2.0];
 
@@ -283,7 +278,6 @@ mod tests {
 
     #[test]
     fn test_rasterize_affine_matches_baseline_rotated_gt_all_touched() {
-        ensure_mem_driver();
         let (w, h) = (40usize, 28usize);
         // Rotated/skewed GeoTransform.
         let gt: GeoTransform = [10.0, 1.2, 0.15, 50.0, -0.1, -1.1];
@@ -306,7 +300,6 @@ mod tests {
 
     #[test]
     fn test_rasterize_affine_matches_baseline_linestring() {
-        ensure_mem_driver();
         let (w, h) = (64usize, 48usize);
         // Rotated/skewed GeoTransform.
         let gt: GeoTransform = [5.0, 1.0, 0.2, 100.0, -0.15, -1.05];
@@ -362,7 +355,6 @@ mod tests {
 
     #[test]
     fn test_rasterize_affine_fails_on_noninvertible_gt() {
-        ensure_mem_driver();
         let (w, h) = (8usize, 8usize);
         let gt: GeoTransform = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let mut ds = make_dataset_u8(w, h, gt).unwrap();

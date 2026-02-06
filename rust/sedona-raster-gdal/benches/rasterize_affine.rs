@@ -24,10 +24,6 @@ use gdal::raster::RasterizeOptions;
 use gdal::vector::Geometry;
 use gdal::{DriverManager, GeoTransform, GeoTransformEx};
 
-fn ensure_mem_driver() {
-    let _ = DriverManager::get_driver_by_name("MEM");
-}
-
 fn bench_threads() -> usize {
     if let Ok(s) = std::env::var("SEDONA_BENCH_THREADS") {
         if let Ok(n) = s.parse::<usize>() {
@@ -90,8 +86,6 @@ fn setup_thread_local_config() {
 }
 
 fn bench_rasterize_affine(c: &mut Criterion) {
-    ensure_mem_driver();
-
     let driver = DriverManager::get_driver_by_name("MEM").unwrap();
     let (w, h) = (2usize, 2usize);
     // Rotated/skewed GeoTransform.
