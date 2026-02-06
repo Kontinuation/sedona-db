@@ -162,7 +162,7 @@ pub fn rasterize_affine(
         .collect();
     let burn_values_expanded: Vec<f64> = burn_values
         .iter()
-        .flat_map(|burn| std::iter::repeat(burn).take(bands_i32.len()))
+        .flat_map(|burn| std::iter::repeat_n(burn, bands_i32.len()))
         .copied()
         .collect();
 
@@ -205,11 +205,11 @@ pub fn rasterize_affine(
 mod tests {
     use super::*;
 
+    use crate::gdal_common::mem_driver;
     use gdal::raster::{Buffer, RasterizeOptions};
-    use gdal::DriverManager;
 
     fn ensure_mem_driver() {
-        let _ = DriverManager::get_driver_by_name("MEM");
+        let _ = mem_driver().unwrap();
     }
 
     fn make_dataset_u8(
@@ -217,7 +217,7 @@ mod tests {
         height: usize,
         gt: GeoTransform,
     ) -> gdal::errors::Result<Dataset> {
-        let driver = DriverManager::get_driver_by_name("MEM")?;
+        let driver = mem_driver().unwrap();
         let mut ds = driver.create_with_band_type::<u8, _>("", width, height, 1)?;
         ds.set_geo_transform(&gt)?;
         let mut band = ds.rasterband(1)?;

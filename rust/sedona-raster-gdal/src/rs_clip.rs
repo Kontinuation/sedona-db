@@ -34,7 +34,6 @@ use datafusion_expr::{
 };
 use gdal::raster::Buffer;
 use gdal::vector::Geometry;
-use gdal::DriverManager;
 
 use arrow_schema::DataType;
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
@@ -46,7 +45,7 @@ use sedona_schema::datatypes::{SedonaType, RASTER};
 use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::{BandDataType, StorageType};
 
-use crate::gdal_common::{nodata_bytes_to_f64, nodata_f64_to_bytes};
+use crate::gdal_common::{mem_driver, nodata_bytes_to_f64, nodata_f64_to_bytes};
 use crate::gdal_dataset_provider::configure_thread_local_cache_size;
 use crate::gdal_rasterize_affine::rasterize_affine;
 use crate::raster_band_reader::RasterBandReader;
@@ -291,8 +290,7 @@ fn clip_raster(
     })?;
 
     // Create a mask raster (same dimensions as input)
-    let mem_driver = DriverManager::get_driver_by_name("MEM")
-        .map_err(|e| DataFusionError::Execution(format!("Failed to get MEM driver: {}", e)))?;
+    let mem_driver = mem_driver()?;
 
     let mut mask_dataset = mem_driver
         .create_with_band_type::<u8, _>("", width, height, 1)

@@ -16,17 +16,36 @@
 // under the License.
 
 use std::ffi::c_void;
+use std::sync::OnceLock;
 
 use gdal::{
     cpl::CslStringList, errors::GdalError, raster::GdalDataType, DatasetOptions, DriverManager,
     GdalOpenFlags,
 };
 
-use gdal_sys::CPLErr;
+use gdal_sys::{CPLErr, GDALDriverH};
 use sedona_raster::traits::RasterRef;
 use sedona_schema::raster::{BandDataType, StorageType};
 
 use datafusion_common::{arrow_datafusion_err, DataFusionError, Result};
+
+// GDAL drivers live in the global GDALDriverManager registry protected by
+// GDAL's internal mutex. The MEM driver handle is stable for the lifetime of
+// the process unless the application explicitly destroys the driver manager,
+// which Sedona does not do.
+#[derive(Copy, Clone)]
+struct SharedDriverHandle(GDALDriverH);
+
+// SAFETY: the handle points to a GDAL-owned driver in the global registry.
+// Sharing the handle across threads is safe as long as the driver manager
+// remains alive (i.e., no GDALDestroy/GDALDestroyDriverManager), which is
+// the supported usage in this process.
+unsafe impl Send for SharedDriverHandle {}
+// SAFETY: see above; the handle is immutable and refers to a global driver
+// object that is expected to be thread-safe to access via GDAL.
+unsafe impl Sync for SharedDriverHandle {}
+
+static MEM_DRIVER: OnceLock<std::result::Result<SharedDriverHandle, GdalError>> = OnceLock::new();
 
 /// Converts a BandDataType to the corresponding GDAL data type.
 pub fn band_data_type_to_gdal(band_type: &BandDataType) -> GdalDataType {
@@ -134,6 +153,21 @@ pub(crate) fn convert_gdal_err(e: GdalError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
 
+pub(crate) fn mem_driver() -> std::result::Result<gdal::Driver, DataFusionError> {
+    let cached = MEM_DRIVER.get_or_init(|| {
+        DriverManager::get_driver_by_name("MEM").map(|driver| {
+            // SAFETY: GDAL owns the driver registry; we cache the handle only.
+            let handle = unsafe { driver.c_driver() };
+            SharedDriverHandle(handle)
+        })
+    });
+
+    match cached {
+        Ok(handle) => Ok(unsafe { gdal::Driver::from_c_driver(handle.0) }),
+        Err(err) => Err(convert_gdal_err(err.clone())),
+    }
+}
+
 /// This function creates a GDAL dataset backed by the MEM driver that directly
 /// references the band data stored in the [RasterRef]. No data copying occurs -
 /// the GDAL bands point to the same memory as the data buffer held by [RasterRef].
@@ -161,7 +195,7 @@ pub unsafe fn raster_ref_to_gdal_mem<R: RasterRef + ?Sized>(
     let height = metadata.height() as usize;
 
     // Create empty dataset (0 bands initially, we'll add them with DATAPOINTER)
-    let mem_driver = DriverManager::get_driver_by_name("MEM").map_err(convert_gdal_err)?;
+    let mem_driver = mem_driver()?;
 
     // create_with_band_type::<u8, _> calls GDALCreate with eType = GDT_Byte under the hood. The eType
     // can be different from the actual band data types. This follows the same pattern as PostGIS's

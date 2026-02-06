@@ -38,7 +38,6 @@ use datafusion_expr::{
 };
 use gdal::raster::Buffer;
 use gdal::vector::Geometry;
-use gdal::DriverManager;
 
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_raster::affine_transformation::to_world_coordinate;
@@ -48,7 +47,7 @@ use sedona_raster_functions::RasterExecutor;
 use sedona_schema::datatypes::SedonaType;
 use sedona_schema::matchers::ArgMatcher;
 
-use crate::gdal_common::nodata_bytes_to_f64;
+use crate::gdal_common::{mem_driver, nodata_bytes_to_f64};
 use crate::gdal_dataset_provider::configure_thread_local_cache_size;
 use crate::gdal_rasterize_affine::rasterize_affine;
 use crate::raster_band_reader::RasterBandReader;
@@ -727,8 +726,7 @@ fn compute_zonal_stats(
     };
 
     // Create a mask raster
-    let mem_driver = DriverManager::get_driver_by_name("MEM")
-        .map_err(|e| DataFusionError::Execution(format!("Failed to get MEM driver: {}", e)))?;
+    let mem_driver = mem_driver()?;
 
     let mut mask_dataset = mem_driver
         .create_with_band_type::<u8, _>("", window.width, window.height, 1)
@@ -1444,7 +1442,7 @@ mod tests {
         use tempfile::tempdir;
 
         fn write_tiled_geotiff_f32(path: &Path, w: usize, h: usize, block: u32, nodata: f64) {
-            let mem_driver = DriverManager::get_driver_by_name("MEM").unwrap();
+            let mem_driver = mem_driver().unwrap();
             let mut mem_ds = mem_driver
                 .create_with_band_type::<f32, _>("", w, h, 1)
                 .unwrap();
@@ -1463,7 +1461,7 @@ mod tests {
             let mut buffer = Buffer::new((w, h), data);
             band.write((0, 0), (w, h), &mut buffer).unwrap();
 
-            let gtiff_driver = DriverManager::get_driver_by_name("GTiff").unwrap();
+            let gtiff_driver = gdal::DriverManager::get_driver_by_name("GTiff").unwrap();
             let options_list = [
                 "TILED=YES".to_string(),
                 format!("BLOCKXSIZE={}", block),

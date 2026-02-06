@@ -34,7 +34,6 @@ use datafusion_expr::{
 use gdal::raster::PolygonizeOptions;
 use gdal::vector::LayerAccess;
 use gdal::vector::{OGRFieldType, OGRwkbGeometryType};
-use gdal::DriverManager;
 
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_raster::array::{RasterRefImpl, RasterStructArray};
@@ -43,6 +42,7 @@ use sedona_schema::datatypes::SedonaType;
 use sedona_schema::matchers::ArgMatcher;
 
 // `dataset` removed; the provider is used instead when creating GDAL datasets.
+use crate::gdal_common::mem_driver;
 use crate::gdal_dataset_provider::configure_thread_local_cache_size;
 
 /// RS_Polygonize() scalar UDF implementation
@@ -201,8 +201,7 @@ fn polygonize_raster(raster: &RasterRefImpl<'_>, band_num: usize) -> Result<Vec<
     })?;
 
     // Create memory datasource for output polygons
-    let mem_driver = DriverManager::get_driver_by_name("MEM")
-        .map_err(|e| DataFusionError::Execution(format!("Failed to get MEM driver: {}", e)))?;
+    let mem_driver = mem_driver()?;
 
     let mut mem_ds = mem_driver.create_vector_only("").map_err(|e| {
         DataFusionError::Execution(format!("Failed to create memory dataset: {}", e))

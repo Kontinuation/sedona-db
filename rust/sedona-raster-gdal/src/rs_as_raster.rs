@@ -31,7 +31,6 @@ use datafusion_expr::{
 };
 use gdal::raster::Buffer;
 use gdal::vector::Geometry;
-use gdal::DriverManager;
 
 use arrow_schema::DataType;
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
@@ -42,7 +41,7 @@ use sedona_schema::datatypes::{SedonaType, RASTER};
 use sedona_schema::matchers::ArgMatcher;
 use sedona_schema::raster::{BandDataType, StorageType};
 
-use crate::gdal_common::nodata_f64_to_bytes;
+use crate::gdal_common::{mem_driver, nodata_f64_to_bytes};
 use crate::gdal_dataset_provider::configure_thread_local_cache_size;
 use crate::gdal_rasterize_affine::rasterize_affine;
 
@@ -326,8 +325,7 @@ fn as_raster(
     };
 
     // Create output GDAL dataset
-    let mem_driver = DriverManager::get_driver_by_name("MEM")
-        .map_err(|e| DataFusionError::Execution(format!("Failed to get MEM driver: {}", e)))?;
+    let mem_driver = mem_driver()?;
 
     let mut out_dataset = create_output_dataset(&mem_driver, out_width, out_height, &band_type)?;
 
