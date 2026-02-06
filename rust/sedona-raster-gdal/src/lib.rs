@@ -49,6 +49,9 @@ mod gdal_common;
 mod gdal_dataset_provider;
 mod gdal_rasterize_affine;
 
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::Result;
+
 // Public for benchmarking / targeted internal usage.
 #[doc(hidden)]
 pub use gdal_rasterize_affine::rasterize_affine;
@@ -76,6 +79,17 @@ pub use rs_zonal_stats::{rs_zonal_stats_all_udf, rs_zonal_stats_udf, StatType, Z
 
 // Re-export UDTF constructors
 pub use rs_geotiff_tiles::rs_geotiff_tiles_udtf;
+
+/// Configure the GDAL shim shared library from config options, if provided.
+pub fn configure_gdal_shim(config_options: Option<&ConfigOptions>) -> Result<()> {
+    gdal_dataset_provider::configure_gdal_shim(config_options)
+}
+
+/// Configure the GDAL shim from the current process symbol table (tests only).
+#[cfg(test)]
+pub fn configure_gdal_shim_from_current_process() -> Result<()> {
+    gdal_dataset_provider::configure_gdal_shim_from_current_process()
+}
 
 /// Returns all GDAL-based raster UDFs
 pub fn all_gdal_udfs() -> Vec<datafusion_expr::ScalarUDF> {

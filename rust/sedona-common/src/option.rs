@@ -74,6 +74,9 @@ config_namespace! {
 
         /// Maximum number of GDAL VRT datasets cached per thread
         pub per_thread_max_cached_vrt_datasets: usize, default = DEFAULT_GDAL_PER_THREAD_MAX_CACHED_VRT_DATASETS
+
+        /// Path to the Sedona GDAL shim shared library
+        pub shared_library_path: Option<String>, default = None
     }
 }
 

@@ -121,6 +121,13 @@ impl SedonaContext {
             functions: FunctionSet::new(),
         };
 
+        #[cfg(feature = "raster-gdal")]
+        {
+            let config = out.ctx.copied_config();
+            let config_options = config.options();
+            sedona_raster_gdal::configure_gdal_shim(Some(config_options.as_ref()))?;
+        }
+
         // Register table functions
         out.ctx.register_udtf(
             "sd_random_geometry",

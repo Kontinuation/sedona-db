@@ -51,6 +51,7 @@ sedona-raster = { workspace = true }
 sedona-raster-functions = { workspace = true }
 sedona-schema = { workspace = true }
 sedona-proj = { workspace = true }
+sedona-gdal = { workspace = true }
 wkb = { workspace = true }
 walkdir = "2"
 

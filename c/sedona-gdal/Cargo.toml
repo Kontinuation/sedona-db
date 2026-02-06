@@ -14,25 +14,31 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-from sedonadb import _lib  # type: ignore[import-not-found]
-from sedonadb import context as _context
 
-connect = _context.connect
-configure_proj = _context.configure_proj
-configure_gdal = _context.configure_gdal  # type: ignore[attr-defined]
+[package]
+name = "sedona-gdal"
+version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description.workspace = true
+readme.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
-__version__ = _lib.sedona_python_version()
+[lib]
+crate-type = ["staticlib", "cdylib", "lib"]
 
-__features__ = _lib.sedona_python_features()
+[build-dependencies]
+cc = { version = "1" }
+pkg-config = { version = "0.3" }
 
-__all__ = ["connect", "configure_proj", "configure_gdal", "options"]
+[dependencies]
+gdal = { workspace = true }
+thiserror = { workspace = true }
 
-# Attempt to configure PROJ on import. This will warn if PROJ
-# can't be configured but should never error. The auto-configured
-# value can be overridden as long as the call to configure_proj()
-# occurs before actually creating a transform.
-configure_proj("auto")
-try:
-    configure_gdal(preset="auto")
-except Exception:
-    pass
+[features]
+default = []

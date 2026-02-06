@@ -490,6 +490,7 @@ impl SedonaScalarKernel for RsAsGeoTiff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::configure_gdal_shim_from_current_process;
     use sedona_raster::traits::RasterRef;
 
     #[test]
@@ -529,6 +530,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip_geotiff() {
+        configure_gdal_shim_from_current_process().unwrap();
         use crate::rs_from_gdal_raster::RsFromGDALRaster;
         use sedona_raster::array::RasterStructArray;
         use sedona_testing::data::test_raster;
@@ -575,6 +577,7 @@ mod tests {
 
     #[test]
     fn test_geotiff_with_compression() {
+        configure_gdal_shim_from_current_process().unwrap();
         use crate::rs_from_gdal_raster::RsFromGDALRaster;
         use sedona_raster::array::RasterStructArray;
         use sedona_testing::data::test_raster;

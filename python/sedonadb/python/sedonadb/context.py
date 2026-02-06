@@ -19,9 +19,9 @@ import os
 import sys
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Dict, Iterable, Literal, Optional, Union
+from typing import Any, Dict, Iterable, Literal, Optional, Union, Tuple
 
-from sedonadb._lib import InternalContext, configure_proj_shared
+from sedonadb._lib import InternalContext, configure_gdal_shared, configure_proj_shared
 from sedonadb._options import Options
 from sedonadb.dataframe import DataFrame, _create_data_frame
 from sedonadb.functions import Functions
@@ -143,15 +143,18 @@ class SedonaContext:
             <sedonadb.dataframe.DataFrame object at ...>
 
         """
+        table_path_list: Iterable[Union[str, Path]]
         if isinstance(table_paths, (str, Path)):
-            table_paths = [table_paths]
+            table_path_list = [table_paths]
+        else:
+            table_path_list = table_paths
 
         if options is None:
             options = {}
 
         return DataFrame(
             self._impl,
-            self._impl.read_parquet([str(path) for path in table_paths], options),
+            self._impl.read_parquet([str(path) for path in table_path_list], options),
             self.options,
         )
 
@@ -208,8 +211,11 @@ class SedonaContext:
         """
         from sedonadb.datasource import PyogrioFormatSpec
 
+        table_path_list: Iterable[Union[str, Path]]
         if isinstance(table_paths, (str, Path)):
-            table_paths = [table_paths]
+            table_path_list = [table_paths]
+        else:
+            table_path_list = table_paths
 
         spec = PyogrioFormatSpec(extension)
         if options is not None:
@@ -218,7 +224,7 @@ class SedonaContext:
         return DataFrame(
             self._impl,
             self._impl.read_external_format(
-                spec, [str(path) for path in table_paths], False
+                spec, [str(path) for path in table_path_list], False
             ),
             self.options,
         )
@@ -287,11 +293,11 @@ def connect() -> SedonaContext:
 
 
 def configure_proj(
-    preset: Literal["auto", "pyproj", "homebrew", "conda", "system", None] = None,
+    preset: Optional[Literal["auto", "pyproj", "homebrew", "conda", "system"]] = None,
     *,
-    shared_library: Union[str, Path] = None,
-    database_path: Union[str, Path] = None,
-    search_path: Union[str, Path] = None,
+    shared_library: Optional[Union[str, Path]] = None,
+    database_path: Optional[Union[str, Path]] = None,
+    search_path: Optional[Union[str, Path]] = None,
     verbose: bool = False,
 ):
     """Configure PROJ source
@@ -349,21 +355,26 @@ def configure_proj(
             _configure_proj_system()
             return
         elif preset == "auto":
-            tried = ["pyproj", "conda", "homebrew", "system"]
+            tried: Tuple[Literal["pyproj", "conda", "homebrew", "system"], ...] = (
+                "pyproj",
+                "conda",
+                "homebrew",
+                "system",
+            )
             errors = []
-            for preset in tried:
+            for preset_name in tried:
                 try:
-                    configure_proj(preset)
+                    configure_proj(preset=preset_name)
 
                     if verbose:
-                        print(f"Configured PROJ using '{preset}'")
+                        print(f"Configured PROJ using '{preset_name}'")
 
                     return
                 except Exception as e:
                     if verbose:
-                        print(f"Failed to configure PROJ using '{preset}': {e}")
+                        print(f"Failed to configure PROJ using '{preset_name}': {e}")
                     else:
-                        errors.append(f"{preset}: {e}")
+                        errors.append(f"{preset_name}: {e}")
 
             import warnings
 
@@ -398,10 +409,65 @@ def configure_proj(
     )
 
 
+def configure_gdal(
+    preset: Optional[Literal["homebrew", "system", "auto"]] = None,
+    *,
+    shared_library: Optional[Union[str, Path]] = None,
+) -> None:
+    """Configure the Sedona GDAL shim library.
+
+    Args:
+        preset: One of `"homebrew"`, `"system"`, or `"auto"`.
+        shared_library: Path to the Sedona GDAL shim shared library.
+    """
+    if preset is not None:
+        if preset == "homebrew":
+            prefix = os.environ.get("HOMEBREW_PREFIX", "/opt/homebrew")
+            shared_library = Path(prefix) / "lib" / _gdal_shim_lib_name()
+        elif preset == "system":
+            shared_library = _gdal_shim_lib_name()
+        elif preset == "auto":
+            errors = []
+            for option in ("homebrew", "system"):
+                try:
+                    configure_gdal(preset=option)
+                    return
+                except Exception as e:
+                    errors.append(f"{option}: {e}")
+            raise ValueError(
+                f"Failed to configure GDAL shim. Tried presets: {', '.join(errors)}"
+            )
+        else:
+            raise ValueError(f"Unknown preset: {preset}")
+
+    if shared_library is None:
+        raise ValueError("Must provide shared_library or preset")
+
+    shared_library = Path(shared_library)
+    try:
+        import ctypes
+
+        ctypes.CDLL(str(shared_library))
+    except OSError as e:
+        raise ValueError(f"Can't load GDAL shim shared library '{shared_library}': {e}")
+
+    configure_gdal_shared(str(shared_library))
+
+
+def _gdal_shim_lib_name() -> str:
+    if sys.platform == "darwin":
+        return "libsedona_gdal.dylib"
+    if sys.platform.startswith("linux"):
+        return "libsedona_gdal.so"
+    if sys.platform == "win32":
+        return "sedona_gdal.dll"
+    raise ValueError(f"Unsupported platform: {sys.platform}")
+
+
 def _configure_proj_pyproj():
     import pyproj
 
-    data_dir = Path(pyproj.datadir.get_data_dir())
+    data_dir = Path(pyproj.datadir.get_data_dir())  # type: ignore[attr-defined]
     database_path = data_dir / "proj.db"
     possible_files = []
 
@@ -445,13 +511,13 @@ def _configure_proj_system():
         configure_proj(shared_library="libproj.so")
 
 
-def _configure_proj_prefix(prefix: str):
+def _configure_proj_prefix(prefix: Union[str, Path]):
     prefix = Path(prefix)
     if not prefix.exists():
         raise ValueError(f"Can't configure PROJ from prefix '{prefix}': does not exist")
 
     configure_proj(
-        shared_library=Path(prefix) / "lib" / "libproj.dylib",
-        database_path=Path(prefix) / "share" / "proj" / "proj.db",
-        search_path=Path(prefix) / "share" / "proj",
+        shared_library=prefix / "lib" / "libproj.dylib",
+        database_path=prefix / "share" / "proj" / "proj.db",
+        search_path=prefix / "share" / "proj",
     )

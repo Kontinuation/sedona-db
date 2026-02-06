@@ -202,6 +202,7 @@ impl SedonaScalarKernel for RsMetaData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::configure_gdal_shim_from_current_process;
     use arrow_array::cast::AsArray;
     use datafusion_expr::ScalarUDF;
     use sedona_raster::array::RasterStructArray;
@@ -217,6 +218,7 @@ mod tests {
 
     #[test]
     fn rs_metadata_tile_dimensions_from_gdal() {
+        configure_gdal_shim_from_current_process().unwrap();
         use crate::rs_from_gdal_raster::RsFromGDALRaster;
 
         let test_file = sedona_testing::data::test_raster("test4.tiff").unwrap();
@@ -250,6 +252,7 @@ mod tests {
 
     #[test]
     fn rs_metadata_tile_dimensions_golden() {
+        configure_gdal_shim_from_current_process().unwrap();
         use crate::rs_from_gdal_raster::RsFromGDALRaster;
 
         let test_file = sedona_testing::data::test_raster("test5.tiff").unwrap();

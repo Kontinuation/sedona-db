@@ -5142,6 +5142,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sedona-gdal"
+version = "0.3.0"
+dependencies = [
+ "cc",
+ "gdal",
+ "pkg-config",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "sedona-geo"
 version = "0.3.0"
 dependencies = [
@@ -5407,6 +5417,7 @@ dependencies = [
  "lru",
  "sedona-common",
  "sedona-expr",
+ "sedona-gdal",
  "sedona-geometry",
  "sedona-proj",
  "sedona-raster",
@@ -5567,6 +5578,7 @@ dependencies = [
  "sedona-adbc",
  "sedona-datasource",
  "sedona-expr",
+ "sedona-gdal",
  "sedona-geometry",
  "sedona-geoparquet",
  "sedona-proj",
@@ -5591,6 +5603,7 @@ dependencies = [
  "sedona",
  "sedona-adbc",
  "sedona-expr",
+ "sedona-gdal",
  "sedona-geoparquet",
  "sedona-proj",
  "sedona-schema",

@@ -18,12 +18,10 @@
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-use gdal::{
-    cpl::CslStringList, errors::GdalError, raster::GdalDataType, DatasetOptions, DriverManager,
-    GdalOpenFlags,
-};
+use gdal::{DatasetOptions, DriverManager, GdalOpenFlags, errors::GdalError, raster::GdalDataType};
 
-use gdal_sys::{CPLErr, GDALDriverH};
+use gdal_sys::GDALDriverH;
+use sedona_gdal::{gdal_dyn_bindgen::GDALDataType as SedonaGdalDataType, register::with_global_gdal_api};
 use sedona_raster::traits::RasterRef;
 use sedona_schema::raster::{BandDataType, StorageType};
 
@@ -194,45 +192,18 @@ pub unsafe fn raster_ref_to_gdal_mem<R: RasterRef + ?Sized>(
     let width = metadata.width() as usize;
     let height = metadata.height() as usize;
 
-    // Create empty dataset (0 bands initially, we'll add them with DATAPOINTER)
-    let mem_driver = mem_driver()?;
-
-    // create_with_band_type::<u8, _> calls GDALCreate with eType = GDT_Byte under the hood. The eType
-    // can be different from the actual band data types. This follows the same pattern as PostGIS's
-    // rt_raster_to_gdal_mem.
-    // See https://github.com/postgis/postgis/blob/3.6.1/raster/rt_core/rt_raster.c#L1869-L1873
-    let mut dataset = mem_driver
-        .create_with_band_type::<u8, _>("", width, height, 0)
-        .map_err(convert_gdal_err)?;
-
-    // Set geotransform (safe API)
-    // GDAL geotransform: [origin_x, pixel_width, rotation_x, origin_y, rotation_y, pixel_height]
-    let geotransform = [
-        metadata.upper_left_x(),
-        metadata.scale_x(),
-        metadata.skew_x(),
-        metadata.upper_left_y(),
-        metadata.skew_y(),
-        metadata.scale_y(),
-    ];
-
-    dataset
-        .set_geo_transform(&geotransform)
-        .map_err(convert_gdal_err)?;
-
-    // Set projection/CRS if available
-    if let Some(crs) = raster.crs() {
-        dataset.set_projection(crs).map_err(convert_gdal_err)?;
-    }
+    // Create internal MEM dataset via sedona-gdal shim to avoid open dataset list contention.
+    let mut band_types = Vec::with_capacity(band_indices.len());
+    let mut band_ptrs = Vec::with_capacity(band_indices.len());
+    let mut pixel_offsets = Vec::with_capacity(band_indices.len());
+    let mut line_offsets = Vec::with_capacity(band_indices.len());
 
     // Add bands with DATAPOINTER option (zero-copy)
     //
     // Note: GDALAddBand always appends a new band, so the destination band index
     // is sequential (1..=band_indices.len()), even if the source band indices are
     // sparse (e.g. [1, 3]).
-    for (dst_band_index, &src_band_index) in band_indices.iter().enumerate() {
-        let dst_band_index = dst_band_index + 1;
-
+    for &src_band_index in band_indices.iter() {
         let band = bands
             .band(src_band_index)
             .map_err(|e| arrow_datafusion_err!(e))?;
@@ -256,24 +227,82 @@ pub unsafe fn raster_ref_to_gdal_mem<R: RasterRef + ?Sized>(
         // Get pointer to band data
         let band_data = band.data();
         let data_ptr = band_data.as_ptr() as *const c_void;
-
-        // Format the data pointer as a hex string for GDAL
-        let datapointer_option = format!("DATAPOINTER={:p}", data_ptr);
-        let c_options = CslStringList::from_iter([datapointer_option.as_str()]);
-        let rv = unsafe {
-            gdal_sys::GDALAddBand(dataset.c_dataset(), gdal_type as u32, c_options.as_ptr())
-        };
-
-        if rv != CPLErr::CE_None {
-            let gdal_err = GdalError::CplError {
-                class: rv,
-                number: 0,
-                msg: format!("Could not add band {}", src_band_index),
-            };
-            return Err(DataFusionError::External(Box::new(gdal_err)));
-        }
+        let gdal_type: SedonaGdalDataType = gdal_type.try_into().map_err(|_| {
+            DataFusionError::NotImplemented(format!(
+                "Band data type {:?} is not supported by this GDAL build",
+                band_type
+            ))
+        })?;
+        band_types.push(gdal_type);
+        band_ptrs.push(data_ptr);
+        pixel_offsets.push(0);
+        line_offsets.push(0);
 
         // Set nodata value if present
+        if band_metadata.nodata_value().is_some() {
+            // Nodata is applied after dataset creation.
+        }
+    }
+
+    let dataset = with_global_gdal_api(|api| {
+        let dataset = unsafe {
+            api.mem_create_internal(
+                width as i32,
+                height as i32,
+                band_ptrs.len() as i32,
+                band_types.as_ptr(),
+                band_ptrs.as_ptr(),
+                pixel_offsets.as_ptr(),
+                line_offsets.as_ptr(),
+            )
+        };
+        if dataset.is_null() {
+            return Err(sedona_gdal::error::SedonaGdalError::CreateError(
+                "Failed to create internal MEM dataset".to_string(),
+            ));
+        }
+        Ok(unsafe { gdal::Dataset::from_c_dataset(dataset) })
+    })
+    .map_err(|e| match e {
+        sedona_gdal::error::SedonaGdalError::Invalid(msg)
+            if msg == "GDAL API not configured" =>
+        {
+            DataFusionError::Configuration(
+                "GDAL shim not configured. Set sedona.gdal.shared_library_path or call configure_gdal_shared()/configure_global_gdal_api()".to_string(),
+            )
+        }
+        _ => DataFusionError::Execution(format!("{e}")),
+    })?;
+
+    let mut dataset = dataset;
+
+    // Set geotransform (safe API)
+    // GDAL geotransform: [origin_x, pixel_width, rotation_x, origin_y, rotation_y, pixel_height]
+    let geotransform = [
+        metadata.upper_left_x(),
+        metadata.scale_x(),
+        metadata.skew_x(),
+        metadata.upper_left_y(),
+        metadata.skew_y(),
+        metadata.scale_y(),
+    ];
+
+    dataset
+        .set_geo_transform(&geotransform)
+        .map_err(convert_gdal_err)?;
+
+    // Set projection/CRS if available
+    if let Some(crs) = raster.crs() {
+        dataset.set_projection(crs).map_err(convert_gdal_err)?;
+    }
+
+    for (dst_band_index, &src_band_index) in band_indices.iter().enumerate() {
+        let dst_band_index = dst_band_index + 1;
+        let band = bands
+            .band(src_band_index)
+            .map_err(|e| arrow_datafusion_err!(e))?;
+        let band_metadata = band.metadata();
+        let band_type = band_metadata.data_type();
         if let Some(nodata_bytes) = band_metadata.nodata_value() {
             let mut band = dataset
                 .rasterband(dst_band_index)

@@ -35,6 +35,10 @@ use crate::gdal_common::{
     band_data_type_to_gdal, bytes_to_f64, convert_gdal_err, create_outdb_source,
     raster_ref_to_gdal_empty, raster_ref_to_gdal_mem,
 };
+use sedona_gdal::register::{configure_global_gdal_api, is_gdal_api_configured};
+
+#[cfg(test)]
+use sedona_gdal::register::configure_global_gdal_api_from_current_process;
 
 /// A GDAL dataset constructed from a `RasterRef`.
 ///
@@ -88,6 +92,7 @@ thread_local! {
 pub(crate) fn configure_thread_local_cache_size(
     config_options: Option<&ConfigOptions>,
 ) -> Result<()> {
+    configure_gdal_shim(config_options)?;
     let cache_size = config_options
         .and_then(|options| options.extensions.get::<SedonaOptions>())
         .map(|options| options.gdal.per_thread_max_cached_datasets)
@@ -150,6 +155,55 @@ pub(crate) fn configure_thread_local_cache_size(
     }
 
     Ok(())
+}
+
+pub(crate) fn configure_gdal_shim(config_options: Option<&ConfigOptions>) -> Result<()> {
+    let shared_library_path = config_options
+        .and_then(|options| options.extensions.get::<SedonaOptions>())
+        .and_then(|options| options.gdal.shared_library_path.as_ref())
+        .map(|path| path.as_str());
+
+    if let Some(path) = shared_library_path {
+        if is_gdal_api_configured() {
+            return Ok(());
+        }
+        if let Err(err) = configure_global_gdal_api(path.into()) {
+            if !matches!(
+                &err,
+                sedona_gdal::error::SedonaGdalError::Invalid(msg)
+                    if msg == "GDAL API already configured"
+            ) {
+                return Err(DataFusionError::Configuration(format!(
+                    "Failed to configure GDAL shim shared library: {err}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn configure_gdal_shim_from_current_process() -> Result<()> {
+    if is_gdal_api_configured() {
+        return Ok(());
+    }
+    match configure_global_gdal_api_from_current_process() {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if matches!(
+                &err,
+                sedona_gdal::error::SedonaGdalError::Invalid(msg)
+                    if msg == "GDAL API already configured"
+            ) {
+                Ok(())
+            } else {
+                Err(DataFusionError::Configuration(format!(
+                    "Failed to configure GDAL shim from current process: {err}"
+                )))
+            }
+        }
+    }
 }
 
 /// Get or create the thread-local `GDALDatasetProvider`.
