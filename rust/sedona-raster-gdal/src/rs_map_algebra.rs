@@ -319,14 +319,17 @@ struct MapAlgebraResult {
 fn parse_pixel_type(pixel_type: &str) -> Result<BandDataType> {
     match pixel_type.to_uppercase().as_str() {
         "B" | "BYTE" | "UINT8" => Ok(BandDataType::UInt8),
+        "I8" | "INT8" => Ok(BandDataType::Int8),
         "S" | "SHORT" | "INT16" => Ok(BandDataType::Int16),
         "US" | "USHORT" | "UINT16" => Ok(BandDataType::UInt16),
         "I" | "INT" | "INT32" => Ok(BandDataType::Int32),
         "UI" | "UINT" | "UINT32" => Ok(BandDataType::UInt32),
+        "U64" | "UINT64" => Ok(BandDataType::UInt64),
+        "I64" | "INT64" => Ok(BandDataType::Int64),
         "F" | "FLOAT" | "FLOAT32" => Ok(BandDataType::Float32),
         "D" | "DOUBLE" | "FLOAT64" => Ok(BandDataType::Float64),
         _ => Err(DataFusionError::Execution(format!(
-            "Unknown pixel type '{}'. Use: B(yte), S(hort), I(nt), F(loat), D(ouble)",
+            "Unknown pixel type '{}'. Use: B(yte), I8, S(hort), I(nt), U64, I64, F(loat), D(ouble)",
             pixel_type
         ))),
     }
@@ -521,6 +524,10 @@ fn write_pixel_value(data: &mut [u8], offset: usize, data_type: &BandDataType, v
         BandDataType::UInt8 => {
             data[byte_offset] = value.clamp(0.0, 255.0) as u8;
         }
+        BandDataType::Int8 => {
+            let v = value.clamp(i8::MIN as f64, i8::MAX as f64) as i8;
+            data[byte_offset] = v as u8;
+        }
         BandDataType::UInt16 => {
             let v = value.clamp(0.0, u16::MAX as f64) as u16;
             data[byte_offset..byte_offset + 2].copy_from_slice(&v.to_le_bytes());
@@ -537,6 +544,14 @@ fn write_pixel_value(data: &mut [u8], offset: usize, data_type: &BandDataType, v
             let v = value.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
             data[byte_offset..byte_offset + 4].copy_from_slice(&v.to_le_bytes());
         }
+        BandDataType::UInt64 => {
+            let v = value.clamp(0.0, u64::MAX as f64) as u64;
+            data[byte_offset..byte_offset + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        BandDataType::Int64 => {
+            let v = value.clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+            data[byte_offset..byte_offset + 8].copy_from_slice(&v.to_le_bytes());
+        }
         BandDataType::Float32 => {
             let v = value as f32;
             data[byte_offset..byte_offset + 4].copy_from_slice(&v.to_le_bytes());
@@ -551,8 +566,10 @@ fn write_pixel_value(data: &mut [u8], offset: usize, data_type: &BandDataType, v
 fn data_type_byte_size(data_type: &BandDataType) -> usize {
     match data_type {
         BandDataType::UInt8 => 1,
+        BandDataType::Int8 => 1,
         BandDataType::UInt16 | BandDataType::Int16 => 2,
         BandDataType::UInt32 | BandDataType::Int32 | BandDataType::Float32 => 4,
+        BandDataType::UInt64 | BandDataType::Int64 => 8,
         BandDataType::Float64 => 8,
     }
 }
@@ -686,8 +703,11 @@ mod tests {
     fn test_parse_pixel_type() {
         assert_eq!(parse_pixel_type("B").unwrap(), BandDataType::UInt8);
         assert_eq!(parse_pixel_type("byte").unwrap(), BandDataType::UInt8);
+        assert_eq!(parse_pixel_type("I8").unwrap(), BandDataType::Int8);
         assert_eq!(parse_pixel_type("S").unwrap(), BandDataType::Int16);
         assert_eq!(parse_pixel_type("I").unwrap(), BandDataType::Int32);
+        assert_eq!(parse_pixel_type("U64").unwrap(), BandDataType::UInt64);
+        assert_eq!(parse_pixel_type("I64").unwrap(), BandDataType::Int64);
         assert_eq!(parse_pixel_type("F").unwrap(), BandDataType::Float32);
         assert_eq!(parse_pixel_type("D").unwrap(), BandDataType::Float64);
         assert_eq!(parse_pixel_type("FLOAT64").unwrap(), BandDataType::Float64);

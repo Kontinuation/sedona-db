@@ -249,8 +249,11 @@ fn parse_pixel_type(s: &str) -> Result<BandDataType> {
         "S" => Ok(BandDataType::Int16),
         "US" => Ok(BandDataType::UInt16),
         "B" => Ok(BandDataType::UInt8),
+        "I8" | "INT8" => Ok(BandDataType::Int8),
+        "U64" | "UINT64" => Ok(BandDataType::UInt64),
+        "I64" | "INT64" => Ok(BandDataType::Int64),
         other => Err(DataFusionError::Execution(format!(
-            "Unsupported pixelType: {} (expected one of D, F, I, S, US, B)",
+            "Unsupported pixelType: {} (expected one of D, F, I, S, US, B, I8, U64, I64)",
             other
         ))),
     }
@@ -363,13 +366,26 @@ fn as_raster(
 
     // Set nodata metadata on band
     if let Some(nodata) = nodata_value {
-        out_dataset
+        let mut band = out_dataset
             .rasterband(1)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to get output band: {}", e)))?
-            .set_no_data_value(Some(nodata))
-            .map_err(|e| {
+            .map_err(|e| DataFusionError::Execution(format!("Failed to get output band: {}", e)))?;
+        match band_type {
+            BandDataType::UInt64 => {
+                band.set_no_data_value_u64(Some(nodata as u64))
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!("Failed to set nodata value: {}", e))
+                    })?;
+            }
+            BandDataType::Int64 => {
+                band.set_no_data_value_i64(Some(nodata as i64))
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!("Failed to set nodata value: {}", e))
+                    })?;
+            }
+            _ => band.set_no_data_value(Some(nodata)).map_err(|e| {
                 DataFusionError::Execution(format!("Failed to set nodata value: {}", e))
-            })?;
+            })?,
+        }
     }
 
     // Rasterize geometry
@@ -422,6 +438,9 @@ fn create_output_dataset(
         BandDataType::UInt8 => mem_driver
             .create_with_band_type::<u8, _>("", width, height, 1)
             .map_err(|e| DataFusionError::Execution(format!("Failed to create dataset: {}", e))),
+        BandDataType::Int8 => mem_driver
+            .create_with_band_type::<i8, _>("", width, height, 1)
+            .map_err(|e| DataFusionError::Execution(format!("Failed to create dataset: {}", e))),
         BandDataType::UInt16 => mem_driver
             .create_with_band_type::<u16, _>("", width, height, 1)
             .map_err(|e| DataFusionError::Execution(format!("Failed to create dataset: {}", e))),
@@ -433,6 +452,12 @@ fn create_output_dataset(
             .map_err(|e| DataFusionError::Execution(format!("Failed to create dataset: {}", e))),
         BandDataType::Int32 => mem_driver
             .create_with_band_type::<i32, _>("", width, height, 1)
+            .map_err(|e| DataFusionError::Execution(format!("Failed to create dataset: {}", e))),
+        BandDataType::UInt64 => mem_driver
+            .create_with_band_type::<u64, _>("", width, height, 1)
+            .map_err(|e| DataFusionError::Execution(format!("Failed to create dataset: {}", e))),
+        BandDataType::Int64 => mem_driver
+            .create_with_band_type::<i64, _>("", width, height, 1)
             .map_err(|e| DataFusionError::Execution(format!("Failed to create dataset: {}", e))),
         BandDataType::Float32 => mem_driver
             .create_with_band_type::<f32, _>("", width, height, 1)
@@ -452,10 +477,13 @@ fn initialize_band(
 ) -> Result<()> {
     match band_type {
         BandDataType::UInt8 => initialize_band_t::<u8>(dataset, width, height, init_value as u8),
+        BandDataType::Int8 => initialize_band_t::<i8>(dataset, width, height, init_value as i8),
         BandDataType::UInt16 => initialize_band_t::<u16>(dataset, width, height, init_value as u16),
         BandDataType::Int16 => initialize_band_t::<i16>(dataset, width, height, init_value as i16),
         BandDataType::UInt32 => initialize_band_t::<u32>(dataset, width, height, init_value as u32),
         BandDataType::Int32 => initialize_band_t::<i32>(dataset, width, height, init_value as i32),
+        BandDataType::UInt64 => initialize_band_t::<u64>(dataset, width, height, init_value as u64),
+        BandDataType::Int64 => initialize_band_t::<i64>(dataset, width, height, init_value as i64),
         BandDataType::Float32 => {
             initialize_band_t::<f32>(dataset, width, height, init_value as f32)
         }
@@ -504,6 +532,17 @@ fn read_band_as_bytes(
                 })?;
             buffer.data().to_vec()
         }
+        BandDataType::Int8 => {
+            let buffer = band
+                .read_as::<i8>((0, 0), (width, height), (width, height), None)
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to read band {} data: {}",
+                        band_idx, e
+                    ))
+                })?;
+            buffer.data().iter().map(|v| *v as u8).collect()
+        }
         BandDataType::UInt16 => {
             let buffer = band
                 .read_as::<u16>((0, 0), (width, height), (width, height), None)
@@ -540,6 +579,28 @@ fn read_band_as_bytes(
         BandDataType::Int32 => {
             let buffer = band
                 .read_as::<i32>((0, 0), (width, height), (width, height), None)
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to read band {} data: {}",
+                        band_idx, e
+                    ))
+                })?;
+            buffer.data().iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+        BandDataType::UInt64 => {
+            let buffer = band
+                .read_as::<u64>((0, 0), (width, height), (width, height), None)
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to read band {} data: {}",
+                        band_idx, e
+                    ))
+                })?;
+            buffer.data().iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+        BandDataType::Int64 => {
+            let buffer = band
+                .read_as::<i64>((0, 0), (width, height), (width, height), None)
                 .map_err(|e| {
                     DataFusionError::Execution(format!(
                         "Failed to read band {} data: {}",
@@ -695,6 +756,9 @@ mod tests {
         assert_eq!(parse_pixel_type("S").unwrap(), BandDataType::Int16);
         assert_eq!(parse_pixel_type("US").unwrap(), BandDataType::UInt16);
         assert_eq!(parse_pixel_type("B").unwrap(), BandDataType::UInt8);
+        assert_eq!(parse_pixel_type("I8").unwrap(), BandDataType::Int8);
+        assert_eq!(parse_pixel_type("U64").unwrap(), BandDataType::UInt64);
+        assert_eq!(parse_pixel_type("I64").unwrap(), BandDataType::Int64);
     }
 
     #[test]

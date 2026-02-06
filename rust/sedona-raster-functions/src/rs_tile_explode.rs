@@ -790,10 +790,13 @@ fn extract_tile_data(
 fn nodata_to_bytes(value: f64, data_type: BandDataType) -> Vec<u8> {
     match data_type {
         BandDataType::UInt8 => vec![value as u8],
+        BandDataType::Int8 => vec![(value as i8).to_le_bytes()[0]],
         BandDataType::UInt16 => (value as u16).to_le_bytes().to_vec(),
         BandDataType::Int16 => (value as i16).to_le_bytes().to_vec(),
         BandDataType::UInt32 => (value as u32).to_le_bytes().to_vec(),
         BandDataType::Int32 => (value as i32).to_le_bytes().to_vec(),
+        BandDataType::UInt64 => (value as u64).to_le_bytes().to_vec(),
+        BandDataType::Int64 => (value as i64).to_le_bytes().to_vec(),
         BandDataType::Float32 => (value as f32).to_le_bytes().to_vec(),
         BandDataType::Float64 => value.to_le_bytes().to_vec(),
     }
@@ -807,8 +810,10 @@ impl BandDataTypeExt for BandDataType {
     fn bytes_per_pixel(&self) -> usize {
         match self {
             BandDataType::UInt8 => 1,
+            BandDataType::Int8 => 1,
             BandDataType::UInt16 | BandDataType::Int16 => 2,
             BandDataType::UInt32 | BandDataType::Int32 | BandDataType::Float32 => 4,
+            BandDataType::UInt64 | BandDataType::Int64 => 8,
             BandDataType::Float64 => 8,
         }
     }

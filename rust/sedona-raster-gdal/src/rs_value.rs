@@ -379,6 +379,15 @@ fn read_nodata_value(bytes: &[u8], data_type: BandDataType) -> Result<f64> {
                 ))
             }
         }
+        BandDataType::Int8 => {
+            if !bytes.is_empty() {
+                Ok(bytes[0] as i8 as f64)
+            } else {
+                Err(DataFusionError::Execution(
+                    "Invalid nodata bytes".to_string(),
+                ))
+            }
+        }
         BandDataType::UInt16 => {
             if bytes.len() >= 2 {
                 Ok(u16::from_le_bytes([bytes[0], bytes[1]]) as f64)
@@ -409,6 +418,28 @@ fn read_nodata_value(bytes: &[u8], data_type: BandDataType) -> Result<f64> {
         BandDataType::Int32 => {
             if bytes.len() >= 4 {
                 Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64)
+            } else {
+                Err(DataFusionError::Execution(
+                    "Invalid nodata bytes".to_string(),
+                ))
+            }
+        }
+        BandDataType::UInt64 => {
+            if bytes.len() >= 8 {
+                Ok(u64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]) as f64)
+            } else {
+                Err(DataFusionError::Execution(
+                    "Invalid nodata bytes".to_string(),
+                ))
+            }
+        }
+        BandDataType::Int64 => {
+            if bytes.len() >= 8 {
+                Ok(i64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]) as f64)
             } else {
                 Err(DataFusionError::Execution(
                     "Invalid nodata bytes".to_string(),

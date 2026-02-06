@@ -605,6 +605,7 @@ mod tests {
         // Test all BandDataType variants
         let test_cases = vec![
             (BandDataType::UInt8, vec![1u8, 2u8, 3u8, 4u8]),
+            (BandDataType::Int8, vec![255u8, 254u8, 253u8, 252u8]), // -1, -2, -3, -4
             (
                 BandDataType::UInt16,
                 vec![1u8, 0u8, 2u8, 0u8, 3u8, 0u8, 4u8, 0u8],
@@ -641,6 +642,21 @@ mod tests {
                     16u8, 64u8,
                 ],
             ), // little-endian f64: 1.0, 2.0, 3.0, 4.0
+            (
+                BandDataType::UInt64,
+                vec![
+                    1u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 2u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+                    3u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 4u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+                ],
+            ), // little-endian u64
+            (
+                BandDataType::Int64,
+                vec![
+                    255u8, 255u8, 255u8, 255u8, 255u8, 255u8, 255u8, 255u8, 254u8, 255u8, 255u8,
+                    255u8, 255u8, 255u8, 255u8, 255u8, 253u8, 255u8, 255u8, 255u8, 255u8, 255u8,
+                    255u8, 255u8, 252u8, 255u8, 255u8, 255u8, 255u8, 255u8, 255u8, 255u8,
+                ],
+            ), // little-endian i64
         ];
 
         for (expected_data_type, test_data) in test_cases {
@@ -665,17 +681,20 @@ mod tests {
         let raster = iterator.get(0).unwrap();
         let bands = raster.bands();
 
-        assert_eq!(bands.len(), 7, "Expected 7 bands for all data types");
+        assert_eq!(bands.len(), 10, "Expected 10 bands for all data types");
 
         // Verify each band returns the correct data type
         let expected_types = [
             BandDataType::UInt8,
+            BandDataType::Int8,
             BandDataType::UInt16,
             BandDataType::Int16,
             BandDataType::UInt32,
             BandDataType::Int32,
             BandDataType::Float32,
             BandDataType::Float64,
+            BandDataType::UInt64,
+            BandDataType::Int64,
         ];
 
         // i is zero-based index

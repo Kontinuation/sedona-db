@@ -320,8 +320,10 @@ impl<'a> RasterBandReader<'a> {
 fn band_data_type_size(data_type: &BandDataType) -> usize {
     match data_type {
         BandDataType::UInt8 => 1,
+        BandDataType::Int8 => 1,
         BandDataType::UInt16 | BandDataType::Int16 => 2,
         BandDataType::UInt32 | BandDataType::Int32 | BandDataType::Float32 => 4,
+        BandDataType::UInt64 | BandDataType::Int64 => 8,
         BandDataType::Float64 => 8,
     }
 }
@@ -338,6 +340,7 @@ fn read_pixel_from_bytes(data: &[u8], offset: usize, data_type: &BandDataType) -
 
     let value = match data_type {
         BandDataType::UInt8 => data[byte_offset] as f64,
+        BandDataType::Int8 => (data[byte_offset] as i8) as f64,
         BandDataType::UInt16 => {
             u16::from_le_bytes([data[byte_offset], data[byte_offset + 1]]) as f64
         }
@@ -355,6 +358,26 @@ fn read_pixel_from_bytes(data: &[u8], offset: usize, data_type: &BandDataType) -
             data[byte_offset + 1],
             data[byte_offset + 2],
             data[byte_offset + 3],
+        ]) as f64,
+        BandDataType::UInt64 => u64::from_le_bytes([
+            data[byte_offset],
+            data[byte_offset + 1],
+            data[byte_offset + 2],
+            data[byte_offset + 3],
+            data[byte_offset + 4],
+            data[byte_offset + 5],
+            data[byte_offset + 6],
+            data[byte_offset + 7],
+        ]) as f64,
+        BandDataType::Int64 => i64::from_le_bytes([
+            data[byte_offset],
+            data[byte_offset + 1],
+            data[byte_offset + 2],
+            data[byte_offset + 3],
+            data[byte_offset + 4],
+            data[byte_offset + 5],
+            data[byte_offset + 6],
+            data[byte_offset + 7],
         ]) as f64,
         BandDataType::Float32 => f32::from_le_bytes([
             data[byte_offset],
@@ -385,10 +408,13 @@ fn read_band_bytes_from_gdal(
     let gdal_type = band_data_type_to_gdal(&data_type);
     match gdal_type {
         GdalDataType::UInt8 => read_gdal_bytes::<u8>(band, pixel_count),
+        GdalDataType::Int8 => read_gdal_bytes::<i8>(band, pixel_count),
         GdalDataType::UInt16 => read_gdal_bytes::<u16>(band, pixel_count),
         GdalDataType::Int16 => read_gdal_bytes::<i16>(band, pixel_count),
         GdalDataType::UInt32 => read_gdal_bytes::<u32>(band, pixel_count),
         GdalDataType::Int32 => read_gdal_bytes::<i32>(band, pixel_count),
+        GdalDataType::UInt64 => read_gdal_bytes::<u64>(band, pixel_count),
+        GdalDataType::Int64 => read_gdal_bytes::<i64>(band, pixel_count),
         GdalDataType::Float32 => read_gdal_bytes::<f32>(band, pixel_count),
         GdalDataType::Float64 => read_gdal_bytes::<f64>(band, pixel_count),
         _ => Err(DataFusionError::NotImplemented(
@@ -407,10 +433,13 @@ fn read_window_bytes_from_gdal(
     let gdal_type = band_data_type_to_gdal(&data_type);
     match gdal_type {
         GdalDataType::UInt8 => read_gdal_window_bytes::<u8>(band, offset, size),
+        GdalDataType::Int8 => read_gdal_window_bytes::<i8>(band, offset, size),
         GdalDataType::UInt16 => read_gdal_window_bytes::<u16>(band, offset, size),
         GdalDataType::Int16 => read_gdal_window_bytes::<i16>(band, offset, size),
         GdalDataType::UInt32 => read_gdal_window_bytes::<u32>(band, offset, size),
         GdalDataType::Int32 => read_gdal_window_bytes::<i32>(band, offset, size),
+        GdalDataType::UInt64 => read_gdal_window_bytes::<u64>(band, offset, size),
+        GdalDataType::Int64 => read_gdal_window_bytes::<i64>(band, offset, size),
         GdalDataType::Float32 => read_gdal_window_bytes::<f32>(band, offset, size),
         GdalDataType::Float64 => read_gdal_window_bytes::<f64>(band, offset, size),
         _ => Err(DataFusionError::NotImplemented(
@@ -467,6 +496,12 @@ impl ToLeBytes for u8 {
     }
 }
 
+impl ToLeBytes for i8 {
+    fn to_le_bytes(&self) -> Vec<u8> {
+        vec![*self as u8]
+    }
+}
+
 impl ToLeBytes for u16 {
     fn to_le_bytes(&self) -> Vec<u8> {
         u16::to_le_bytes(*self).to_vec()
@@ -488,6 +523,18 @@ impl ToLeBytes for u32 {
 impl ToLeBytes for i32 {
     fn to_le_bytes(&self) -> Vec<u8> {
         i32::to_le_bytes(*self).to_vec()
+    }
+}
+
+impl ToLeBytes for u64 {
+    fn to_le_bytes(&self) -> Vec<u8> {
+        u64::to_le_bytes(*self).to_vec()
+    }
+}
+
+impl ToLeBytes for i64 {
+    fn to_le_bytes(&self) -> Vec<u8> {
+        i64::to_le_bytes(*self).to_vec()
     }
 }
 

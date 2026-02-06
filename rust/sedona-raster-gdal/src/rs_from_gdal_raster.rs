@@ -111,6 +111,17 @@ impl RsFromGDALRaster {
                     })?;
                 buffer.data().to_vec()
             }
+            BandDataType::Int8 => {
+                let buffer = band
+                    .read_as::<i8>((0, 0), (width, height), (width, height), None)
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to read band {} data: {}",
+                            band_idx, e
+                        ))
+                    })?;
+                buffer.data().iter().map(|v| *v as u8).collect()
+            }
             BandDataType::UInt16 => {
                 let buffer = band
                     .read_as::<u16>((0, 0), (width, height), (width, height), None)
@@ -147,6 +158,28 @@ impl RsFromGDALRaster {
             BandDataType::Int32 => {
                 let buffer = band
                     .read_as::<i32>((0, 0), (width, height), (width, height), None)
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to read band {} data: {}",
+                            band_idx, e
+                        ))
+                    })?;
+                buffer.data().iter().flat_map(|v| v.to_le_bytes()).collect()
+            }
+            BandDataType::UInt64 => {
+                let buffer = band
+                    .read_as::<u64>((0, 0), (width, height), (width, height), None)
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to read band {} data: {}",
+                            band_idx, e
+                        ))
+                    })?;
+                buffer.data().iter().flat_map(|v| v.to_le_bytes()).collect()
+            }
+            BandDataType::Int64 => {
+                let buffer = band
+                    .read_as::<i64>((0, 0), (width, height), (width, height), None)
                     .map_err(|e| {
                         DataFusionError::Execution(format!(
                             "Failed to read band {} data: {}",

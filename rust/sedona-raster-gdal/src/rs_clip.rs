@@ -433,6 +433,9 @@ fn write_nodata_value(
         BandDataType::UInt8 => {
             data[offset] = nodata as u8;
         }
+        BandDataType::Int8 => {
+            data[offset] = (nodata as i8).to_le_bytes()[0];
+        }
         BandDataType::UInt16 => {
             let bytes = (nodata as u16).to_le_bytes();
             data[offset..offset + 2].copy_from_slice(&bytes);
@@ -448,6 +451,14 @@ fn write_nodata_value(
         BandDataType::Int32 => {
             let bytes = (nodata as i32).to_le_bytes();
             data[offset..offset + 4].copy_from_slice(&bytes);
+        }
+        BandDataType::UInt64 => {
+            let bytes = (nodata as u64).to_le_bytes();
+            data[offset..offset + 8].copy_from_slice(&bytes);
+        }
+        BandDataType::Int64 => {
+            let bytes = (nodata as i64).to_le_bytes();
+            data[offset..offset + 8].copy_from_slice(&bytes);
         }
         BandDataType::Float32 => {
             let bytes = (nodata as f32).to_le_bytes();
@@ -511,8 +522,10 @@ fn build_clipped_raster(
 fn data_type_byte_size(data_type: &BandDataType) -> usize {
     match data_type {
         BandDataType::UInt8 => 1,
+        BandDataType::Int8 => 1,
         BandDataType::UInt16 | BandDataType::Int16 => 2,
         BandDataType::UInt32 | BandDataType::Int32 | BandDataType::Float32 => 4,
+        BandDataType::UInt64 | BandDataType::Int64 => 8,
         BandDataType::Float64 => 8,
     }
 }

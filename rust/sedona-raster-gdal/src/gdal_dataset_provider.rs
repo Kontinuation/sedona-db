@@ -21,6 +21,7 @@ use std::{cell::OnceCell, cell::RefCell, marker::PhantomData, num::NonZeroUsize,
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{arrow_datafusion_err, DataFusionError, Result};
 
+use gdal::raster::GdalDataType;
 use gdal::GeoTransformEx;
 
 use sedona_common::{
@@ -367,19 +368,47 @@ impl GDALDatasetProvider {
             let band_metadata = band.metadata();
             let band_type = band_metadata.data_type();
             let gdal_type = band_data_type_to_gdal(&band_type);
-
-            let nodata_value = band_metadata
-                .nodata_value()
-                .map(|bytes| bytes_to_f64(bytes, &band_type))
-                .transpose()?;
+            if matches!(gdal_type, GdalDataType::Unknown) {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "Band data type {:?} is not supported by this GDAL build",
+                    band_type
+                )));
+            }
 
             vrt.add_band(gdal_type, None).map_err(convert_gdal_err)?;
-            let vrt_band = vrt.rasterband(i).map_err(convert_gdal_err)?;
+            let mut vrt_band = vrt.rasterband(i).map_err(convert_gdal_err)?;
 
-            if let Some(nodata) = nodata_value {
-                vrt_band
-                    .set_no_data_value(nodata)
-                    .map_err(convert_gdal_err)?;
+            if let Some(nodata_bytes) = band_metadata.nodata_value() {
+                match band_type {
+                    BandDataType::UInt64 => {
+                        let nodata_bytes: [u8; 8] = nodata_bytes.try_into().map_err(|_| {
+                            DataFusionError::Execution(
+                                "Invalid nodata byte length for UInt64".to_string(),
+                            )
+                        })?;
+                        let nodata = u64::from_le_bytes(nodata_bytes);
+                        vrt_band
+                            .set_no_data_value_u64(Some(nodata))
+                            .map_err(convert_gdal_err)?;
+                    }
+                    BandDataType::Int64 => {
+                        let nodata_bytes: [u8; 8] = nodata_bytes.try_into().map_err(|_| {
+                            DataFusionError::Execution(
+                                "Invalid nodata byte length for Int64".to_string(),
+                            )
+                        })?;
+                        let nodata = i64::from_le_bytes(nodata_bytes);
+                        vrt_band
+                            .set_no_data_value_i64(Some(nodata))
+                            .map_err(convert_gdal_err)?;
+                    }
+                    _ => {
+                        let nodata = bytes_to_f64(nodata_bytes, &band_type)?;
+                        vrt_band
+                            .set_no_data_value(nodata)
+                            .map_err(convert_gdal_err)?;
+                    }
+                }
             }
 
             match band_metadata.storage_type() {
@@ -507,11 +536,26 @@ impl VrtKey {
             let band = bands.band(i).map_err(|e| arrow_datafusion_err!(e))?;
             let band_metadata = band.metadata();
             let band_type = band_metadata.data_type();
-            let nodata_bits = band_metadata
-                .nodata_value()
-                .map(|bytes| bytes_to_f64(bytes, &band_type))
-                .transpose()?
-                .map(f64::to_bits);
+            let nodata_bits = match (band_metadata.nodata_value(), band_type) {
+                (Some(bytes), BandDataType::UInt64) => {
+                    let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+                        DataFusionError::Execution(
+                            "Invalid nodata byte length for UInt64".to_string(),
+                        )
+                    })?;
+                    Some(f64::to_bits(u64::from_le_bytes(bytes) as f64))
+                }
+                (Some(bytes), BandDataType::Int64) => {
+                    let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+                        DataFusionError::Execution(
+                            "Invalid nodata byte length for Int64".to_string(),
+                        )
+                    })?;
+                    Some(f64::to_bits(i64::from_le_bytes(bytes) as f64))
+                }
+                (Some(bytes), _) => Some(bytes_to_f64(bytes, &band_type)?.to_bits()),
+                (None, _) => None,
+            };
             band_keys.push(VrtBandKey {
                 storage_type: band_metadata.storage_type(),
                 data_type: band_type,

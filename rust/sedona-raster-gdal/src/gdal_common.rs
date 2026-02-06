@@ -32,10 +32,13 @@ use datafusion_common::{arrow_datafusion_err, DataFusionError, Result};
 pub fn band_data_type_to_gdal(band_type: &BandDataType) -> GdalDataType {
     match band_type {
         BandDataType::UInt8 => GdalDataType::UInt8,
+        BandDataType::Int8 => GdalDataType::Int8,
         BandDataType::UInt16 => GdalDataType::UInt16,
         BandDataType::Int16 => GdalDataType::Int16,
         BandDataType::UInt32 => GdalDataType::UInt32,
         BandDataType::Int32 => GdalDataType::Int32,
+        BandDataType::UInt64 => GdalDataType::UInt64,
+        BandDataType::Int64 => GdalDataType::Int64,
         BandDataType::Float32 => GdalDataType::Float32,
         BandDataType::Float64 => GdalDataType::Float64,
     }
@@ -45,10 +48,13 @@ pub fn band_data_type_to_gdal(band_type: &BandDataType) -> GdalDataType {
 pub fn gdal_to_band_data_type(gdal_type: GdalDataType) -> Result<BandDataType> {
     match gdal_type {
         GdalDataType::UInt8 => Ok(BandDataType::UInt8),
+        GdalDataType::Int8 => Ok(BandDataType::Int8),
         GdalDataType::UInt16 => Ok(BandDataType::UInt16),
         GdalDataType::Int16 => Ok(BandDataType::Int16),
         GdalDataType::UInt32 => Ok(BandDataType::UInt32),
         GdalDataType::Int32 => Ok(BandDataType::Int32),
+        GdalDataType::UInt64 => Ok(BandDataType::UInt64),
+        GdalDataType::Int64 => Ok(BandDataType::Int64),
         GdalDataType::Float32 => Ok(BandDataType::Float32),
         GdalDataType::Float64 => Ok(BandDataType::Float64),
         _ =>
@@ -66,8 +72,10 @@ pub fn gdal_to_band_data_type(gdal_type: GdalDataType) -> Result<BandDataType> {
 pub fn gdal_type_byte_size(gdal_type: GdalDataType) -> usize {
     match gdal_type {
         GdalDataType::UInt8 => 1,
+        GdalDataType::Int8 => 1,
         GdalDataType::UInt16 | GdalDataType::Int16 => 2,
         GdalDataType::UInt32 | GdalDataType::Int32 | GdalDataType::Float32 => 4,
+        GdalDataType::UInt64 | GdalDataType::Int64 => 8,
         GdalDataType::Float64 => 8,
         _ => 0, // Complex types not supported
     }
@@ -101,10 +109,21 @@ pub fn bytes_to_f64(bytes: &[u8], band_type: &BandDataType) -> Result<f64> {
             }
             Ok(bytes[0] as f64)
         }
+        BandDataType::Int8 => {
+            if bytes.len() != 1 {
+                return Err(DataFusionError::Execution(format!(
+                    "Invalid byte length for Int8: expected 1, got {}",
+                    bytes.len()
+                )));
+            }
+            Ok(bytes[0] as i8 as f64)
+        }
         BandDataType::UInt16 => read_le_f64!(u16, 2),
         BandDataType::Int16 => read_le_f64!(i16, 2),
         BandDataType::UInt32 => read_le_f64!(u32, 4),
         BandDataType::Int32 => read_le_f64!(i32, 4),
+        BandDataType::UInt64 => read_le_f64!(u64, 8),
+        BandDataType::Int64 => read_le_f64!(i64, 8),
         BandDataType::Float32 => read_le_f64!(f32, 4),
         BandDataType::Float64 => read_le_f64!(f64, 8),
     }
@@ -193,6 +212,12 @@ pub unsafe fn raster_ref_to_gdal_mem<R: RasterRef + ?Sized>(
         let band_metadata = band.metadata();
         let band_type = band_metadata.data_type();
         let gdal_type = band_data_type_to_gdal(&band_type);
+        if matches!(gdal_type, GdalDataType::Unknown) {
+            return Err(DataFusionError::NotImplemented(format!(
+                "Band data type {:?} is not supported by this GDAL build",
+                band_type
+            )));
+        }
 
         // Get pointer to band data
         let band_data = band.data();
@@ -216,12 +241,36 @@ pub unsafe fn raster_ref_to_gdal_mem<R: RasterRef + ?Sized>(
 
         // Set nodata value if present
         if let Some(nodata_bytes) = band_metadata.nodata_value() {
-            let nodata = bytes_to_f64(nodata_bytes, &band_type)?;
             let mut band = dataset
                 .rasterband(dst_band_index)
                 .map_err(convert_gdal_err)?;
-            band.set_no_data_value(Some(nodata))
-                .map_err(convert_gdal_err)?;
+            match band_type {
+                BandDataType::UInt64 => {
+                    let nodata_bytes: [u8; 8] = nodata_bytes.try_into().map_err(|_| {
+                        DataFusionError::Execution(
+                            "Invalid nodata byte length for UInt64".to_string(),
+                        )
+                    })?;
+                    let nodata = u64::from_le_bytes(nodata_bytes);
+                    band.set_no_data_value_u64(Some(nodata))
+                        .map_err(convert_gdal_err)?;
+                }
+                BandDataType::Int64 => {
+                    let nodata_bytes: [u8; 8] = nodata_bytes.try_into().map_err(|_| {
+                        DataFusionError::Execution(
+                            "Invalid nodata byte length for Int64".to_string(),
+                        )
+                    })?;
+                    let nodata = i64::from_le_bytes(nodata_bytes);
+                    band.set_no_data_value_i64(Some(nodata))
+                        .map_err(convert_gdal_err)?;
+                }
+                _ => {
+                    let nodata = bytes_to_f64(nodata_bytes, &band_type)?;
+                    band.set_no_data_value(Some(nodata))
+                        .map_err(convert_gdal_err)?;
+                }
+            }
         }
     }
 
@@ -247,10 +296,13 @@ pub fn nodata_bytes_to_f64(nodata_bytes: Option<&[u8]>, band_type: &BandDataType
 pub fn nodata_f64_to_bytes(nodata: f64, band_type: &BandDataType) -> Vec<u8> {
     match band_type {
         BandDataType::UInt8 => vec![(nodata as u8)],
+        BandDataType::Int8 => (nodata as i8).to_le_bytes().to_vec(),
         BandDataType::UInt16 => (nodata as u16).to_le_bytes().to_vec(),
         BandDataType::Int16 => (nodata as i16).to_le_bytes().to_vec(),
         BandDataType::UInt32 => (nodata as u32).to_le_bytes().to_vec(),
         BandDataType::Int32 => (nodata as i32).to_le_bytes().to_vec(),
+        BandDataType::UInt64 => (nodata as u64).to_le_bytes().to_vec(),
+        BandDataType::Int64 => (nodata as i64).to_le_bytes().to_vec(),
         BandDataType::Float32 => (nodata as f32).to_le_bytes().to_vec(),
         BandDataType::Float64 => nodata.to_le_bytes().to_vec(),
     }
@@ -281,6 +333,10 @@ mod tests {
             GdalDataType::UInt8
         );
         assert_eq!(
+            band_data_type_to_gdal(&BandDataType::Int8),
+            GdalDataType::Int8
+        );
+        assert_eq!(
             band_data_type_to_gdal(&BandDataType::UInt16),
             GdalDataType::UInt16
         );
@@ -295,6 +351,14 @@ mod tests {
         assert_eq!(
             band_data_type_to_gdal(&BandDataType::Int32),
             GdalDataType::Int32
+        );
+        assert_eq!(
+            band_data_type_to_gdal(&BandDataType::UInt64),
+            GdalDataType::UInt64
+        );
+        assert_eq!(
+            band_data_type_to_gdal(&BandDataType::Int64),
+            GdalDataType::Int64
         );
         assert_eq!(
             band_data_type_to_gdal(&BandDataType::Float32),
@@ -317,6 +381,27 @@ mod tests {
         assert_eq!(
             bytes_to_f64(&val.to_le_bytes(), &BandDataType::Int16).unwrap(),
             -32768.0
+        );
+
+        // Int8
+        let val: i8 = -7;
+        assert_eq!(
+            bytes_to_f64(&val.to_le_bytes(), &BandDataType::Int8).unwrap(),
+            -7.0
+        );
+
+        // UInt64
+        let val: u64 = 42;
+        assert_eq!(
+            bytes_to_f64(&val.to_le_bytes(), &BandDataType::UInt64).unwrap(),
+            42.0
+        );
+
+        // Int64
+        let val: i64 = -42;
+        assert_eq!(
+            bytes_to_f64(&val.to_le_bytes(), &BandDataType::Int64).unwrap(),
+            -42.0
         );
 
         // Float32
