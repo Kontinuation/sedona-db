@@ -36,7 +36,7 @@ use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{
     scalar_doc_sections::DOC_SECTION_OTHER, ColumnarValue, Documentation, Volatility,
 };
-use gdal::raster::{rasterize, Buffer, RasterizeOptions};
+use gdal::raster::{Buffer, RasterizeOptions};
 use gdal::vector::Geometry;
 use gdal::DriverManager;
 
@@ -50,6 +50,7 @@ use sedona_schema::matchers::ArgMatcher;
 
 use crate::gdal_common::nodata_bytes_to_f64;
 use crate::gdal_dataset_provider::configure_thread_local_cache_size;
+use crate::gdal_rasterize_affine::rasterize_affine;
 use crate::raster_band_reader::RasterBandReader;
 
 /// Statistics types supported by RS_ZonalStats
@@ -764,7 +765,7 @@ fn compute_zonal_stats(
         ..Default::default()
     };
 
-    rasterize(
+    rasterize_affine(
         &mut mask_dataset,
         &[1],
         &[geometry],

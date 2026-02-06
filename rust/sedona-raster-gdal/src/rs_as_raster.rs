@@ -29,7 +29,7 @@ use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{
     scalar_doc_sections::DOC_SECTION_OTHER, ColumnarValue, Documentation, Volatility,
 };
-use gdal::raster::{rasterize, Buffer, RasterizeOptions};
+use gdal::raster::{Buffer, RasterizeOptions};
 use gdal::vector::Geometry;
 use gdal::DriverManager;
 
@@ -44,6 +44,7 @@ use sedona_schema::raster::{BandDataType, StorageType};
 
 use crate::gdal_common::nodata_f64_to_bytes;
 use crate::gdal_dataset_provider::configure_thread_local_cache_size;
+use crate::gdal_rasterize_affine::rasterize_affine;
 
 /// RS_AsRaster() scalar UDF implementation
 pub fn rs_as_raster_udf() -> SedonaScalarUDF {
@@ -394,7 +395,7 @@ fn as_raster(
         ..Default::default()
     };
 
-    rasterize(
+    rasterize_affine(
         &mut out_dataset,
         &[1],
         &[geometry],

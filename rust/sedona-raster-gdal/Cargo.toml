@@ -100,3 +100,8 @@ path = "benches/rs_map_algebra.rs"
 harness = false
 name = "rs_from_path"
 path = "benches/rs_from_path.rs"
+
+[[bench]]
+harness = false
+name = "rasterize_affine"
+path = "benches/rasterize_affine.rs"

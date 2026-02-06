@@ -47,6 +47,11 @@ pub mod rs_zonal_stats;
 
 mod gdal_common;
 mod gdal_dataset_provider;
+mod gdal_rasterize_affine;
+
+// Public for benchmarking / targeted internal usage.
+#[doc(hidden)]
+pub use gdal_rasterize_affine::rasterize_affine;
 
 // Re-export main dataset conversion functions
 pub use gdal_common::{
