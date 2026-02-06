@@ -198,8 +198,12 @@ impl<'a> BandRef for BandRefImpl<'a> {
 struct BandsRefImpl<'a> {
     bands_list: &'a ListArray,
     raster_index: usize,
-    // Direct references to the metadata and data structs
-    band_metadata_struct: &'a StructArray,
+    // Direct references to the metadata and data arrays
+    nodata_array: &'a BinaryArray,
+    storage_type_array: &'a UInt32Array,
+    datatype_array: &'a UInt32Array,
+    outdb_url_array: &'a StringArray,
+    outdb_band_id_array: &'a UInt32Array,
     band_data_array: &'a BinaryViewArray,
 }
 
@@ -230,46 +234,11 @@ impl<'a> BandsRef for BandsRefImpl<'a> {
         let band_row = start + index;
 
         let band_metadata = BandMetadataRefImpl {
-            nodata_array: self
-                .band_metadata_struct
-                .column(band_metadata_indices::NODATAVALUE)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or(ArrowError::SchemaError(
-                    "Failed to downcast nodata to BinaryArray".to_string(),
-                ))?,
-            storage_type_array: self
-                .band_metadata_struct
-                .column(band_metadata_indices::STORAGE_TYPE)
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or(ArrowError::SchemaError(
-                    "Failed to downcast storage_type to UInt32Array".to_string(),
-                ))?,
-            datatype_array: self
-                .band_metadata_struct
-                .column(band_metadata_indices::DATATYPE)
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or(ArrowError::SchemaError(
-                    "Failed to downcast datatype to UInt32Array".to_string(),
-                ))?,
-            outdb_url_array: self
-                .band_metadata_struct
-                .column(band_metadata_indices::OUTDB_URL)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or(ArrowError::SchemaError(
-                    "Failed to downcast outdb_url to StringArray".to_string(),
-                ))?,
-            outdb_band_id_array: self
-                .band_metadata_struct
-                .column(band_metadata_indices::OUTDB_BAND_ID)
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .ok_or(ArrowError::SchemaError(
-                    "Failed to downcast outdb_band_id to UInt32Array".to_string(),
-                ))?,
+            nodata_array: self.nodata_array,
+            storage_type_array: self.storage_type_array,
+            datatype_array: self.datatype_array,
+            outdb_url_array: self.outdb_url_array,
+            outdb_band_id_array: self.outdb_band_id_array,
             band_index: band_row,
         };
 
@@ -355,7 +324,11 @@ impl<'a> RasterRefImpl<'a> {
         let bands = BandsRefImpl {
             bands_list: raster_struct_array.bands_list,
             raster_index,
-            band_metadata_struct: raster_struct_array.band_metadata_struct,
+            nodata_array: raster_struct_array.band_nodata_array,
+            storage_type_array: raster_struct_array.band_storage_type_array,
+            datatype_array: raster_struct_array.band_datatype_array,
+            outdb_url_array: raster_struct_array.band_outdb_url_array,
+            outdb_band_id_array: raster_struct_array.band_outdb_band_id_array,
             band_data_array: raster_struct_array.band_data_array,
         };
 
@@ -403,7 +376,11 @@ pub struct RasterStructArray<'a> {
     skew_y_array: &'a Float64Array,
     crs: &'a StringViewArray,
     bands_list: &'a ListArray,
-    band_metadata_struct: &'a StructArray,
+    band_nodata_array: &'a BinaryArray,
+    band_storage_type_array: &'a UInt32Array,
+    band_datatype_array: &'a UInt32Array,
+    band_outdb_url_array: &'a StringArray,
+    band_outdb_band_id_array: &'a UInt32Array,
     band_data_array: &'a BinaryViewArray,
 }
 
@@ -480,6 +457,31 @@ impl<'a> RasterStructArray<'a> {
             .as_any()
             .downcast_ref::<StructArray>()
             .unwrap();
+        let band_nodata_array = band_metadata_struct
+            .column(band_metadata_indices::NODATAVALUE)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let band_storage_type_array = band_metadata_struct
+            .column(band_metadata_indices::STORAGE_TYPE)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let band_datatype_array = band_metadata_struct
+            .column(band_metadata_indices::DATATYPE)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let band_outdb_url_array = band_metadata_struct
+            .column(band_metadata_indices::OUTDB_URL)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let band_outdb_band_id_array = band_metadata_struct
+            .column(band_metadata_indices::OUTDB_BAND_ID)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
         let band_data_array = bands_struct
             .column(band_indices::DATA)
             .as_any()
@@ -498,7 +500,11 @@ impl<'a> RasterStructArray<'a> {
             skew_y_array,
             crs,
             bands_list,
-            band_metadata_struct,
+            band_nodata_array,
+            band_storage_type_array,
+            band_datatype_array,
+            band_outdb_url_array,
+            band_outdb_band_id_array,
             band_data_array,
         }
     }
