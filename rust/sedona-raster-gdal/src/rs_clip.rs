@@ -32,7 +32,7 @@ use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{
     scalar_doc_sections::DOC_SECTION_OTHER, ColumnarValue, Documentation, Volatility,
 };
-use gdal::raster::{Buffer, RasterizeOptions};
+use gdal::raster::Buffer;
 use gdal::vector::Geometry;
 use gdal::DriverManager;
 
@@ -321,18 +321,12 @@ fn clip_raster(
         .write((0, 0), (width, height), &mut buffer)
         .map_err(|e| DataFusionError::Execution(format!("Failed to initialize mask: {}", e)))?;
 
-    // Rasterize geometry onto mask (set to 1 inside geometry)
-    let rasterize_options = RasterizeOptions {
-        all_touched,
-        ..Default::default()
-    };
-
     rasterize_affine(
         &mut mask_dataset,
         &[1], // band 1
         &[geometry],
         &[1.0], // burn value = 1 (inside)
-        Some(rasterize_options),
+        all_touched,
     )
     .map_err(|e| DataFusionError::Execution(format!("Failed to rasterize geometry: {}", e)))?;
 

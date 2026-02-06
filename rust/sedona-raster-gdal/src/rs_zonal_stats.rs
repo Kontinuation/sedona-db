@@ -36,7 +36,7 @@ use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{
     scalar_doc_sections::DOC_SECTION_OTHER, ColumnarValue, Documentation, Volatility,
 };
-use gdal::raster::{Buffer, RasterizeOptions};
+use gdal::raster::Buffer;
 use gdal::vector::Geometry;
 use gdal::DriverManager;
 
@@ -759,20 +759,8 @@ fn compute_zonal_stats(
         .write((0, 0), (window.width, window.height), &mut buffer)
         .map_err(|e| DataFusionError::Execution(format!("Failed to initialize mask: {}", e)))?;
 
-    // Rasterize geometry
-    let rasterize_options = RasterizeOptions {
-        all_touched,
-        ..Default::default()
-    };
-
-    rasterize_affine(
-        &mut mask_dataset,
-        &[1],
-        &[geometry],
-        &[1.0],
-        Some(rasterize_options),
-    )
-    .map_err(|e| DataFusionError::Execution(format!("Failed to rasterize geometry: {}", e)))?;
+    rasterize_affine(&mut mask_dataset, &[1], &[geometry], &[1.0], all_touched)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to rasterize geometry: {}", e)))?;
 
     // Read mask
     let mask_band = mask_dataset

@@ -24,13 +24,10 @@
 //! This module supplies a minimal GDALTransformerFunc that applies the dataset
 //! GeoTransform (and its inverse), avoiding expensive transformer creation.
 
-use std::convert::TryFrom;
 use std::ffi::{c_int, c_void};
 use std::ptr;
 
-use gdal::cpl::CslStringList;
 use gdal::errors::{GdalError, Result};
-use gdal::raster::RasterizeOptions;
 use gdal::vector::Geometry;
 use gdal::{Dataset, GeoTransform, GeoTransformEx};
 use gdal_sys::CPLErr;
@@ -125,7 +122,7 @@ pub fn rasterize_affine(
     bands: &[usize],
     geometries: &[Geometry],
     burn_values: &[f64],
-    options: Option<RasterizeOptions>,
+    all_touched: bool,
 ) -> Result<()> {
     if bands.is_empty() {
         return Err(GdalError::BadArgument(
@@ -152,8 +149,12 @@ pub fn rasterize_affine(
     }
 
     let bands_i32: Vec<c_int> = bands.iter().map(|&band| band as c_int).collect();
-    let options = options.unwrap_or_default();
-    let c_options = CslStringList::try_from(options)?;
+
+    let c_options = if all_touched {
+        [c"ALL_TOUCHED=TRUE".as_ptr(), ptr::null_mut()]
+    } else {
+        [c"ALL_TOUCHED=FALSE".as_ptr(), ptr::null_mut()]
+    };
 
     let geometries_c: Vec<_> = geometries
         .iter()
@@ -189,7 +190,7 @@ pub fn rasterize_affine(
             Some(affine_transformer),
             (&mut arg as *mut AffineTransformArg).cast::<c_void>(),
             burn_values_expanded.as_ptr(),
-            c_options.as_ptr(),
+            c_options.as_ptr() as *mut *mut i8,
             None,
             ptr::null_mut(),
         );
@@ -204,7 +205,7 @@ pub fn rasterize_affine(
 mod tests {
     use super::*;
 
-    use gdal::raster::{Buffer, MergeAlgorithm};
+    use gdal::raster::{Buffer, RasterizeOptions};
     use gdal::DriverManager;
 
     fn ensure_mem_driver() {
@@ -275,7 +276,7 @@ mod tests {
 
         gdal::raster::rasterize(&mut ds_baseline, &[1], &[geom.clone()], &[1.0], Some(opts))
             .unwrap();
-        rasterize_affine(&mut ds_affine, &[1], &[geom], &[1.0], Some(opts)).unwrap();
+        rasterize_affine(&mut ds_affine, &[1], &[geom], &[1.0], false).unwrap();
 
         assert_eq!(read_u8(&ds_affine, w, h), read_u8(&ds_baseline, w, h));
     }
@@ -298,44 +299,7 @@ mod tests {
 
         gdal::raster::rasterize(&mut ds_baseline, &[1], &[geom.clone()], &[1.0], Some(opts))
             .unwrap();
-        rasterize_affine(&mut ds_affine, &[1], &[geom], &[1.0], Some(opts)).unwrap();
-
-        assert_eq!(read_u8(&ds_affine, w, h), read_u8(&ds_baseline, w, h));
-    }
-
-    #[test]
-    fn test_rasterize_affine_matches_baseline_merge_add() {
-        ensure_mem_driver();
-        let (w, h) = (48usize, 36usize);
-        let gt: GeoTransform = [0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-
-        let geom1 = poly_from_pixel_rect(&gt, 10.1, 10.1, 30.9, 26.8);
-        let geom2 = poly_from_pixel_rect(&gt, 20.2, 15.3, 40.4, 32.6);
-        let opts = RasterizeOptions {
-            merge_algorithm: MergeAlgorithm::Add,
-            all_touched: true,
-            ..Default::default()
-        };
-
-        let mut ds_baseline = make_dataset_u8(w, h, gt).unwrap();
-        let mut ds_affine = make_dataset_u8(w, h, gt).unwrap();
-
-        gdal::raster::rasterize(
-            &mut ds_baseline,
-            &[1],
-            &[geom1.clone(), geom2.clone()],
-            &[1.0, 2.0],
-            Some(opts),
-        )
-        .unwrap();
-        rasterize_affine(
-            &mut ds_affine,
-            &[1],
-            &[geom1, geom2],
-            &[1.0, 2.0],
-            Some(opts),
-        )
-        .unwrap();
+        rasterize_affine(&mut ds_affine, &[1], &[geom], &[1.0], true).unwrap();
 
         assert_eq!(read_u8(&ds_affine, w, h), read_u8(&ds_baseline, w, h));
     }
@@ -361,7 +325,7 @@ mod tests {
         let geom = line_from_pixel_points(&gt, &pts);
 
         let opts = RasterizeOptions {
-            all_touched: true,
+            all_touched: false,
             ..Default::default()
         };
 
@@ -370,7 +334,7 @@ mod tests {
 
         gdal::raster::rasterize(&mut ds_baseline, &[1], &[geom.clone()], &[1.0], Some(opts))
             .unwrap();
-        rasterize_affine(&mut ds_affine, &[1], &[geom], &[1.0], Some(opts)).unwrap();
+        rasterize_affine(&mut ds_affine, &[1], &[geom], &[1.0], false).unwrap();
 
         let got = read_u8(&ds_affine, w, h);
         let expected = read_u8(&ds_baseline, w, h);
@@ -403,7 +367,7 @@ mod tests {
         let gt: GeoTransform = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let mut ds = make_dataset_u8(w, h, gt).unwrap();
         let geom = Geometry::from_wkt("POINT (0 0)").unwrap();
-        let err = rasterize_affine(&mut ds, &[1], &[geom], &[1.0], None).unwrap_err();
+        let err = rasterize_affine(&mut ds, &[1], &[geom], &[1.0], true).unwrap_err();
         match err {
             GdalError::BadArgument(msg) => {
                 assert!(msg.contains("Non-invertible geotransform"));

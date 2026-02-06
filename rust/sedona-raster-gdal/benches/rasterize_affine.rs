@@ -142,7 +142,7 @@ fn bench_rasterize_affine(c: &mut Criterion) {
                     &[1],
                     std::hint::black_box(&geoms),
                     std::hint::black_box(&burns),
-                    Some(opts),
+                    true,
                 )
                 .unwrap();
             }
@@ -235,10 +235,6 @@ fn bench_rasterize_affine(c: &mut Criterion) {
                     let geom = Geometry::from_wkt(&wkt).unwrap();
                     let geoms = [geom];
                     let burns = [1.0f64];
-                    let opts = RasterizeOptions {
-                        all_touched: true,
-                        ..Default::default()
-                    };
 
                     ready.wait();
                     start.wait();
@@ -250,7 +246,7 @@ fn bench_rasterize_affine(c: &mut Criterion) {
                                 &[1],
                                 std::hint::black_box(&geoms),
                                 std::hint::black_box(&burns),
-                                Some(opts),
+                                true,
                             )
                             .unwrap();
                         }

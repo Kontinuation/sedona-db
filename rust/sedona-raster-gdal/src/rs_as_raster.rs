@@ -29,7 +29,7 @@ use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{
     scalar_doc_sections::DOC_SECTION_OTHER, ColumnarValue, Documentation, Volatility,
 };
-use gdal::raster::{Buffer, RasterizeOptions};
+use gdal::raster::Buffer;
 use gdal::vector::Geometry;
 use gdal::DriverManager;
 
@@ -389,18 +389,12 @@ fn as_raster(
         }
     }
 
-    // Rasterize geometry
-    let rasterize_options = RasterizeOptions {
-        all_touched,
-        ..Default::default()
-    };
-
     rasterize_affine(
         &mut out_dataset,
         &[1],
         &[geometry],
         &[burn_value],
-        Some(rasterize_options),
+        all_touched,
     )
     .map_err(|e| DataFusionError::Execution(format!("Failed to rasterize geometry: {}", e)))?;
 
