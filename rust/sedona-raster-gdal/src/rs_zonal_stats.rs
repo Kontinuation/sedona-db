@@ -36,9 +36,8 @@ use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{
     scalar_doc_sections::DOC_SECTION_OTHER, ColumnarValue, Documentation, Volatility,
 };
-use gdal::raster::{rasterize, Buffer, RasterizeOptions};
+use gdal::raster::{rasterize, RasterizeOptions};
 use gdal::vector::Geometry;
-use gdal::DriverManager;
 
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_raster::affine_transformation::to_world_coordinate;
@@ -51,6 +50,7 @@ use sedona_schema::matchers::ArgMatcher;
 use crate::gdal_common::nodata_bytes_to_f64;
 use crate::gdal_dataset_provider::configure_thread_local_cache_size;
 use crate::raster_band_reader::RasterBandReader;
+use crate::temporary_mem_dataset::TemporaryMemDataset;
 
 /// Statistics types supported by RS_ZonalStats
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -726,12 +726,7 @@ fn compute_zonal_stats(
     };
 
     // Create a mask raster
-    let mem_driver = DriverManager::get_driver_by_name("MEM")
-        .map_err(|e| DataFusionError::Execution(format!("Failed to get MEM driver: {}", e)))?;
-
-    let mut mask_dataset = mem_driver
-        .create_with_band_type::<u8, _>("", window.width, window.height, 1)
-        .map_err(|e| DataFusionError::Execution(format!("Failed to create mask dataset: {}", e)))?;
+    let mut mask_dataset = TemporaryMemDataset::<u8>::new_zeroed(window.width, window.height, 1)?;
 
     // Set geotransform
     let start_col = window.xoff as f64;
@@ -745,18 +740,9 @@ fn compute_zonal_stats(
         metadata.scale_y(),
     ];
     mask_dataset
+        .dataset_mut()
         .set_geo_transform(&geotransform)
         .map_err(|e| DataFusionError::Execution(format!("Failed to set geotransform: {}", e)))?;
-
-    // Initialize mask to 0
-    let mut mask_band = mask_dataset
-        .rasterband(1)
-        .map_err(|e| DataFusionError::Execution(format!("Failed to get mask band: {}", e)))?;
-    let zeros = vec![0u8; window.width * window.height];
-    let mut buffer = Buffer::new((window.width, window.height), zeros);
-    mask_band
-        .write((0, 0), (window.width, window.height), &mut buffer)
-        .map_err(|e| DataFusionError::Execution(format!("Failed to initialize mask: {}", e)))?;
 
     // Rasterize geometry
     let rasterize_options = RasterizeOptions {
@@ -765,27 +751,14 @@ fn compute_zonal_stats(
     };
 
     rasterize(
-        &mut mask_dataset,
+        mask_dataset.dataset_mut(),
         &[1],
         &[geometry],
         &[1.0],
         Some(rasterize_options),
     )
     .map_err(|e| DataFusionError::Execution(format!("Failed to rasterize geometry: {}", e)))?;
-
-    // Read mask
-    let mask_band = mask_dataset
-        .rasterband(1)
-        .map_err(|e| DataFusionError::Execution(format!("Failed to get mask band: {}", e)))?;
-    let mask_buffer = mask_band
-        .read_as::<u8>(
-            (0, 0),
-            (window.width, window.height),
-            (window.width, window.height),
-            None,
-        )
-        .map_err(|e| DataFusionError::Execution(format!("Failed to read mask: {}", e)))?;
-    let mask = mask_buffer.data();
+    let mask = mask_dataset.band_slice(1)?;
 
     let band = raster
         .bands()
@@ -1085,6 +1058,8 @@ fn calc_num_iterations(args: &[ColumnarValue]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gdal::raster::Buffer;
+    use gdal::DriverManager;
     use sedona_raster::affine_transformation::to_world_coordinate;
     use sedona_raster::array::RasterStructArray;
     use sedona_schema::crs::deserialize_crs;

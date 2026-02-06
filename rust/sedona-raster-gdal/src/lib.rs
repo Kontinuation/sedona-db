@@ -44,6 +44,7 @@ pub mod rs_metadata;
 pub mod rs_polygonize;
 pub mod rs_value;
 pub mod rs_zonal_stats;
+mod temporary_mem_dataset;
 
 mod gdal_common;
 mod gdal_dataset_provider;
