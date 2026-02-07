@@ -204,15 +204,15 @@ sd_configure_proj <- function(
   )
 }
 
-#' Configure the Sedona GDAL shim
+#' Configure the GDAL shared library
 #'
-#' Loads the Sedona GDAL shim shared library used for internal MEM datasets.
+#' Loads the GDAL shared library used for internal MEM datasets.
 #'
 #' @param preset One of:
-#'   - `"homebrew"`: Look for the shim installed by Homebrew.
-#'   - `"system"`: Look for the shim in the platform library load path.
+#'   - `"homebrew"`: Look for GDAL installed by Homebrew.
+#'   - `"system"`: Look for GDAL in the platform library load path.
 #'   - `"auto"`: Try all presets in the order listed above.
-#' @param shared_library An absolute or relative path to the shim shared library.
+#' @param shared_library An absolute or relative path to the GDAL shared library.
 #'
 #' @returns NULL, invisibly
 #' @export
@@ -266,7 +266,7 @@ sd_configure_gdal <- function(preset = NULL, shared_library = NULL) {
 }
 
 configure_gdal_system <- function() {
-  sd_configure_gdal(shared_library = gdal_shim_dll_name())
+  sd_configure_gdal(shared_library = gdal_dll_name())
 }
 
 configure_gdal_prefix <- function(prefix) {
@@ -275,18 +275,18 @@ configure_gdal_prefix <- function(prefix) {
   }
 
   sd_configure_gdal(
-    shared_library = file.path(prefix, "lib", gdal_shim_dll_name())
+    shared_library = file.path(prefix, "lib", gdal_dll_name())
   )
 }
 
-gdal_shim_dll_name <- function() {
+gdal_dll_name <- function() {
   switch(
     tolower(Sys.info()[["sysname"]]),
-    windows = "sedona_gdal.dll",
-    darwin = "libsedona_gdal.dylib",
-    linux = "libsedona_gdal.so",
+    windows = "gdal.dll",
+    darwin = "libgdal.dylib",
+    linux = "libgdal.so",
     stop(sprintf(
-      "Can't determine sedona-gdal shared library name for OS: %s",
+      "Can't determine GDAL shared library name for OS: %s",
       Sys.info()[["sysname"]]
     ))
   )

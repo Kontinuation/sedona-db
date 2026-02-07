@@ -5146,8 +5146,6 @@ name = "sedona-gdal"
 version = "0.3.0"
 dependencies = [
  "cc",
- "gdal",
- "pkg-config",
  "thiserror 2.0.17",
 ]
 

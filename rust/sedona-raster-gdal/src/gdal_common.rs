@@ -18,10 +18,12 @@
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-use gdal::{DatasetOptions, DriverManager, GdalOpenFlags, errors::GdalError, raster::GdalDataType};
+use gdal::{errors::GdalError, raster::GdalDataType, DatasetOptions, DriverManager, GdalOpenFlags};
 
 use gdal_sys::GDALDriverH;
-use sedona_gdal::{gdal_dyn_bindgen::GDALDataType as SedonaGdalDataType, register::with_global_gdal_api};
+use sedona_gdal::{
+    gdal_dyn_bindgen::GDALDataType as SedonaGdalDataType, register::with_global_gdal_api,
+};
 use sedona_raster::traits::RasterRef;
 use sedona_schema::raster::{BandDataType, StorageType};
 
@@ -217,7 +219,8 @@ pub unsafe fn raster_ref_to_gdal_mem<R: RasterRef + ?Sized>(
         let band_metadata = band.metadata();
         let band_type = band_metadata.data_type();
         let gdal_type = band_data_type_to_gdal(&band_type);
-        if matches!(gdal_type, GdalDataType::Unknown) {
+        let gdal_ordinal = gdal_type as i32;
+        if gdal_ordinal == 0 {
             return Err(DataFusionError::NotImplemented(format!(
                 "Band data type {:?} is not supported by this GDAL build",
                 band_type
@@ -227,7 +230,7 @@ pub unsafe fn raster_ref_to_gdal_mem<R: RasterRef + ?Sized>(
         // Get pointer to band data
         let band_data = band.data();
         let data_ptr = band_data.as_ptr() as *const c_void;
-        let gdal_type: SedonaGdalDataType = gdal_type.try_into().map_err(|_| {
+        let gdal_type = SedonaGdalDataType::try_from_ordinal(gdal_ordinal).map_err(|_| {
             DataFusionError::NotImplemented(format!(
                 "Band data type {:?} is not supported by this GDAL build",
                 band_type

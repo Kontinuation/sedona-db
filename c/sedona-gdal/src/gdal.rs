@@ -53,9 +53,9 @@ impl GdalApi {
     pub fn try_from_shared_library(shared_library: PathBuf) -> Result<Arc<Self>, SedonaGdalError> {
         let mut inner = SedonaGdalApi {
             sedona_gdal_mem_create_internal: None,
-            sedona_gdal_dataset_close: None,
             release: None,
             private_data: ptr::null_mut(),
+            shim: ptr::null_mut(),
         };
         let mut err_message = (0..1024).map(|_| 0).collect::<Vec<u8>>();
         let shared_library_c = CString::new(shared_library.to_string_lossy().to_string())
@@ -87,9 +87,9 @@ impl GdalApi {
     pub fn try_from_current_process() -> Result<Arc<Self>, SedonaGdalError> {
         let mut inner = SedonaGdalApi {
             sedona_gdal_mem_create_internal: None,
-            sedona_gdal_dataset_close: None,
             release: None,
             private_data: ptr::null_mut(),
+            shim: ptr::null_mut(),
         };
         let mut err_message = (0..1024).map(|_| 0).collect::<Vec<u8>>();
 
@@ -140,9 +140,5 @@ impl GdalApi {
             pixel_offsets,
             line_offsets
         )
-    }
-
-    pub unsafe fn dataset_close(&self, dataset: GDALDatasetH) {
-        call_gdal_api!(self, sedona_gdal_dataset_close, dataset)
     }
 }

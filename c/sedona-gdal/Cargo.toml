@@ -34,10 +34,8 @@ crate-type = ["staticlib", "cdylib", "lib"]
 
 [build-dependencies]
 cc = { version = "1" }
-pkg-config = { version = "0.3" }
 
 [dependencies]
-gdal = { workspace = true }
 thiserror = { workspace = true }
 
 [features]

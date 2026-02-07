@@ -20,13 +20,9 @@
 
 #include <stddef.h>
 
-#if defined(SEDONA_GDAL_BUILD)
-#include <gdal.h>
-#else
 typedef void* GDALDatasetH;
 typedef int GDALDataType;
 typedef long long GSpacing;
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,9 +34,9 @@ struct SedonaGdalApi {
                                                   const void* const* band_data,
                                                   const GSpacing* pixel_offsets,
                                                   const GSpacing* line_offsets);
-  void (*sedona_gdal_dataset_close)(GDALDatasetH dataset);
   void (*release)(struct SedonaGdalApi*);
   void* private_data;
+  void* shim;
 };
 
 int sedona_gdal_dyn_api_init(struct SedonaGdalApi* api, const char* shared_object_path,

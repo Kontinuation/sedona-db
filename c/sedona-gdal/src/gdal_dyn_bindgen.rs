@@ -45,28 +45,33 @@ pub enum GDALDataType {
     GDT_TypeCount = 17,
 }
 
-pub type GDALDatasetH = *mut c_void;
-
-impl TryFrom<gdal::raster::GdalDataType> for GDALDataType {
-    type Error = ();
-
-    fn try_from(value: gdal::raster::GdalDataType) -> Result<Self, Self::Error> {
-        let mapped = match value {
-            gdal::raster::GdalDataType::Unknown => GDALDataType::GDT_Unknown,
-            gdal::raster::GdalDataType::UInt8 => GDALDataType::GDT_Byte,
-            gdal::raster::GdalDataType::Int8 => GDALDataType::GDT_Int8,
-            gdal::raster::GdalDataType::UInt16 => GDALDataType::GDT_UInt16,
-            gdal::raster::GdalDataType::Int16 => GDALDataType::GDT_Int16,
-            gdal::raster::GdalDataType::UInt32 => GDALDataType::GDT_UInt32,
-            gdal::raster::GdalDataType::Int32 => GDALDataType::GDT_Int32,
-            gdal::raster::GdalDataType::UInt64 => GDALDataType::GDT_UInt64,
-            gdal::raster::GdalDataType::Int64 => GDALDataType::GDT_Int64,
-            gdal::raster::GdalDataType::Float32 => GDALDataType::GDT_Float32,
-            gdal::raster::GdalDataType::Float64 => GDALDataType::GDT_Float64,
-        };
-        Ok(mapped)
+impl GDALDataType {
+    pub fn try_from_ordinal(value: i32) -> Result<Self, ()> {
+        match value {
+            0 => Ok(GDALDataType::GDT_Unknown),
+            1 => Ok(GDALDataType::GDT_Byte),
+            2 => Ok(GDALDataType::GDT_UInt16),
+            3 => Ok(GDALDataType::GDT_Int16),
+            4 => Ok(GDALDataType::GDT_UInt32),
+            5 => Ok(GDALDataType::GDT_Int32),
+            6 => Ok(GDALDataType::GDT_Float32),
+            7 => Ok(GDALDataType::GDT_Float64),
+            8 => Ok(GDALDataType::GDT_CInt16),
+            9 => Ok(GDALDataType::GDT_CInt32),
+            10 => Ok(GDALDataType::GDT_CFloat32),
+            11 => Ok(GDALDataType::GDT_CFloat64),
+            12 => Ok(GDALDataType::GDT_UInt64),
+            13 => Ok(GDALDataType::GDT_Int64),
+            14 => Ok(GDALDataType::GDT_Int8),
+            15 => Ok(GDALDataType::GDT_Float16),
+            16 => Ok(GDALDataType::GDT_CFloat16),
+            17 => Ok(GDALDataType::GDT_TypeCount),
+            _ => Err(()),
+        }
     }
 }
+
+pub type GDALDatasetH = *mut c_void;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -82,9 +87,9 @@ pub struct SedonaGdalApi {
             line_offsets: *const GSpacing,
         ) -> GDALDatasetH,
     >,
-    pub sedona_gdal_dataset_close: Option<unsafe extern "C" fn(dataset: GDALDatasetH)>,
     pub release: Option<unsafe extern "C" fn(arg1: *mut SedonaGdalApi)>,
     pub private_data: *mut c_void,
+    pub shim: *mut c_void,
 }
 
 unsafe extern "C" {

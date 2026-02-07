@@ -17,7 +17,6 @@
 use crate::{error::PySedonaError, udf::sedona_scalar_udf};
 use pyo3::{ffi::Py_uintptr_t, prelude::*};
 use sedona_adbc::AdbcSedonadbDriverInit;
-use sedona_gdal::register::configure_global_gdal_api;
 use sedona_proj::register::{configure_global_proj_engine, ProjCrsEngineBuilder};
 use std::ffi::c_void;
 
@@ -98,8 +97,9 @@ fn configure_proj_shared(
 
 #[pyfunction]
 fn configure_gdal_shared(shared_library_path: String) -> Result<(), PySedonaError> {
-    configure_global_gdal_api(shared_library_path.into())
-        .map_err(|e| PySedonaError::SedonaPython(format!("Failed to configure GDAL shim: {e}")))?;
+    sedona_gdal::register::configure_global_gdal_api(shared_library_path.into()).map_err(|e| {
+        PySedonaError::SedonaPython(format!("Failed to configure GDAL shared library: {e}"))
+    })?;
     Ok(())
 }
 

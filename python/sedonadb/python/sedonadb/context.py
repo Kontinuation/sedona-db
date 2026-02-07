@@ -414,18 +414,18 @@ def configure_gdal(
     *,
     shared_library: Optional[Union[str, Path]] = None,
 ) -> None:
-    """Configure the Sedona GDAL shim library.
+    """Configure the GDAL shared library.
 
     Args:
         preset: One of `"homebrew"`, `"system"`, or `"auto"`.
-        shared_library: Path to the Sedona GDAL shim shared library.
+        shared_library: Path to the GDAL shared library.
     """
     if preset is not None:
         if preset == "homebrew":
             prefix = os.environ.get("HOMEBREW_PREFIX", "/opt/homebrew")
-            shared_library = Path(prefix) / "lib" / _gdal_shim_lib_name()
+            shared_library = Path(prefix) / "lib" / _gdal_lib_name()
         elif preset == "system":
-            shared_library = _gdal_shim_lib_name()
+            shared_library = _gdal_lib_name()
         elif preset == "auto":
             errors = []
             for option in ("homebrew", "system"):
@@ -435,7 +435,7 @@ def configure_gdal(
                 except Exception as e:
                     errors.append(f"{option}: {e}")
             raise ValueError(
-                f"Failed to configure GDAL shim. Tried presets: {', '.join(errors)}"
+                f"Failed to configure GDAL shared library. Tried presets: {', '.join(errors)}"
             )
         else:
             raise ValueError(f"Unknown preset: {preset}")
@@ -449,18 +449,18 @@ def configure_gdal(
 
         ctypes.CDLL(str(shared_library))
     except OSError as e:
-        raise ValueError(f"Can't load GDAL shim shared library '{shared_library}': {e}")
+        raise ValueError(f"Can't load GDAL shared library '{shared_library}': {e}")
 
     configure_gdal_shared(str(shared_library))
 
 
-def _gdal_shim_lib_name() -> str:
+def _gdal_lib_name() -> str:
     if sys.platform == "darwin":
-        return "libsedona_gdal.dylib"
+        return "libgdal.dylib"
     if sys.platform.startswith("linux"):
-        return "libsedona_gdal.so"
+        return "libgdal.so"
     if sys.platform == "win32":
-        return "sedona_gdal.dll"
+        return "gdal.dll"
     raise ValueError(f"Unsupported platform: {sys.platform}")
 
 
