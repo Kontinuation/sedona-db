@@ -85,12 +85,6 @@ pub fn configure_gdal_shim(config_options: Option<&ConfigOptions>) -> Result<()>
     gdal_dataset_provider::configure_gdal_shim(config_options)
 }
 
-/// Configure the GDAL shim from the current process symbol table (tests only).
-#[cfg(test)]
-pub fn configure_gdal_shim_from_current_process() -> Result<()> {
-    gdal_dataset_provider::configure_gdal_shim_from_current_process()
-}
-
 /// Returns all GDAL-based raster UDFs
 pub fn all_gdal_udfs() -> Vec<datafusion_expr::ScalarUDF> {
     vec![

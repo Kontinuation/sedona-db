@@ -264,13 +264,6 @@ pub unsafe fn raster_ref_to_gdal_mem<R: RasterRef + ?Sized>(
         Ok(unsafe { gdal::Dataset::from_c_dataset(dataset) })
     })
     .map_err(|e| match e {
-        sedona_gdal::error::SedonaGdalError::Invalid(msg)
-            if msg == "GDAL API not configured" =>
-        {
-            DataFusionError::Configuration(
-                "GDAL shim not configured. Set sedona.gdal.shared_library_path or call configure_gdal_shared()/configure_global_gdal_api()".to_string(),
-            )
-        }
         _ => DataFusionError::Execution(format!("{e}")),
     })?;
 

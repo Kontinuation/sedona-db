@@ -729,7 +729,6 @@ fn finish_result(args: &[ColumnarValue], out: ArrayRef) -> Result<ColumnarValue>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::configure_gdal_shim_from_current_process;
 
     use crate::rs_from_gdal_raster::RsFromGDALRaster;
     use gdal::vector::Geometry;
@@ -757,7 +756,6 @@ mod tests {
 
     #[test]
     fn test_rs_as_raster_use_reference_extent() {
-        configure_gdal_shim_from_current_process().unwrap();
         let test_file = sedona_testing::data::test_raster("test4.tiff").unwrap();
         let content = std::fs::read(&test_file).unwrap();
         let raster_array = RsFromGDALRaster::parse_gdal_raster(&content).unwrap();
@@ -806,7 +804,6 @@ mod tests {
 
     #[test]
     fn test_rs_as_raster_use_geometry_extent() {
-        configure_gdal_shim_from_current_process().unwrap();
         let test_file = sedona_testing::data::test_raster("test4.tiff").unwrap();
         let content = std::fs::read(&test_file).unwrap();
         let raster_array = RsFromGDALRaster::parse_gdal_raster(&content).unwrap();

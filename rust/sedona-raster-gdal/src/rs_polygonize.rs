@@ -321,7 +321,6 @@ fn finish_result(args: &[ColumnarValue], out: ArrayRef) -> Result<ColumnarValue>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::configure_gdal_shim_from_current_process;
 
     #[test]
     fn test_polygon_value_list_type() {
@@ -344,7 +343,6 @@ mod tests {
 
     #[test]
     fn test_polygonize_raster() {
-        configure_gdal_shim_from_current_process().unwrap();
         // Load test raster and polygonize it
         use crate::rs_from_gdal_raster::RsFromGDALRaster;
 
