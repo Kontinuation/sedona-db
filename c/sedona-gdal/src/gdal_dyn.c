@@ -78,6 +78,19 @@ struct SedonaGdalShim {
 };
 
 static struct SedonaGdalShim* g_sedona_gdal_shim = NULL;
+static int g_sedona_gdal_log_emitted = 0;
+
+static void sedona_gdal_log_loaded(const char* source) {
+  if (g_sedona_gdal_log_emitted) {
+    return;
+  }
+  g_sedona_gdal_log_emitted = 1;
+  if (source == NULL) {
+    fprintf(stderr, "sedona-gdal: loaded GDAL (unknown source)\n");
+    return;
+  }
+  fprintf(stderr, "sedona-gdal: loaded GDAL from %s\n", source);
+}
 
 static void sedona_gdal_dyn_release_api(struct SedonaGdalApi* api) {
   if (api->shim != NULL) {
@@ -117,8 +130,13 @@ static int load_gdal_shim(struct SedonaGdalShim* shim, void* handle, char* err_m
                           int len) {
   const char* mem_create_symbols[] = {
       "_ZN10MEMDataset6CreateEPKciii12GDALDataTypePPc",
+      "__ZN10MEMDataset6CreateEPKciii12GDALDataTypePPc",
       "_ZN10MEMDataset6CreateEPKciii12GDALDataTypePPKc",
-      "?Create@MEMDataset@@SAPEAV1@PEBDHHH4GDALDataType@@PEAPEAD@Z", NULL};
+      "__ZN10MEMDataset6CreateEPKciii12GDALDataTypePPKc",
+      "_ZN10MEMDataset6CreateEPKciii12GDALDataTypePPKc",
+      "?Create@MEMDataset@@SAPEAV1@PEBDHHH4GDALDataType@@PEAPEAD@Z",
+      "?Create@MEMDataset@@SAPEAV1@PEBDHHH4GDALDataType@@PEAPEBAD@Z",
+      NULL};
   const char* csl_set_name_value_symbols[] = {"CSLSetNameValue", NULL};
   const char* csl_destroy_symbols[] = {"CSLDestroy", NULL};
   const char* cpl_print_pointer_symbols[] = {"CPLPrintPointer", NULL};
@@ -161,8 +179,8 @@ static int load_gdal_shim(struct SedonaGdalShim* shim, void* handle, char* err_m
   return 0;
 }
 
-static int load_gdal_from_handle(struct SedonaGdalApi* api, void* handle, char* err_msg,
-                                 int len);
+static int load_gdal_from_handle(struct SedonaGdalApi* api, void* handle,
+                                 const char* source, char* err_msg, int len);
 
 static int load_gdal_from_current_process(struct SedonaGdalApi* api, char* err_msg,
                                           int len) {
@@ -172,7 +190,7 @@ static int load_gdal_from_current_process(struct SedonaGdalApi* api, char* err_m
     snprintf(err_msg, len, "%s", dlerror());
     return -1;
   }
-  int result = load_gdal_from_handle(api, handle, err_msg, len);
+  int result = load_gdal_from_handle(api, handle, "current_process", err_msg, len);
   if (result != 0) {
     dlclose(handle);
   }
@@ -183,7 +201,7 @@ static int load_gdal_from_current_process(struct SedonaGdalApi* api, char* err_m
     win32_get_last_error(err_msg, len);
     return -1;
   }
-  return load_gdal_from_handle(api, module, err_msg, len);
+  return load_gdal_from_handle(api, module, "current_process", err_msg, len);
 #endif
 }
 
@@ -245,8 +263,8 @@ static GDALDatasetH sedona_gdal_mem_create_internal_impl(int x_size, int y_size,
   return dataset;
 }
 
-static int load_gdal_from_handle(struct SedonaGdalApi* api, void* handle, char* err_msg,
-                                 int len) {
+static int load_gdal_from_handle(struct SedonaGdalApi* api, void* handle,
+                                 const char* source, char* err_msg, int len) {
   struct SedonaGdalShim* shim = calloc(1, sizeof(struct SedonaGdalShim));
   if (shim == NULL) {
     snprintf(err_msg, len, "%s", "Cannot allocate sedona gdal shim");
@@ -263,6 +281,8 @@ static int load_gdal_from_handle(struct SedonaGdalApi* api, void* handle, char* 
   api->release = &sedona_gdal_dyn_release_api;
   api->private_data = handle;
   api->shim = shim;
+
+  sedona_gdal_log_loaded(source);
 
   return 0;
 }
@@ -291,7 +311,7 @@ int sedona_gdal_dyn_api_init(struct SedonaGdalApi* api, const char* shared_objec
   }
   void* handle = module;
 #endif
-  int result = load_gdal_from_handle(api, handle, err_msg, len);
+  int result = load_gdal_from_handle(api, handle, shared_object_path, err_msg, len);
 #ifndef TARGETING_WINDOWS
   if (result != 0) {
     dlclose(handle);
@@ -311,10 +331,13 @@ int sedona_gdal_dyn_api_init_from_current_process(struct SedonaGdalApi* api,
                               "libgdal.so",
                               "libgdal.so.3",
                               "libgdal.so.2",
-                              "libgdal.32.3.6.4.dylib",
+                              "libgdal.33.dylib",
                               "libgdal.32.dylib",
                               "libgdal.31.dylib",
                               "libgdal.30.dylib",
+                              "libgdal.29.dylib",
+                              "libgdal.28.dylib",
+                              "libgdal.27.dylib",
                               "gdal.dll",
                               NULL};
   for (int i = 0; candidates[i] != NULL; ++i) {
@@ -322,7 +345,7 @@ int sedona_gdal_dyn_api_init_from_current_process(struct SedonaGdalApi* api,
     if (handle == NULL) {
       continue;
     }
-    int result = load_gdal_from_handle(api, handle, err_msg, len);
+    int result = load_gdal_from_handle(api, handle, candidates[i], err_msg, len);
     if (result == 0) {
       return 0;
     }
@@ -335,7 +358,7 @@ int sedona_gdal_dyn_api_init_from_current_process(struct SedonaGdalApi* api,
     if (module == NULL) {
       continue;
     }
-    if (load_gdal_from_handle(api, module, err_msg, len) == 0) {
+    if (load_gdal_from_handle(api, module, "gdal.dll", err_msg, len) == 0) {
       return 0;
     }
     FreeLibrary(module);
