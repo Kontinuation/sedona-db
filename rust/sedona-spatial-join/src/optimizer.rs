@@ -40,6 +40,8 @@ use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::joins::utils::ColumnIndex;
 use datafusion_physical_plan::joins::{HashJoinExec, NestedLoopJoinExec};
 use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::repartition::RepartitionExec;
+use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::{joins::utils::JoinFilter, ExecutionPlan};
 use sedona_common::{option::SedonaOptions, sedona_internal_err};
 use sedona_expr::utils::{parse_distance_predicate, ParsedDistancePredicate};
@@ -286,8 +288,8 @@ impl SpatialJoinOptimizer {
                     left
                 };
 
-                let left = left.clone();
-                let right = nested_loop_join.right().clone();
+                let mut left = left.clone();
+                let mut right = nested_loop_join.right().clone();
                 let join_type = nested_loop_join.join_type();
 
                 // Check if the geospatial types involved in spatial_predicate are supported
@@ -297,6 +299,26 @@ impl SpatialJoinOptimizer {
                     &right.schema(),
                 )? {
                     return Ok(None);
+                }
+
+                // Repartition the probe side when `sedona.spatial_join.repartition_probe_side` is enabled
+                let repartition_probe_side = config
+                    .extensions
+                    .get::<SedonaOptions>()
+                    .is_some_and(|ext| ext.spatial_join.repartition_probe_side);
+                if repartition_probe_side {
+                    let probe_plan = match &spatial_predicate {
+                        SpatialPredicate::KNearestNeighbors(knn) => match knn.probe_side {
+                            JoinSide::Left => &mut left,
+                            _ => &mut right,
+                        },
+                        _ => &mut right,
+                    };
+                    let num_partitions = probe_plan.output_partitioning().partition_count();
+                    *probe_plan = Arc::new(RepartitionExec::try_new(
+                        Arc::clone(probe_plan),
+                        datafusion_physical_expr::Partitioning::RoundRobinBatch(num_partitions),
+                    )?)
                 }
 
                 // Create the spatial join
