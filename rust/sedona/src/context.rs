@@ -108,9 +108,6 @@ impl SedonaContext {
                 .with_las_extra_bytes(LasExtraBytes::Typed),
         );
 
-        let rt_builder = RuntimeEnvBuilder::new();
-        let runtime_env = rt_builder.build_arc()?;
-
         #[allow(unused_mut)]
         let mut state_builder = SessionStateBuilder::new()
             .with_default_features()
