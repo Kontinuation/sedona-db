@@ -288,7 +288,7 @@ impl SpatialIndexBuilder {
             }
         };
 
-        log::debug!(
+        log::info!(
             "Estimated memory used by spatial index: {}",
             self.memory_used
         );

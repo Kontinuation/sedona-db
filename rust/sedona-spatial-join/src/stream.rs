@@ -357,7 +357,7 @@ impl SpatialJoinStream {
                                 self.state =
                                     SpatialJoinStreamState::PrepareUnmatchedBuildBatch(*desc);
                             } else {
-                                log::debug!(
+                                log::info!(
                                     "[Partition {}] Start probing the Multi partition",
                                     self.probe_partition_id
                                 );
@@ -385,7 +385,7 @@ impl SpatialJoinStream {
                     ))
                 }
                 SpatialJoinStreamState::Completed => {
-                    log::debug!("[Partition {}] Completed", self.probe_partition_id);
+                    log::info!("[Partition {}] Completed", self.probe_partition_id);
                     Poll::Ready(None)
                 }
             };
@@ -467,14 +467,14 @@ impl SpatialJoinStream {
                     .expect("Partitioned index provider should be available"),
             );
             let future = if should_build {
-                log::debug!(
+                log::info!(
                     "[Partition {}] Building index for spatial partition {}",
                     self.probe_partition_id,
                     partition_id
                 );
                 async move { provider.build_or_wait_for_index(partition_id).await }.boxed()
             } else {
-                log::debug!(
+                log::info!(
                     "[Partition {}] Waiting for index for spatial partition {}",
                     self.probe_partition_id,
                     partition_id
@@ -493,7 +493,7 @@ impl SpatialJoinStream {
             Poll::Ready(Some(Ok(index))) => {
                 self.pending_index_future = None;
                 self.spatial_index = Some(index);
-                log::debug!(
+                log::info!(
                     "[Partition {}] Start probing spatial partition {}",
                     self.probe_partition_id,
                     partition_id
@@ -665,7 +665,7 @@ impl SpatialJoinStream {
                 return Poll::Ready(Ok(StatefulStreamResult::Continue));
             }
 
-            log::debug!(
+            log::info!(
                 "[Partition {}] Producing unmatched build side for spatial partition {}",
                 self.probe_partition_id,
                 partition_desc.partition_id

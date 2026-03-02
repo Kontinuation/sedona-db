@@ -116,7 +116,7 @@ impl SpatialJoinComponentsBuilder {
     ) -> Result<SpatialJoinComponents> {
         let num_partitions = build_streams.len();
         if num_partitions == 0 {
-            log::debug!("Build side has no data. Creating empty spatial index.");
+            log::info!("Build side has no data. Creating empty spatial index.");
             return self.create_spatial_join_components_for_empty_build_side();
         }
 
@@ -129,11 +129,11 @@ impl SpatialJoinComponentsBuilder {
         // memory required for loading the entire build side into a spatial index
         let memory_plan =
             compute_memory_plan(build_partitions.iter().map(PartitionMemorySummary::from))?;
-        log::debug!("Computed memory plan for spatial join:\n{:#?}", memory_plan);
+        log::info!("Computed memory plan for spatial join:\n{:#?}", memory_plan);
         let num_partitions = self.num_spatial_partitions(&memory_plan);
 
         if num_partitions == 1 {
-            log::debug!("Running single-partitioned in-memory spatial join");
+            log::info!("Running single-partitioned in-memory spatial join");
             self.create_single_partitioned_spatial_join_components(build_partitions)
         } else {
             // Collect all memory reservations grown during build side collection
@@ -151,7 +151,7 @@ impl SpatialJoinComponentsBuilder {
                 rng.u64(0..0xFFFF),
             )?;
             let num_partitions = build_partitioner.num_regular_partitions();
-            log::debug!("Actual number of spatial partitions: {}", num_partitions);
+            log::info!("Actual number of spatial partitions: {}", num_partitions);
 
             // Partition the build side into multiple spatial partitions, each partition can be fully
             // loaded into an in-memory spatial index
@@ -160,7 +160,7 @@ impl SpatialJoinComponentsBuilder {
                 .await?;
 
             let merged_spilled_partitions = merge_spilled_partitions(partitioned_spill_files_vec)?;
-            log::debug!(
+            log::info!(
                 "Build side spatial partitions:\n{}",
                 merged_spilled_partitions.debug_str()
             );
@@ -273,7 +273,7 @@ impl SpatialJoinComponentsBuilder {
             let max_items_per_node = 1.max(samples.len() / num_partitions);
             let max_levels = num_partitions;
 
-            log::debug!(
+            log::info!(
                 "Number of samples: {}, max_items_per_node: {}, max_levels: {}",
                 samples.len(),
                 max_items_per_node,
@@ -282,11 +282,11 @@ impl SpatialJoinComponentsBuilder {
             rng.shuffle(&mut samples);
             let kdb_partitioner =
                 KDBPartitioner::build(samples.into_iter(), max_items_per_node, max_levels, extent)?;
-            log::debug!(
+            log::info!(
                 "Built KDB spatial partitioner with {} partitions",
                 num_partitions
             );
-            log::debug!(
+            log::info!(
                 "KDB partitioner debug info:\n{}",
                 kdb_partitioner.debug_str()
             );
@@ -494,7 +494,7 @@ impl SpatialJoinComponentsBuilder {
         {
             NumSpatialPartitionsConfig::Auto => memory_plan.num_partitions,
             NumSpatialPartitionsConfig::Fixed(n) => {
-                log::debug!("Override number of spatial partitions to {}", n);
+                log::info!("Override number of spatial partitions to {}", n);
                 n
             }
         }
@@ -525,7 +525,7 @@ impl SpatialJoinComponentsBuilder {
             .memory_for_intermittent_usage
         {
             Some(value) => {
-                log::debug!("Override memory for intermittent usage to {}", value);
+                log::info!("Override memory for intermittent usage to {}", value);
                 value
             }
             None => memory_plan.memory_for_intermittent_usage,

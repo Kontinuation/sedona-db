@@ -198,7 +198,7 @@ impl BuildSideBatchesCollector {
                     // to grow the reservation.
                     in_mem_batches.push(build_side_batch);
                     if let Err(e) = reservation.try_grow(in_mem_size) {
-                        log::debug!(
+                        log::info!(
                             "Failed to grow reservation by {} bytes. Current reservation: {} bytes. \
                             num rows: {}, reason: {:?}, Spilling...",
                             in_mem_size,
@@ -227,7 +227,7 @@ impl BuildSideBatchesCollector {
         // memory usage. We proceed even when the growth fails.
         let additional_reservation = extra_mem + (extra_mem + reservation.size()) / 5;
         if let Err(e) = reservation.try_grow(additional_reservation) {
-            log::debug!(
+            log::info!(
                 "Failed to grow reservation by {} bytes to account for spatial index building memory usage. \
                 Current reservation: {} bytes. reason: {:?}",
                 additional_reservation,
@@ -239,7 +239,7 @@ impl BuildSideBatchesCollector {
         // If force spill is enabled, flush everything to disk regardless of whether the memory
         // is enough or not.
         if self.spatial_join_options.debug.force_spill && spill_writer_opt.is_none() {
-            log::debug!(
+            log::info!(
                 "Force spilling enabled. Spilling {} in-memory batches to disk.",
                 in_mem_batches.len()
             );
