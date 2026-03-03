@@ -30,9 +30,6 @@
 //!   the rest of the optimizer tree can still be rewritten normally.
 //! * **`execute()`** delegates to the internal `RepartitionExec` which performs
 //!   the actual round-robin shuffle.
-//! * **Output partitioning** is reported as `UnknownPartitioning(n)` so that
-//!   `EnforceDistribution` can add any further repartitioning required by parent
-//!   nodes.
 
 use std::any::Any;
 use std::fmt;
@@ -64,8 +61,12 @@ pub struct ProbeShuffleExec {
 }
 
 impl ProbeShuffleExec {
-    /// Create a new `ProbeShuffleExec` that round-robin repartitions `input`
-    /// into `num_partitions` output partitions.
+    /// Create a new [`ProbeShuffleExec`] that round-robin repartitions `input`
+    /// into the same number of output partitions as `input`. This will ensure
+    /// that the probe workload of a spatial join will be evenly distributed.
+    /// More importantly, shuffled probe side data will be less likely to
+    /// cause skew issues when out-of-core, spatial partitioned spatial join is enabled,
+    /// especially when the input probe data is sorted by their spatial locations.
     pub fn try_new(input: Arc<dyn ExecutionPlan>) -> Result<Self> {
         let num_partitions = input.output_partitioning().partition_count();
         let inner_repartition = RepartitionExec::try_new(
@@ -75,6 +76,7 @@ impl ProbeShuffleExec {
         Ok(Self { inner_repartition })
     }
 
+    /// Try to wrap the given [`RepartitionExec`] `plan` with [`ProbeShuffleExec`].
     pub fn try_wrap_repartition(plan: Arc<dyn ExecutionPlan>) -> Result<Self> {
         let Some(repartition_exec) = plan.as_any().downcast_ref::<RepartitionExec>() else {
             return plan_err!(
