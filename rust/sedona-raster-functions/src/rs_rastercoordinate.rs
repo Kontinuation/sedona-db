@@ -17,13 +17,16 @@
 use std::{sync::Arc, vec};
 
 use crate::executor::RasterExecutor;
-use arrow_array::builder::{BinaryBuilder, Int64Builder};
+use arrow_array::builder::{BinaryBuilder, Int64Builder, StringViewBuilder};
 use arrow_schema::DataType;
 use datafusion_common::cast::as_float64_array;
 use datafusion_common::error::Result;
+use datafusion_common::ScalarValue;
 use datafusion_expr::{ColumnarValue, Volatility};
+use sedona_expr::item_crs::make_item_crs;
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
 use sedona_raster::affine_transformation::to_raster_coordinate;
+use sedona_raster::traits::RasterRef;
 use sedona_schema::datatypes::Edges;
 use sedona_schema::{datatypes::SedonaType, matchers::ArgMatcher};
 
@@ -128,13 +131,14 @@ impl SedonaScalarKernel for RsCoordinateMapper {
 struct RsCoordinatePoint;
 impl SedonaScalarKernel for RsCoordinatePoint {
     fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+        let out_type = SedonaType::new_item_crs(&SedonaType::Wkb(Edges::Planar, None))?;
         let matcher = ArgMatcher::new(
             vec![
                 ArgMatcher::is_raster(),
                 ArgMatcher::is_numeric(),
                 ArgMatcher::is_numeric(),
             ],
-            SedonaType::Wkb(Edges::Planar, None),
+            out_type,
         );
 
         matcher.match_args(args)
@@ -153,6 +157,7 @@ impl SedonaScalarKernel for RsCoordinatePoint {
             executor.num_iterations(),
             item.len() * executor.num_iterations(),
         );
+        let mut crs_builder = StringViewBuilder::with_capacity(executor.num_iterations());
 
         // Expand world x and y coordinate parameters to arrays and cast to Float64
         let world_x_array = args[1].clone().cast_to(&DataType::Float64, None)?;
@@ -174,13 +179,31 @@ impl SedonaScalarKernel for RsCoordinatePoint {
                     item[5..13].copy_from_slice(&(raster_x as f64).to_le_bytes());
                     item[13..21].copy_from_slice(&(raster_y as f64).to_le_bytes());
                     builder.append_value(item);
+                    crs_builder.append_value(raster.crs().unwrap_or("0"));
                 }
-                (_, _, _) => builder.append_null(),
+                (_, _, _) => {
+                    builder.append_null();
+                    crs_builder.append_null();
+                }
             }
             Ok(())
         })?;
 
-        executor.finish(Arc::new(builder.finish()))
+        let item_array = builder.finish();
+        let item_result = executor.finish(Arc::new(item_array))?;
+        let crs_array = crs_builder.finish();
+        let crs_value = if matches!(item_result, ColumnarValue::Scalar(_)) {
+            ColumnarValue::Scalar(ScalarValue::try_from_array(&crs_array, 0)?)
+        } else {
+            ColumnarValue::Array(Arc::new(crs_array))
+        };
+
+        make_item_crs(
+            &SedonaType::Wkb(Edges::Planar, None),
+            item_result,
+            &crs_value,
+            None,
+        )
     }
 }
 
@@ -193,7 +216,7 @@ mod tests {
     use rstest::rstest;
     use sedona_schema::datatypes::{RASTER, WKB_GEOMETRY};
     use sedona_testing::compare::assert_array_equal;
-    use sedona_testing::create::create_array;
+    use sedona_testing::create::create_array_item_crs;
     use sedona_testing::rasters::{build_noninvertible_raster, generate_test_rasters};
     use sedona_testing::testers::ScalarUdfTester;
 
@@ -265,7 +288,11 @@ mod tests {
         );
 
         let rasters = generate_test_rasters(2, Some(0)).unwrap();
-        let expected = &create_array(&[None, Some("POINT (0 0)")], &WKB_GEOMETRY);
+        let expected = &create_array_item_crs(
+            &[None, Some("POINT (0 0)")],
+            [None, Some("OGC:CRS84")],
+            &WKB_GEOMETRY,
+        );
 
         let result = tester
             .invoke_array_scalar_scalar(Arc::new(rasters), 2.0_f64, 3.0_f64)
@@ -395,12 +422,13 @@ mod tests {
             ColumnarValue::Scalar(_) => panic!("Expected array result"),
         };
 
-        let expected = create_array(
+        let expected = create_array_item_crs(
             &[
                 Some("POINT (0 0)"),
                 Some("POINT (4 3)"),
                 Some("POINT (10 8)"),
             ],
+            [Some("OGC:CRS84"), Some("OGC:CRS84"), Some("OGC:CRS84")],
             &WKB_GEOMETRY,
         );
         assert_array_equal(&array, &expected);

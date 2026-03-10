@@ -34,8 +34,12 @@ result_large_err = "allow"
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
+arrow-cast = { workspace = true }
+async-trait = { workspace = true }
+datafusion = { workspace = true, default_features = false }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
+futures = { workspace = true }
 sedona-common = { workspace = true }
 sedona-expr = { workspace = true }
 sedona-geometry = { workspace = true }
@@ -48,10 +52,11 @@ wkb = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-geo-traits = { workspace = true }
 sedona-testing = { workspace = true, features = ["criterion"] }
 sedona-proj = { workspace = true, features = ["proj-sys"] }
+geo-traits = { workspace = true }
 rstest = { workspace = true }
+tokio = { workspace = true }
 
 [[bench]]
 harness = false

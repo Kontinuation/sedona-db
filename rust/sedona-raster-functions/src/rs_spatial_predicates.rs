@@ -18,44 +18,32 @@
 //! RS_Intersects, RS_Contains, RS_Within functions
 //!
 //! These functions test spatial relationships between rasters and geometries.
-//! Each function supports three overloads: (raster, geometry), (geometry, raster),
-//! and (raster, raster). Rasters are compared via their convex hulls.
-//!
 //! CRS transformation rules:
-//! - If neither side has a CRS, the comparison is performed directly without CRS transformation
-//! - If one side has a CRS but the other does not, an error is returned
+//! - If the raster or geometry does not have a defined SRID, it is assumed to be in WGS84
 //! - If both sides are in the same CRS, perform the relationship test directly
-//! - For raster/geometry pairs, the geometry is transformed into the raster's CRS
-//! - For raster/raster pairs, the second raster is transformed into the first's CRS
-//! - If the preferred transformation fails, both sides are transformed to WGS84 as a fallback
+//! - Otherwise, both sides will be transformed to WGS84 before the relationship test
 
 use std::sync::Arc;
 
 use crate::crs_utils::crs_transform_wkb;
+use crate::crs_utils::default_crs;
 use crate::crs_utils::resolve_crs;
 use crate::executor::RasterExecutor;
 use arrow_array::builder::BooleanBuilder;
 use arrow_schema::DataType;
-use datafusion_common::exec_datafusion_err;
-use datafusion_common::exec_err;
 use datafusion_common::DataFusionError;
 use datafusion_common::Result;
 use datafusion_expr::{ColumnarValue, Volatility};
 use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
-use sedona_geometry::transform::CrsEngine;
 use sedona_geometry::wkb_factory::write_wkb_polygon;
-use sedona_proj::transform::with_global_proj_engine;
 use sedona_raster::affine_transformation::to_world_coordinate;
 use sedona_raster::traits::RasterRef;
-use sedona_schema::crs::{lnglat, CrsRef};
 use sedona_schema::{datatypes::SedonaType, matchers::ArgMatcher};
 use sedona_tg::tg;
 
-/// RS_Intersects() scalar UDF
+/// RS_Intersects() scalar UDF documentation
 ///
-/// Returns true if the extents of the two arguments intersect. Supports
-/// (raster, geometry), (geometry, raster), and (raster, raster) overloads.
-/// Rasters are compared via their convex hulls.
+/// Returns true if raster A intersects geometry B.
 pub fn rs_intersects_udf() -> SedonaScalarUDF {
     SedonaScalarUDF::new(
         "rs_intersects",
@@ -68,11 +56,9 @@ pub fn rs_intersects_udf() -> SedonaScalarUDF {
     )
 }
 
-/// RS_Contains() scalar UDF
+/// RS_Contains() scalar UDF documentation
 ///
-/// Returns true if the first argument's extent completely contains the second.
-/// Supports (raster, geometry), (geometry, raster), and (raster, raster) overloads.
-/// Rasters are compared via their convex hulls.
+/// Returns true if raster A contains geometry B.
 pub fn rs_contains_udf() -> SedonaScalarUDF {
     SedonaScalarUDF::new(
         "rs_contains",
@@ -85,11 +71,9 @@ pub fn rs_contains_udf() -> SedonaScalarUDF {
     )
 }
 
-/// RS_Within() scalar UDF
+/// RS_Within() scalar UDF documentation
 ///
-/// Returns true if the first argument's extent is completely within the second.
-/// Supports (raster, geometry), (geometry, raster), and (raster, raster) overloads.
-/// Rasters are compared via their convex hulls.
+/// Returns true if raster A is within geometry B.
 pub fn rs_within_udf() -> SedonaScalarUDF {
     SedonaScalarUDF::new(
         "rs_within",
@@ -189,28 +173,24 @@ impl<Op: tg::BinaryPredicate + Send + Sync> RsSpatialPredicate<Op> {
         let mut builder = BooleanBuilder::with_capacity(executor.num_iterations());
         let mut raster_wkb = Vec::with_capacity(CONVEXHULL_WKB_SIZE);
 
-        with_global_proj_engine(|engine| {
-            executor.execute_raster_wkb_crs_void(|raster_opt, maybe_wkb, geom_crs| {
-                match (raster_opt, maybe_wkb) {
-                    (Some(raster), Some(geom_wkb)) => {
-                        raster_wkb.clear();
-                        write_convexhull_wkb(raster, &mut raster_wkb)?;
+        executor.execute_raster_wkb_crs_void(|raster_opt, maybe_wkb, maybe_geom_crs| {
+            match (raster_opt, maybe_wkb) {
+                (Some(raster), Some(geom_wkb)) => {
+                    raster_wkb.clear();
+                    write_convexhull_wkb(raster, &mut raster_wkb)?;
 
-                        let raster_crs = resolve_crs(raster.crs())?;
-                        let result = evaluate_predicate_with_crs::<Op>(
-                            &raster_wkb,
-                            raster_crs.as_deref(),
-                            geom_wkb,
-                            geom_crs,
-                            false,
-                            engine,
-                        )?;
-                        builder.append_value(result);
-                    }
-                    _ => builder.append_null(),
+                    let result = evaluate_predicate_with_crs::<Op>(
+                        &raster_wkb,
+                        raster.crs(),
+                        geom_wkb,
+                        maybe_geom_crs,
+                        false,
+                    )?;
+                    builder.append_value(result);
                 }
-                Ok(())
-            })
+                _ => builder.append_null(),
+            }
+            Ok(())
         })?;
 
         executor.finish(Arc::new(builder.finish()))
@@ -229,29 +209,25 @@ impl<Op: tg::BinaryPredicate + Send + Sync> RsSpatialPredicate<Op> {
         let mut builder = BooleanBuilder::with_capacity(executor.num_iterations());
         let mut raster_wkb = Vec::with_capacity(CONVEXHULL_WKB_SIZE);
 
-        with_global_proj_engine(|engine| {
-            executor.execute_raster_wkb_crs_void(|raster_opt, maybe_wkb, geom_crs| {
-                match (raster_opt, maybe_wkb) {
-                    (Some(raster), Some(geom_wkb)) => {
-                        raster_wkb.clear();
-                        write_convexhull_wkb(raster, &mut raster_wkb)?;
+        executor.execute_raster_wkb_crs_void(|raster_opt, maybe_wkb, maybe_geom_crs| {
+            match (raster_opt, maybe_wkb) {
+                (Some(raster), Some(geom_wkb)) => {
+                    raster_wkb.clear();
+                    write_convexhull_wkb(raster, &mut raster_wkb)?;
 
-                        let raster_crs = resolve_crs(raster.crs())?;
-                        // Note: order is geometry, raster for the predicate
-                        let result = evaluate_predicate_with_crs::<Op>(
-                            geom_wkb,
-                            geom_crs,
-                            &raster_wkb,
-                            raster_crs.as_deref(),
-                            true,
-                            engine,
-                        )?;
-                        builder.append_value(result);
-                    }
-                    _ => builder.append_null(),
+                    // Note: order is geometry, raster for the predicate
+                    let result = evaluate_predicate_with_crs::<Op>(
+                        geom_wkb,
+                        maybe_geom_crs,
+                        &raster_wkb,
+                        raster.crs(),
+                        true,
+                    )?;
+                    builder.append_value(result);
                 }
-                Ok(())
-            })
+                _ => builder.append_null(),
+            }
+            Ok(())
         })?;
 
         executor.finish(Arc::new(builder.finish()))
@@ -271,31 +247,21 @@ impl<Op: tg::BinaryPredicate + Send + Sync> RsSpatialPredicate<Op> {
         let mut wkb0 = Vec::with_capacity(CONVEXHULL_WKB_SIZE);
         let mut wkb1 = Vec::with_capacity(CONVEXHULL_WKB_SIZE);
 
-        with_global_proj_engine(|engine| {
-            executor.execute_raster_raster_void(|_i, r0_opt, r1_opt| {
-                match (r0_opt, r1_opt) {
-                    (Some(r0), Some(r1)) => {
-                        wkb0.clear();
-                        wkb1.clear();
-                        write_convexhull_wkb(r0, &mut wkb0)?;
-                        write_convexhull_wkb(r1, &mut wkb1)?;
+        executor.execute_raster_raster_void(|_i, r0_opt, r1_opt| {
+            match (r0_opt, r1_opt) {
+                (Some(r0), Some(r1)) => {
+                    wkb0.clear();
+                    wkb1.clear();
+                    write_convexhull_wkb(r0, &mut wkb0)?;
+                    write_convexhull_wkb(r1, &mut wkb1)?;
 
-                        let crs0 = resolve_crs(r0.crs())?;
-                        let crs1 = resolve_crs(r1.crs())?;
-                        let result = evaluate_predicate_with_crs::<Op>(
-                            &wkb0,
-                            crs0.as_deref(),
-                            &wkb1,
-                            crs1.as_deref(),
-                            false,
-                            engine,
-                        )?;
-                        builder.append_value(result);
-                    }
-                    _ => builder.append_null(),
+                    let result =
+                        evaluate_predicate_with_crs::<Op>(&wkb0, r0.crs(), &wkb1, r1.crs(), false)?;
+                    builder.append_value(result);
                 }
-                Ok(())
-            })
+                _ => builder.append_null(),
+            }
+            Ok(())
         })?;
 
         executor.finish(Arc::new(builder.finish()))
@@ -305,64 +271,49 @@ impl<Op: tg::BinaryPredicate + Send + Sync> RsSpatialPredicate<Op> {
 /// Evaluate a spatial predicate with CRS handling
 ///
 /// Rules:
-/// - If neither side has a CRS, compare directly without transformation
-/// - If one side has a CRS but the other does not, return an error
+/// - If no CRS defined, assume WGS84
 /// - If both same CRS, compare directly
 /// - Otherwise, try transforming one side to the other's CRS for comparison.
 ///   If that fails, transform both to WGS84 and compare.
 fn evaluate_predicate_with_crs<Op: tg::BinaryPredicate>(
     wkb_a: &[u8],
-    crs_a: CrsRef<'_>,
+    crs_a: Option<&str>,
     wkb_b: &[u8],
-    crs_b: CrsRef<'_>,
+    crs_b: Option<&str>,
     from_a_to_b: bool,
-    engine: &dyn CrsEngine,
 ) -> Result<bool> {
-    // If either side has no CRS, compare directly without transformation.
-    let (crs_a, crs_b) = match (crs_a, crs_b) {
-        (Some(a), Some(b)) => (a, b),
-        (None, None) => return evaluate_predicate::<Op>(wkb_a, wkb_b),
-        (Some(_), None) => {
-            return exec_err!(
-                "Cannot evaluate spatial predicate: \
-                left geometry has CRS but right geometry does not"
-            )
-        }
-        (None, Some(_)) => {
-            return exec_err!(
-                "Cannot evaluate spatial predicate: \
-                right geometry has CRS but left geometry does not"
-            )
-        }
-    };
+    let crs_a = resolve_crs(crs_a)?;
+    let crs_b = resolve_crs(crs_b)?;
 
-    // If both CRSes are equal, compare directly.
-    if crs_a.crs_equals(crs_b) {
+    if crs_a.crs_equals(crs_b.as_ref()) {
         return evaluate_predicate::<Op>(wkb_a, wkb_b);
     }
 
-    // Try preferred transformation direction.
     if from_a_to_b {
-        if let Ok(wkb_a) = crs_transform_wkb(wkb_a, crs_a, crs_b, engine) {
+        // Transform A to B's CRS for comparison
+        if let Ok(wkb_a) = crs_transform_wkb(wkb_a, crs_a.as_ref(), crs_b.as_ref()) {
             return evaluate_predicate::<Op>(&wkb_a, wkb_b);
         }
-    } else if let Ok(wkb_b) = crs_transform_wkb(wkb_b, crs_b, crs_a, engine) {
-        return evaluate_predicate::<Op>(wkb_a, &wkb_b);
+    } else {
+        // Transform B to A's CRS for comparison
+        if let Ok(wkb_b) = crs_transform_wkb(wkb_b, crs_b.as_ref(), crs_a.as_ref()) {
+            return evaluate_predicate::<Op>(wkb_a, &wkb_b);
+        }
     }
 
-    // Fallback: transform both sides to WGS84 for comparison.
-    let lnglat_crs = lnglat().expect("lnglat() should always return Some");
-    let wkb_a = crs_transform_wkb(wkb_a, crs_a, lnglat_crs.as_ref(), engine)?;
-    let wkb_b = crs_transform_wkb(wkb_b, crs_b, lnglat_crs.as_ref(), engine)?;
+    // If CRS transformation fails, fall back to transforming both to default CRS (WGS84) for comparison
+    let default_crs = default_crs();
+    let wkb_a = crs_transform_wkb(wkb_a, crs_a.as_ref(), default_crs)?;
+    let wkb_b = crs_transform_wkb(wkb_b, crs_b.as_ref(), default_crs)?;
     evaluate_predicate::<Op>(&wkb_a, &wkb_b)
 }
 
 /// Evaluate a spatial predicate between two WKB geometries
 fn evaluate_predicate<Op: tg::BinaryPredicate>(wkb_a: &[u8], wkb_b: &[u8]) -> Result<bool> {
     let geom_a = tg::Geom::parse_wkb(wkb_a, tg::IndexType::Default)
-        .map_err(|e| exec_datafusion_err!("Failed to parse WKB A: {e}"))?;
+        .map_err(|e| DataFusionError::Execution(format!("Failed to parse WKB A: {e}")))?;
     let geom_b = tg::Geom::parse_wkb(wkb_b, tg::IndexType::Default)
-        .map_err(|e| exec_datafusion_err!("Failed to parse WKB B: {e}"))?;
+        .map_err(|e| DataFusionError::Execution(format!("Failed to parse WKB B: {e}")))?;
 
     Ok(Op::evaluate(&geom_a, &geom_b))
 }
@@ -396,6 +347,8 @@ fn write_convexhull_wkb(raster: &dyn RasterRef, out: &mut impl std::io::Write) -
 
 #[cfg(test)]
 mod tests {
+    use crate::crs_utils::crs_transform_coord;
+
     use super::*;
     use arrow_array::{create_array, ArrayRef};
     use datafusion_expr::ScalarUDF;
@@ -412,54 +365,6 @@ mod tests {
     use sedona_testing::create::create_array as create_geom_array;
     use sedona_testing::rasters::generate_test_rasters;
     use sedona_testing::testers::ScalarUdfTester;
-
-    /// Transform a coordinate from one CRS to another, using the provided CRS engine.
-    fn crs_transform_coord(
-        coord: (f64, f64),
-        from_crs: &str,
-        to_crs: &str,
-        engine: &dyn CrsEngine,
-    ) -> Result<(f64, f64)> {
-        let trans = engine
-            .get_transform_crs_to_crs(from_crs, to_crs, None, "")
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let mut coord = coord;
-        trans
-            .transform_coord(&mut coord)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(coord)
-    }
-
-    /// Build a 1×1 raster whose convex hull covers (0,0) to (1,1).
-    ///
-    /// If `crs` is `None`, the raster has no CRS.
-    fn build_unit_raster(crs: Option<&str>) -> arrow_array::StructArray {
-        let mut builder = RasterBuilder::new(1);
-        let metadata = RasterMetadata {
-            width: 1,
-            height: 1,
-            upperleft_x: 0.0,
-            upperleft_y: 1.0,
-            scale_x: 1.0,
-            scale_y: -1.0,
-            skew_x: 0.0,
-            skew_y: 0.0,
-        };
-        builder.start_raster(&metadata, crs).unwrap();
-        builder
-            .start_band(BandMetadata {
-                datatype: BandDataType::UInt8,
-                nodata_value: None,
-                storage_type: StorageType::InDb,
-                outdb_url: None,
-                outdb_band_id: None,
-            })
-            .unwrap();
-        builder.band_data_writer().append_value([0u8]);
-        builder.finish_band().unwrap();
-        builder.finish_raster().unwrap();
-        builder.finish().unwrap()
-    }
 
     #[test]
     fn rs_intersects_udf_docs() {
@@ -482,8 +387,7 @@ mod tests {
     #[rstest]
     fn rs_intersects_raster_geom() {
         let udf = rs_intersects_udf();
-        let geom_type = SedonaType::Wkb(Edges::Planar, lnglat());
-        let tester = ScalarUdfTester::new(udf.into(), vec![RASTER, geom_type.clone()]);
+        let tester = ScalarUdfTester::new(udf.into(), vec![RASTER, WKB_GEOMETRY]);
 
         let rasters = generate_test_rasters(3, Some(0)).unwrap();
 
@@ -499,7 +403,7 @@ mod tests {
                 Some("POINT (2.15 2.75)"), // Inside raster 1
                 Some("POINT (0.0 0.0)"),   // Outside all rasters
             ],
-            &geom_type,
+            &WKB_GEOMETRY,
         );
 
         let expected: ArrayRef = create_array!(Boolean, [None, Some(true), Some(false)]);
@@ -518,10 +422,7 @@ mod tests {
         let tester = ScalarUdfTester::new(udf.into(), vec![RASTER, geom_type.clone()]);
 
         let rasters = generate_test_rasters(3, Some(0)).unwrap();
-        let (x, y) = with_global_proj_engine(|engine| {
-            crs_transform_coord((2.15, 2.75), "OGC:CRS84", "EPSG:3857", engine)
-        })
-        .unwrap();
+        let (x, y) = crs_transform_coord((2.15, 2.75), "OGC:CRS84", "EPSG:3857").unwrap();
         let point_3857 = format!("POINT ({} {})", x, y);
         let wkt_values: [Option<&str>; 3] = [None, Some(point_3857.as_str()), Some("POINT (0 0)")];
 
@@ -545,7 +446,34 @@ mod tests {
         let udf = rs_intersects_udf();
         let tester = ScalarUdfTester::new(udf.into(), vec![RASTER, geom_type.clone()]);
 
-        let rasters = build_unit_raster(Some(OGC_CRS84_PROJJSON));
+        // 1x1 raster whose convex hull covers (0,0) to (1,1)
+        let mut builder = RasterBuilder::new(1);
+        let raster_metadata = RasterMetadata {
+            width: 1,
+            height: 1,
+            upperleft_x: 0.0,
+            upperleft_y: 1.0,
+            scale_x: 1.0,
+            scale_y: -1.0,
+            skew_x: 0.0,
+            skew_y: 0.0,
+        };
+        builder
+            .start_raster(&raster_metadata, Some(OGC_CRS84_PROJJSON))
+            .unwrap();
+        builder
+            .start_band(BandMetadata {
+                datatype: BandDataType::UInt8,
+                nodata_value: None,
+                storage_type: StorageType::InDb,
+                outdb_url: None,
+                outdb_band_id: None,
+            })
+            .unwrap();
+        builder.band_data_writer().append_value([0u8]);
+        builder.finish_band().unwrap();
+        builder.finish_raster().unwrap();
+        let rasters = builder.finish().unwrap();
 
         let geoms = create_geom_array(&[Some("POINT (0.5 0.5)")], &geom_type);
         let expected: ArrayRef = create_array!(Boolean, [Some(true)]);
@@ -558,8 +486,7 @@ mod tests {
     #[rstest]
     fn rs_contains_raster_geom() {
         let udf = rs_contains_udf();
-        let geom_type = SedonaType::Wkb(Edges::Planar, lnglat());
-        let tester = ScalarUdfTester::new(udf.into(), vec![RASTER, geom_type.clone()]);
+        let tester = ScalarUdfTester::new(udf.into(), vec![RASTER, WKB_GEOMETRY]);
 
         let rasters = generate_test_rasters(3, Some(0)).unwrap();
 
@@ -570,7 +497,7 @@ mod tests {
                 Some("POINT (2.15 2.75)"), // Inside raster 1
                 Some("POINT (0.0 0.0)"),   // Outside all rasters
             ],
-            &geom_type,
+            &WKB_GEOMETRY,
         );
 
         let expected: ArrayRef = create_array!(Boolean, [None, Some(true), Some(false)]);
@@ -585,8 +512,7 @@ mod tests {
     #[rstest]
     fn rs_within_raster_geom() {
         let udf = rs_within_udf();
-        let geom_type = SedonaType::Wkb(Edges::Planar, lnglat());
-        let tester = ScalarUdfTester::new(udf.into(), vec![RASTER, geom_type.clone()]);
+        let tester = ScalarUdfTester::new(udf.into(), vec![RASTER, WKB_GEOMETRY]);
 
         let rasters = generate_test_rasters(3, Some(0)).unwrap();
 
@@ -600,7 +526,7 @@ mod tests {
                 Some("POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))"), // Contains raster 1
                 Some("POLYGON ((0 0, 0.1 0, 0.1 0.1, 0 0.1, 0 0))"), // Does not contain raster 2
             ],
-            &geom_type,
+            &WKB_GEOMETRY,
         );
 
         let expected: ArrayRef = create_array!(Boolean, [None, Some(true), Some(false)]);
@@ -615,8 +541,7 @@ mod tests {
     #[rstest]
     fn rs_intersects_geom_raster() {
         let udf = rs_intersects_udf();
-        let geom_type = SedonaType::Wkb(Edges::Planar, lnglat());
-        let tester = ScalarUdfTester::new(udf.into(), vec![geom_type.clone(), RASTER]);
+        let tester = ScalarUdfTester::new(udf.into(), vec![WKB_GEOMETRY, RASTER]);
 
         let rasters = generate_test_rasters(3, Some(0)).unwrap();
 
@@ -627,7 +552,7 @@ mod tests {
                 Some("POINT (2.15 2.75)"), // Inside raster 1
                 Some("POINT (0.0 0.0)"),   // Outside all rasters
             ],
-            &geom_type,
+            &WKB_GEOMETRY,
         );
 
         let expected: ArrayRef = create_array!(Boolean, [None, Some(true), Some(false)]);
@@ -674,72 +599,5 @@ mod tests {
             .unwrap();
 
         assert_array_equal(&result, &expected);
-    }
-
-    /// When neither the raster nor the geometry has a CRS, the comparison
-    /// should succeed (both sides are in an unknown/assumed-same CRS).
-    #[test]
-    fn rs_intersects_both_no_crs_succeeds() {
-        let udf = rs_intersects_udf();
-        let tester = ScalarUdfTester::new(udf.into(), vec![RASTER, WKB_GEOMETRY]);
-
-        // Raster covers (0,0)–(1,1) with no CRS
-        let rasters = build_unit_raster(None);
-        let geoms = create_geom_array(&[Some("POINT (0.5 0.5)")], &WKB_GEOMETRY);
-
-        let expected: ArrayRef = create_array!(Boolean, [Some(true)]);
-        let result = tester
-            .invoke_arrays(vec![Arc::new(rasters), geoms])
-            .unwrap();
-        assert_array_equal(&result, &expected);
-    }
-
-    /// When one side has a CRS but the other does not, an error must be returned.
-    ///
-    /// Covers three overloads:
-    /// - (raster with CRS, geometry without CRS) — raster_geom
-    /// - (geometry with CRS, raster without CRS) — geom_raster
-    /// - (raster with CRS, raster without CRS) — raster_raster
-    #[test]
-    fn rs_intersects_crs_mismatch_one_missing_errors() {
-        let rasters_with_crs = build_unit_raster(Some("OGC:CRS84"));
-        let rasters_no_crs = build_unit_raster(None);
-
-        // raster (has CRS) + geometry (no CRS)
-        let udf = rs_intersects_udf();
-        let tester = ScalarUdfTester::new(udf.clone().into(), vec![RASTER, WKB_GEOMETRY]);
-        let geoms = create_geom_array(&[Some("POINT (0.5 0.5)")], &WKB_GEOMETRY);
-        let err = tester
-            .invoke_arrays(vec![Arc::new(rasters_with_crs.clone()), geoms])
-            .unwrap_err();
-        assert!(
-            err.message().contains("has CRS but"),
-            "unexpected error: {err}"
-        );
-
-        // geometry (has CRS) + raster (no CRS)
-        let geom_type = SedonaType::Wkb(Edges::Planar, lnglat());
-        let tester = ScalarUdfTester::new(udf.clone().into(), vec![geom_type.clone(), RASTER]);
-        let geoms = create_geom_array(&[Some("POINT (0.5 0.5)")], &geom_type);
-        let err = tester
-            .invoke_arrays(vec![geoms, Arc::new(rasters_no_crs.clone())])
-            .unwrap_err();
-        assert!(
-            err.message().contains("has CRS but"),
-            "unexpected error: {err}"
-        );
-
-        // raster (has CRS) + raster (no CRS)
-        let tester = ScalarUdfTester::new(udf.into(), vec![RASTER, RASTER]);
-        let err = tester
-            .invoke_arrays(vec![
-                Arc::new(rasters_with_crs.clone()),
-                Arc::new(rasters_no_crs.clone()),
-            ])
-            .unwrap_err();
-        assert!(
-            err.message().contains("has CRS but"),
-            "unexpected error: {err}"
-        );
     }
 }

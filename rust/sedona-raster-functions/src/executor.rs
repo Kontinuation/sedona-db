@@ -21,11 +21,11 @@ use datafusion_common::cast::{
     as_binary_array, as_binary_view_array, as_string_view_array, as_struct_array,
 };
 use datafusion_common::error::Result;
-use datafusion_common::{exec_err, ScalarValue};
+use datafusion_common::{exec_err, DataFusionError, ScalarValue};
 use datafusion_expr::ColumnarValue;
 use sedona_common::{sedona_internal_datafusion_err, sedona_internal_err};
 use sedona_raster::array::{RasterRefImpl, RasterStructArray};
-use sedona_schema::crs::{deserialize_crs, Crs, CrsRef};
+use sedona_schema::crs::deserialize_crs;
 use sedona_schema::datatypes::SedonaType;
 use sedona_schema::datatypes::RASTER;
 
@@ -40,12 +40,6 @@ pub struct RasterExecutor<'a, 'b> {
     num_iterations: usize,
 }
 
-// The accessor types below use enum-based dispatch to handle different Arrow
-// array representations (Binary vs BinaryView, etc.) rather than trait objects
-// like `Box<dyn Iterator>`. Both approaches involve dynamic dispatch, but the
-// enum variant is simpler and avoids an extra heap allocation. Since raster
-// operations are expensive relative to per-element dispatch overhead, the cost
-// of matching on each access is negligible in practice.
 #[derive(Clone)]
 enum ItemWkbAccessor {
     Binary(BinaryArray),
@@ -74,37 +68,33 @@ impl ItemWkbAccessor {
     }
 }
 
-// Same enum-dispatch rationale as `ItemWkbAccessor` above: the per-element
-// match cost is dwarfed by the raster and CRS operations performed on each row.
 enum GeomWkbCrsAccessor {
     WkbArray {
         wkb: ItemWkbAccessor,
-        static_crs: Crs,
+        static_crs: Option<String>,
     },
     WkbScalar {
         wkb: Option<Vec<u8>>,
-        static_crs: Crs,
+        static_crs: Option<String>,
     },
     ItemCrsArray {
         struct_array: StructArray,
         item: ItemWkbAccessor,
         crs: StringViewArray,
-        item_static_crs: Crs,
-        resolved_crs: Crs,
+        item_static_crs: Option<String>,
     },
     ItemCrsScalar {
         struct_array: StructArray,
         item: ItemWkbAccessor,
         crs: StringViewArray,
-        item_static_crs: Crs,
-        resolved_crs: Crs,
+        item_static_crs: Option<String>,
     },
     Null,
 }
 
 impl GeomWkbCrsAccessor {
     #[inline]
-    fn get(&mut self, i: usize) -> Result<(Option<&[u8]>, CrsRef<'_>)> {
+    fn get(&self, i: usize) -> Result<(Option<&[u8]>, Option<&str>)> {
         match self {
             Self::Null => Ok((None, None)),
             Self::WkbArray { wkb, static_crs } => {
@@ -126,7 +116,6 @@ impl GeomWkbCrsAccessor {
                 item,
                 crs,
                 item_static_crs,
-                resolved_crs,
             } => {
                 if struct_array.is_null(i) {
                     return Ok((None, None));
@@ -142,15 +131,15 @@ impl GeomWkbCrsAccessor {
                 } else {
                     Some(crs.value(i))
                 };
-                *resolved_crs = resolve_item_crs(item_crs_str, item_static_crs)?;
-                Ok((maybe_wkb, resolved_crs.as_deref()))
+                let static_crs_str = item_static_crs.as_deref();
+                let crs_out = resolve_item_crs(item_crs_str, static_crs_str)?;
+                Ok((maybe_wkb, crs_out))
             }
             Self::ItemCrsScalar {
                 struct_array,
                 item,
                 crs,
                 item_static_crs,
-                resolved_crs,
             } => {
                 if struct_array.is_null(0) {
                     return Ok((None, None));
@@ -166,28 +155,32 @@ impl GeomWkbCrsAccessor {
                 } else {
                     Some(crs.value(0))
                 };
-                *resolved_crs = resolve_item_crs(item_crs_str, item_static_crs)?;
+                let static_crs_str = item_static_crs.as_deref();
+                let crs_out = resolve_item_crs(item_crs_str, static_crs_str)?;
                 let _ = i;
-                Ok((maybe_wkb, resolved_crs.as_deref()))
+                Ok((maybe_wkb, crs_out))
             }
         }
     }
 }
 
-fn resolve_item_crs(item_crs_str: Option<&str>, static_crs: &Crs) -> Result<Crs> {
-    let item_crs = if let Some(s) = item_crs_str {
-        deserialize_crs(s)?
-    } else {
-        None
-    };
-
-    match (&item_crs, static_crs) {
+fn resolve_item_crs<'a>(
+    item_crs: Option<&'a str>,
+    static_crs: Option<&'a str>,
+) -> Result<Option<&'a str>> {
+    match (item_crs, static_crs) {
         (None, None) => Ok(None),
-        (Some(_), None) => Ok(item_crs),
-        (None, Some(_)) => Ok(static_crs.clone()),
-        (Some(_), Some(_)) => {
-            if item_crs == *static_crs {
-                Ok(item_crs)
+        (Some(item), None) => Ok(Some(item)),
+        (None, Some(st)) => Ok(Some(st)),
+        (Some(item), Some(st)) => {
+            if item == st {
+                return Ok(Some(item));
+            }
+
+            let item_crs = deserialize_crs(item)?;
+            let static_crs = deserialize_crs(st)?;
+            if item_crs == static_crs {
+                Ok(Some(item))
             } else {
                 exec_err!("CRS values not equal: {item_crs:?} vs {static_crs:?}")
             }
@@ -195,10 +188,18 @@ fn resolve_item_crs(item_crs_str: Option<&str>, static_crs: &Crs) -> Result<Crs>
     }
 }
 
-fn crs_from_sedona_type(sedona_type: &SedonaType) -> Crs {
+fn crs_string_from_sedona_type(sedona_type: &SedonaType) -> Result<Option<String>> {
     match sedona_type {
-        SedonaType::Wkb(_, crs) | SedonaType::WkbView(_, crs) => crs.clone(),
-        _ => None,
+        SedonaType::Wkb(_, crs) | SedonaType::WkbView(_, crs) => {
+            if let Some(crs) = crs {
+                Ok(Some(
+                    crs.to_authority_code()?.unwrap_or_else(|| crs.to_json()),
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
     }
 }
 
@@ -225,7 +226,6 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
     /// This is useful when the executor is built from a subset of the original
     /// arguments (e.g. only raster + geometry) but the overall UDF should still
     /// iterate according to other array arguments.
-    #[cfg(test)]
     pub fn new_with_num_iterations(
         arg_types: &'a [SedonaType],
         args: &'b [ColumnarValue],
@@ -248,16 +248,10 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
         self.num_iterations
     }
 
-    /// Execute a function by iterating over rasters in the first argument
-    ///
-    /// This handles the common pattern of:
-    /// 1. Downcasting array to StructArray
-    /// 2. Creating raster array
-    /// 3. Iterating with null checks
-    /// 4. Calling the provided function with each raster
+    /// Execute a function by iterating over rasters in the first argument.
     pub fn execute_raster_void<F>(&self, mut func: F) -> Result<()>
     where
-        F: FnMut(usize, Option<&RasterRefImpl<'_>>) -> Result<()>,
+        F: FnMut(usize, Option<&RasterRefImpl<'b>>) -> Result<()>,
     {
         if self.arg_types[0] != RASTER {
             return sedona_internal_err!("First argument must be a raster type");
@@ -265,7 +259,6 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
 
         match &self.args[0] {
             ColumnarValue::Array(array) => {
-                // Downcast to StructArray (rasters are stored as structs)
                 let raster_struct =
                     array
                         .as_any()
@@ -275,8 +268,6 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
                         })?;
 
                 let raster_array = RasterStructArray::new(raster_struct);
-
-                // Iterate through each raster in the array
                 for i in 0..self.num_iterations {
                     if raster_array.is_null(i) {
                         func(i, None)?;
@@ -285,7 +276,6 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
                     let raster = raster_array.get(i)?;
                     func(i, Some(&raster))?;
                 }
-
                 Ok(())
             }
             ColumnarValue::Scalar(scalar_value) => match scalar_value {
@@ -330,10 +320,10 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
         match (&self.args[0], &self.args[1]) {
             (ColumnarValue::Array(a0), ColumnarValue::Array(a1)) => {
                 let s0 = a0.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
-                    sedona_internal_datafusion_err!("Expected StructArray for raster data")
+                    DataFusionError::Internal("Expected StructArray for raster data".to_string())
                 })?;
                 let s1 = a1.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
-                    sedona_internal_datafusion_err!("Expected StructArray for raster data")
+                    DataFusionError::Internal("Expected StructArray for raster data".to_string())
                 })?;
 
                 let arr0 = RasterStructArray::new(s0);
@@ -364,7 +354,7 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
             }
             (ColumnarValue::Array(a0), ColumnarValue::Scalar(sv1)) => {
                 let s0 = a0.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
-                    sedona_internal_datafusion_err!("Expected StructArray for raster data")
+                    DataFusionError::Internal("Expected StructArray for raster data".to_string())
                 })?;
                 let arr0 = RasterStructArray::new(s0);
                 if arr0.len() != self.num_iterations {
@@ -385,7 +375,9 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
                     }
                     ScalarValue::Null => None,
                     _ => {
-                        return sedona_internal_err!("Expected Struct scalar for raster");
+                        return Err(DataFusionError::Internal(
+                            "Expected Struct scalar for raster".to_string(),
+                        ))
                     }
                 };
 
@@ -401,7 +393,7 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
             }
             (ColumnarValue::Scalar(sv0), ColumnarValue::Array(a1)) => {
                 let s1 = a1.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
-                    sedona_internal_datafusion_err!("Expected StructArray for raster data")
+                    DataFusionError::Internal("Expected StructArray for raster data".to_string())
                 })?;
                 let arr1 = RasterStructArray::new(s1);
                 if arr1.len() != self.num_iterations {
@@ -422,7 +414,9 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
                     }
                     ScalarValue::Null => None,
                     _ => {
-                        return sedona_internal_err!("Expected Struct scalar for raster");
+                        return Err(DataFusionError::Internal(
+                            "Expected Struct scalar for raster".to_string(),
+                        ))
                     }
                 };
 
@@ -448,7 +442,9 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
                     }
                     ScalarValue::Null => None,
                     _ => {
-                        return sedona_internal_err!("Expected Struct scalar for raster");
+                        return Err(DataFusionError::Internal(
+                            "Expected Struct scalar for raster".to_string(),
+                        ))
                     }
                 };
                 let r1 = match sv1 {
@@ -462,7 +458,9 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
                     }
                     ScalarValue::Null => None,
                     _ => {
-                        return sedona_internal_err!("Expected Struct scalar for raster");
+                        return Err(DataFusionError::Internal(
+                            "Expected Struct scalar for raster".to_string(),
+                        ))
                     }
                 };
 
@@ -483,7 +481,7 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
     /// The closure is invoked for each row with `(raster, wkb_bytes, crs_str)`.
     pub fn execute_raster_wkb_crs_void<F>(&self, mut func: F) -> Result<()>
     where
-        F: FnMut(Option<&RasterRefImpl<'_>>, Option<&[u8]>, CrsRef<'_>) -> Result<()>,
+        F: FnMut(Option<&RasterRefImpl<'_>>, Option<&[u8]>, Option<&str>) -> Result<()>,
     {
         if self.arg_types.first() != Some(&RASTER) {
             return sedona_internal_err!("First argument must be a raster type");
@@ -492,7 +490,7 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
             return sedona_internal_err!("Expected at least 2 arguments (raster, geom)");
         }
 
-        let mut geom_accessor = self.make_geom_wkb_crs_accessor(1)?;
+        let geom_accessor = self.make_geom_wkb_crs_accessor(1)?;
 
         match &self.args[0] {
             ColumnarValue::Array(array) => {
@@ -501,7 +499,9 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
                         .as_any()
                         .downcast_ref::<StructArray>()
                         .ok_or_else(|| {
-                            sedona_internal_datafusion_err!("Expected StructArray for raster data")
+                            DataFusionError::Internal(
+                                "Expected StructArray for raster data".to_string(),
+                            )
                         })?;
                 let raster_array = RasterStructArray::new(raster_struct);
 
@@ -538,20 +538,30 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
                     }
                     Ok(())
                 }
-                _ => sedona_internal_err!("Expected Struct scalar for raster"),
+                _ => Err(DataFusionError::Internal(
+                    "Expected Struct scalar for raster".to_string(),
+                )),
             },
         }
+    }
+
+    /// Alias for the originally requested method name.
+    pub fn execube_raster_item_crs_void<F>(&self, func: F) -> Result<()>
+    where
+        F: FnMut(Option<&RasterRefImpl<'_>>, Option<&[u8]>, Option<&str>) -> Result<()>,
+    {
+        self.execute_raster_wkb_crs_void(func)
     }
 
     fn make_geom_wkb_crs_accessor(&self, arg_index: usize) -> Result<GeomWkbCrsAccessor> {
         let sedona_type = self
             .arg_types
             .get(arg_index)
-            .ok_or_else(|| sedona_internal_datafusion_err!("Missing argument type"))?;
+            .ok_or_else(|| DataFusionError::Internal("Missing argument type".to_string()))?;
         let arg = self
             .args
             .get(arg_index)
-            .ok_or_else(|| sedona_internal_datafusion_err!("Missing argument"))?;
+            .ok_or_else(|| DataFusionError::Internal("Missing argument".to_string()))?;
 
         if is_item_crs_type(sedona_type) {
             let item_type = match sedona_type {
@@ -560,26 +570,26 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
                 }
                 _ => return sedona_internal_err!("Unexpected item_crs type"),
             };
-            let item_static_crs = crs_from_sedona_type(&item_type);
+            let item_static_crs = crs_string_from_sedona_type(&item_type)?;
 
             match arg {
                 ColumnarValue::Array(array) => {
                     let struct_array_ref = as_struct_array(array)?;
                     let item_col = struct_array_ref.column(0);
                     let crs_col = struct_array_ref.column(1);
-                    let crs_array = as_string_view_array(crs_col)?.clone();
+                    let crs_array = as_string_view_array(&crs_col)?.clone();
                     let item_accessor = match &item_type {
                         SedonaType::Wkb(_, _) => {
-                            ItemWkbAccessor::Binary(as_binary_array(item_col)?.clone())
+                            ItemWkbAccessor::Binary(as_binary_array(&item_col)?.clone())
                         }
                         SedonaType::WkbView(_, _) => {
-                            ItemWkbAccessor::BinaryView(as_binary_view_array(item_col)?.clone())
+                            ItemWkbAccessor::BinaryView(as_binary_view_array(&item_col)?.clone())
                         }
                         SedonaType::Arrow(DataType::Binary) => {
-                            ItemWkbAccessor::Binary(as_binary_array(item_col)?.clone())
+                            ItemWkbAccessor::Binary(as_binary_array(&item_col)?.clone())
                         }
                         SedonaType::Arrow(DataType::BinaryView) => {
-                            ItemWkbAccessor::BinaryView(as_binary_view_array(item_col)?.clone())
+                            ItemWkbAccessor::BinaryView(as_binary_view_array(&item_col)?.clone())
                         }
                         other => {
                             return sedona_internal_err!(
@@ -593,26 +603,25 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
                         item: item_accessor,
                         crs: crs_array,
                         item_static_crs,
-                        resolved_crs: None,
                     })
                 }
                 ColumnarValue::Scalar(ScalarValue::Struct(struct_scalar)) => {
                     let struct_array_ref = struct_scalar.as_ref();
                     let item_col = struct_array_ref.column(0);
                     let crs_col = struct_array_ref.column(1);
-                    let crs_array = as_string_view_array(crs_col)?.clone();
+                    let crs_array = as_string_view_array(&crs_col)?.clone();
                     let item_accessor = match &item_type {
                         SedonaType::Wkb(_, _) => {
-                            ItemWkbAccessor::Binary(as_binary_array(item_col)?.clone())
+                            ItemWkbAccessor::Binary(as_binary_array(&item_col)?.clone())
                         }
                         SedonaType::WkbView(_, _) => {
-                            ItemWkbAccessor::BinaryView(as_binary_view_array(item_col)?.clone())
+                            ItemWkbAccessor::BinaryView(as_binary_view_array(&item_col)?.clone())
                         }
                         SedonaType::Arrow(DataType::Binary) => {
-                            ItemWkbAccessor::Binary(as_binary_array(item_col)?.clone())
+                            ItemWkbAccessor::Binary(as_binary_array(&item_col)?.clone())
                         }
                         SedonaType::Arrow(DataType::BinaryView) => {
-                            ItemWkbAccessor::BinaryView(as_binary_view_array(item_col)?.clone())
+                            ItemWkbAccessor::BinaryView(as_binary_view_array(&item_col)?.clone())
                         }
                         other => {
                             return sedona_internal_err!(
@@ -626,7 +635,6 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
                         item: item_accessor,
                         crs: crs_array,
                         item_static_crs,
-                        resolved_crs: None,
                     })
                 }
                 ColumnarValue::Scalar(ScalarValue::Null) => Ok(GeomWkbCrsAccessor::Null),
@@ -635,7 +643,7 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
                 }
             }
         } else {
-            let static_crs = crs_from_sedona_type(sedona_type);
+            let static_crs = crs_string_from_sedona_type(sedona_type)?;
             match arg {
                 ColumnarValue::Array(array) => match sedona_type {
                     SedonaType::Wkb(_, _) | SedonaType::Arrow(DataType::Binary) => {
@@ -680,32 +688,21 @@ impl<'a, 'b> RasterExecutor<'a, 'b> {
     pub fn finish(&self, out: ArrayRef) -> Result<ColumnarValue> {
         for arg in self.args {
             match arg {
-                // If any argument was an array, we return an array
-                ColumnarValue::Array(_) => {
-                    return Ok(ColumnarValue::Array(out));
-                }
+                ColumnarValue::Array(_) => return Ok(ColumnarValue::Array(out)),
                 ColumnarValue::Scalar(_) => {}
             }
         }
 
-        // All arguments are scalars, return a scalar
         Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(&out, 0)?))
     }
 
-    /// Calculates the number of iterations that should happen based on the
-    /// argument ColumnarValue types
     fn calc_num_iterations(args: &[ColumnarValue]) -> usize {
         for arg in args {
             match arg {
-                // If any argument is an array, iterate array.len() times
-                ColumnarValue::Array(array) => {
-                    return array.len();
-                }
+                ColumnarValue::Array(array) => return array.len(),
                 ColumnarValue::Scalar(_) => {}
             }
         }
-
-        // All arguments are scalars, iterate once
         1
     }
 }
@@ -726,7 +723,6 @@ mod tests {
 
     #[test]
     fn test_raster_executor_execute_raster_void() {
-        // 3 rasters, second one is null
         let rasters = generate_test_rasters(3, Some(1)).unwrap();
         let args = [ColumnarValue::Array(Arc::new(rasters))];
         let arg_types = vec![RASTER];
@@ -739,17 +735,13 @@ mod tests {
             .execute_raster_void(|_i, raster_opt| {
                 match raster_opt {
                     None => builder.append_null(),
-                    Some(raster) => {
-                        let width = raster.metadata().width();
-                        builder.append_value(width);
-                    }
+                    Some(raster) => builder.append_value(raster.metadata().width()),
                 }
                 Ok(())
             })
             .unwrap();
 
         let result = executor.finish(Arc::new(builder.finish())).unwrap();
-
         let width_array = match &result {
             ColumnarValue::Array(array) => array
                 .as_any()
@@ -781,18 +773,13 @@ mod tests {
             .execute_raster_void(|_i, raster_opt| {
                 match raster_opt {
                     None => builder.append_null(),
-                    Some(raster) => {
-                        let width = raster.metadata().width();
-                        builder.append_value(width);
-                    }
+                    Some(raster) => builder.append_value(raster.metadata().width()),
                 }
                 Ok(())
             })
             .unwrap();
 
         let result = executor.finish(Arc::new(builder.finish())).unwrap();
-
-        // With scalar input, result should be a scalar
         let width_scalar = match &result {
             ColumnarValue::Scalar(scalar) => scalar,
             ColumnarValue::Array(_) => panic!("Expected scalar, got array"),
@@ -806,7 +793,6 @@ mod tests {
 
     #[test]
     fn test_raster_executor_null_scalar() {
-        // Test with a null scalar
         let args = [ColumnarValue::Scalar(ScalarValue::Null)];
         let arg_types = vec![RASTER];
 
@@ -818,18 +804,13 @@ mod tests {
             .execute_raster_void(|_i, raster_opt| {
                 match raster_opt {
                     None => builder.append_null(),
-                    Some(raster) => {
-                        let width = raster.metadata().width();
-                        builder.append_value(width);
-                    }
+                    Some(raster) => builder.append_value(raster.metadata().width()),
                 }
                 Ok(())
             })
             .unwrap();
 
         let result = executor.finish(Arc::new(builder.finish())).unwrap();
-
-        // With null scalar input, result should be null scalar
         let width_scalar = match &result {
             ColumnarValue::Scalar(scalar) => scalar,
             ColumnarValue::Array(_) => panic!("Expected scalar, got array"),
@@ -851,19 +832,20 @@ mod tests {
         let arg_types = vec![RASTER, geom_type];
         let executor = RasterExecutor::new(&arg_types, &args);
 
-        let expected_crs = deserialize_crs("EPSG:4326").unwrap().unwrap();
-        let mut out_crs_matches: Vec<Option<bool>> = Vec::with_capacity(executor.num_iterations());
+        let mut out_crs: Vec<Option<String>> = Vec::with_capacity(executor.num_iterations());
         let mut out_has_wkb: Vec<bool> = Vec::with_capacity(executor.num_iterations());
         executor
             .execute_raster_wkb_crs_void(|_raster, wkb, crs| {
                 out_has_wkb.push(wkb.is_some());
-                out_crs_matches.push(crs.map(|c| c.crs_equals(expected_crs.as_ref())));
+                out_crs.push(crs.map(|s| s.to_string()));
                 Ok(())
             })
             .unwrap();
 
         assert_eq!(out_has_wkb, vec![true, false]);
-        assert_eq!(out_crs_matches, vec![Some(true), None]);
+        assert!(out_crs[1].is_none());
+        let parsed = deserialize_crs(out_crs[0].as_deref().unwrap()).unwrap();
+        assert_eq!(parsed, deserialize_crs("EPSG:4326").unwrap());
     }
 
     #[test]
@@ -887,16 +869,15 @@ mod tests {
         let arg_types = vec![RASTER, geom_type];
         let executor = RasterExecutor::new(&arg_types, &args);
 
-        let expected_crs = deserialize_crs("EPSG:4326").unwrap().unwrap();
-        let mut out_crs_matches: Vec<Option<bool>> = Vec::with_capacity(executor.num_iterations());
+        let mut out_crs: Vec<Option<String>> = Vec::with_capacity(executor.num_iterations());
         executor
             .execute_raster_wkb_crs_void(|_raster, _wkb, crs| {
-                out_crs_matches.push(crs.map(|c| c.crs_equals(expected_crs.as_ref())));
+                out_crs.push(crs.map(|s| s.to_string()));
                 Ok(())
             })
             .unwrap();
 
-        assert_eq!(out_crs_matches, vec![Some(true), None]);
+        assert_eq!(out_crs, vec![Some("EPSG:4326".to_string()), None]);
     }
 
     #[test]
@@ -922,16 +903,18 @@ mod tests {
         let executor = RasterExecutor::new(&arg_types, &args);
         assert_eq!(executor.num_iterations(), 2);
 
-        let expected_crs = deserialize_crs("EPSG:4326").unwrap().unwrap();
-        let mut out_crs_matches: Vec<Option<bool>> = Vec::with_capacity(executor.num_iterations());
+        let mut out_crs: Vec<Option<String>> = Vec::with_capacity(executor.num_iterations());
         executor
             .execute_raster_wkb_crs_void(|_raster, _wkb, crs| {
-                out_crs_matches.push(crs.map(|c| c.crs_equals(expected_crs.as_ref())));
+                out_crs.push(crs.map(|s| s.to_string()));
                 Ok(())
             })
             .unwrap();
 
-        assert_eq!(out_crs_matches, vec![Some(true), Some(true)]);
+        let parsed0 = deserialize_crs(out_crs[0].as_deref().unwrap()).unwrap();
+        let parsed1 = deserialize_crs(out_crs[1].as_deref().unwrap()).unwrap();
+        assert_eq!(parsed0, deserialize_crs("EPSG:4326").unwrap());
+        assert_eq!(parsed1, deserialize_crs("EPSG:4326").unwrap());
     }
 
     #[test]

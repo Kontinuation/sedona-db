@@ -21,5 +21,5 @@ mod proj_dyn_bindgen;
 pub mod provider;
 pub mod register;
 pub mod sd_order_lnglat;
-mod st_transform;
+pub mod st_transform;
 pub mod transform;

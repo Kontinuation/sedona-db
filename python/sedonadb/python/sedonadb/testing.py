@@ -383,13 +383,7 @@ class DuckDB(DBEngine):
         self.con = duckdb.connect()
         self.con.install_extension("spatial")
         self.con.load_extension("spatial")
-        needs_geoarrow_registration = self.con.sql(
-            "SELECT count(*) > 0 FROM duckdb_functions() "
-            "WHERE function_name = 'register_geoarrow_extensions'"
-        ).fetchone()[0]
-
-        if needs_geoarrow_registration:
-            self.con.sql("CALL register_geoarrow_extensions()")
+        self.con.sql("CALL register_geoarrow_extensions()")
 
     @classmethod
     def name(cls):
@@ -428,7 +422,7 @@ class DuckDB(DBEngine):
         return self
 
     def execute_and_collect(self, query) -> pa.Table:
-        return self.con.execute(query).arrow().read_all()
+        return self.con.sql(query).fetch_arrow_table()
 
 
 class DuckDBSingleThread(DuckDB):

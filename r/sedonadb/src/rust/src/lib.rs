@@ -67,3 +67,12 @@ fn configure_proj_shared(
     configure_global_proj_engine(builder)?;
     Ok(())
 }
+
+#[savvy]
+fn configure_gdal_shared(shared_library_path: &str) -> savvy::Result<()> {
+    let builder = sedona_gdal::global::GdalApiBuilder::default()
+        .with_shared_library(shared_library_path.into());
+    sedona_gdal::global::configure_global_gdal_api(builder)
+        .map_err(|e| savvy::Error::new(format!("Failed to configure GDAL shared library: {e}")))?;
+    Ok(())
+}

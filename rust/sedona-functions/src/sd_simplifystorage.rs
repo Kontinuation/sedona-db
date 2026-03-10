@@ -110,7 +110,8 @@ fn simplify_field(field: FieldRef) -> FieldRef {
                 .map(|(_, field)| simplify_field(field.clone()))
                 .collect::<Vec<_>>();
             let new_ids = union_fields.iter().map(|(idx, _)| idx).collect::<Vec<_>>();
-            let new_union_fields = UnionFields::new(new_ids, new_fields);
+            let new_union_fields = UnionFields::try_new(new_ids, new_fields)
+                .expect("union field ids and fields should stay aligned");
             DataType::Union(new_union_fields, *union_mode)
         }
         DataType::Map(field, is_ordered) => {

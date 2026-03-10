@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod crs_utils;
 mod executor;
+pub use executor::RasterExecutor;
+pub mod crs_utils;
 pub mod register;
 pub mod rs_band_accessors;
 pub mod rs_bandpath;
 pub mod rs_convexhull;
+pub mod rs_count;
 pub mod rs_envelope;
 pub mod rs_example;
 pub mod rs_georeference;

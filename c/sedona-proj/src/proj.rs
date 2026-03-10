@@ -447,9 +447,8 @@ impl Proj {
 /// the Sedona PROJ wrapper. This is not intended to provide the entire API.
 /// When loading from proj_sys, the function pointers to the Rust functions
 /// are returned such that most of the code paths are the same even when using
-/// proj_sys to resolve the PROJ location. Dynamic libraries are currently
-/// loaded using C code; however, this could be migrated to Rust which also
-/// provides dynamic library loading capabilities.
+/// proj_sys to resolve the PROJ location. Dynamic libraries are loaded using
+/// `libloading` in pure Rust.
 ///
 /// This API is thread safe and is marked as such. When loading PROJ from a
 /// shared library, the `_lib` field holds the `Library` handle, ensuring that
@@ -457,10 +456,10 @@ impl Proj {
 /// lifetime of this `ProjApi` instance.
 struct ProjApi {
     inner: proj_dyn_bindgen::ProjApi,
-    name: String,
     /// Keep the dynamically loaded library alive for the lifetime of the function pointers.
-    /// `None` when using `proj-sys` (statically linked), `Some` when loaded from a shared library.
+    /// `None` when using `proj-sys` (statically linked).
     _lib: Option<Library>,
+    name: String,
 }
 
 impl Debug for ProjApi {
@@ -475,8 +474,8 @@ impl ProjApi {
 
         Ok(Arc::new(Self {
             inner,
-            name: shared_library.to_string_lossy().to_string(),
             _lib: Some(lib),
+            name: shared_library.to_string_lossy().to_string(),
         }))
     }
 
@@ -592,14 +591,14 @@ impl ProjApi {
                 proj_trans_array as unsafe extern "C" fn(*mut _, _, usize, *mut _) -> _,
             ));
             inner.proj_as_projjson = Some(std::mem::transmute(
-                proj_as_projjson as unsafe extern "C" fn(_, _, _) -> _,
+                proj_as_projjson as unsafe extern "C" fn(*mut _, *const _, *const _) -> _,
             ));
         }
 
         Self {
             inner,
-            name: "proj_sys".to_string(),
             _lib: None,
+            name: "proj_sys".to_string(),
         }
     }
 }

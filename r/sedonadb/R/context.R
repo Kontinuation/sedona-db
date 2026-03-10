@@ -308,7 +308,7 @@ sd_configure_proj <- function(
         presets <- c("homebrew", "system")
         errors <- c()
         for (preset in presets) {
-          maybe_err <- try(sd_configure_proj(preset), silent = TRUE)
+          maybe_err <- try(sd_configure_proj(preset = preset), silent = TRUE)
           if (!inherits(maybe_err, "try-error")) {
             return(invisible(NULL))
           } else {
@@ -349,6 +349,94 @@ sd_configure_proj <- function(
     shared_library_path = shared_library,
     database_path = database_path,
     search_path = search_path
+  )
+}
+
+#' Configure the GDAL shared library
+#'
+#' Loads the GDAL shared library used for internal MEM datasets.
+#'
+#' @param preset One of:
+#'   - `"homebrew"`: Look for GDAL installed by Homebrew.
+#'   - `"system"`: Look for GDAL in the platform library load path.
+#'   - `"auto"`: Try all presets in the order listed above.
+#' @param shared_library An absolute or relative path to the GDAL shared library.
+#'
+#' @returns NULL, invisibly
+#' @export
+#'
+#' @examples
+#' sd_configure_gdal("auto")
+#'
+sd_configure_gdal <- function(preset = NULL, shared_library = NULL) {
+  if (!is.null(preset)) {
+    switch(
+      tolower(preset),
+      homebrew = {
+        configure_gdal_prefix(Sys.getenv("HOMEBREW_PREFIX", "/opt/homebrew"))
+        return(invisible(NULL))
+      },
+      system = {
+        configure_gdal_system()
+        return(invisible(NULL))
+      },
+      auto = {
+        presets <- c("homebrew", "system")
+        errors <- c()
+        for (preset in presets) {
+          maybe_err <- try(sd_configure_gdal(preset = preset), silent = TRUE)
+          if (!inherits(maybe_err, "try-error")) {
+            return(invisible(NULL))
+          } else {
+            errors <- c(errors, sprintf("%s: %s", preset, maybe_err))
+          }
+        }
+
+        packageStartupMessage(
+          sprintf(
+            "Failed to configure GDAL (tried %s):\n%s",
+            paste0("'", presets, "'", collapse = ", "),
+            paste0(errors, collapse = "\n")
+          )
+        )
+
+        return(invisible(NULL))
+      },
+      stop(sprintf("Unknown preset: '%s'", preset))
+    )
+  }
+
+  if (is.null(shared_library)) {
+    stop("Must provide shared_library or preset")
+  }
+
+  configure_gdal_shared(shared_library_path = shared_library)
+}
+
+configure_gdal_system <- function() {
+  sd_configure_gdal(shared_library = gdal_dll_name())
+}
+
+configure_gdal_prefix <- function(prefix) {
+  if (!dir.exists(prefix)) {
+    stop(sprintf("Can't configure GDAL from prefix '%s': does not exist", prefix))
+  }
+
+  sd_configure_gdal(
+    shared_library = file.path(prefix, "lib", gdal_dll_name())
+  )
+}
+
+gdal_dll_name <- function() {
+  switch(
+    tolower(Sys.info()[["sysname"]]),
+    windows = "gdal.dll",
+    darwin = "libgdal.dylib",
+    linux = "libgdal.so",
+    stop(sprintf(
+      "Can't determine GDAL shared library name for OS: %s",
+      Sys.info()[["sysname"]]
+    ))
   )
 }
 

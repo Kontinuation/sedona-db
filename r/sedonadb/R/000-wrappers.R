@@ -84,6 +84,15 @@ NULL
   ))
 }
 
+`configure_gdal_shared` <- function(
+  `shared_library_path`
+) {
+  invisible(.Call(
+    savvy_configure_gdal_shared__impl,
+    `shared_library_path`
+  ))
+}
+
 
 `init_r_runtime_interrupts` <- function(`interrupts_call`, `pkg_env`) {
   invisible(.Call(savvy_init_r_runtime_interrupts__impl, `interrupts_call`, `pkg_env`))

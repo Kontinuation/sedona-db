@@ -114,7 +114,6 @@ pub fn generate_tiled_rasters(
             for _ in 0..band_count {
                 // Set a nodata value appropriate for the data type
                 let nodata_value = get_nodata_value_for_type(&data_type);
-
                 let nodata_value_bytes = nodata_value.clone();
 
                 let band_metadata = BandMetadata {

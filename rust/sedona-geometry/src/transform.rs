@@ -41,6 +41,14 @@ use geo_traits::{
 
 /// Represents a coordinate reference system (CRS) transformation engine.
 pub trait CrsEngine: Debug {
+    /// Create a reusable transformation from a source CRS (`from`) to a destination CRS (`to`).
+    ///
+    /// - `from`/`to`: CRS definition strings. The supported formats are engine-defined.
+    /// - `area_of_interest`: Optional bounding box used to constrain/optimize the candidate
+    ///   coordinate operations. When provided, it is forwarded to the underlying engine for
+    ///   selecting the most accurate transformation for that area. The exact semantics of
+    ///   how this is used are engine-defined.
+    /// - `options`: Engine specific options for creating the transformation.
     fn get_transform_crs_to_crs(
         &self,
         from: &str,
@@ -48,6 +56,12 @@ pub trait CrsEngine: Debug {
         area_of_interest: Option<BoundingBox>,
         options: &str,
     ) -> Result<Rc<dyn CrsTransform>, SedonaGeometryError>;
+
+    /// Create a transformation from a pipeline/operation definition.
+    ///
+    /// The accepted pipeline/operation syntax is engine-defined.
+    ///
+    /// - `options`: Engine specific options for creating the transformation.
     fn get_transform_pipeline(
         &self,
         pipeline: &str,
