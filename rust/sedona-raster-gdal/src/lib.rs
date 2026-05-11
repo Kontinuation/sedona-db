@@ -33,6 +33,7 @@ mod gdal_common;
 mod gdal_dataset_provider;
 
 mod rs_from_path;
+mod rs_metadata;
 mod utils;
 
 #[cfg(test)]
@@ -44,8 +45,9 @@ pub use gdal_common::{
     nodata_bytes_to_f64, nodata_f64_to_bytes,
 };
 pub use rs_from_path::rs_from_path_udf;
+pub use rs_metadata::rs_metadata_udf;
 pub use utils::{append_as_indb_raster, dataset_to_indb_raster};
 
 pub fn all_gdal_udfs() -> Vec<sedona_expr::scalar_udf::SedonaScalarUDF> {
-    vec![rs_from_path_udf()]
+    vec![rs_from_path_udf(), rs_metadata_udf()]
 }
