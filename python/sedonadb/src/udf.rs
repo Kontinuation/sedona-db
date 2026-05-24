@@ -142,7 +142,7 @@ impl PySedonaScalarUdf {
         py: Python<'py>,
     ) -> Result<Bound<'py, PyCapsule>, PySedonaError> {
         let capsule_name = CString::new("datafusion_scalar_udf").unwrap();
-        let scalar_udf: ScalarUDF = self.inner.clone().into();
+        let scalar_udf = self.inner.to_datafusion_udf();
         let ffi_scalar_udf = FFI_ScalarUDF::from(Arc::new(scalar_udf));
         Ok(PyCapsule::new(py, ffi_scalar_udf, Some(capsule_name))?)
     }

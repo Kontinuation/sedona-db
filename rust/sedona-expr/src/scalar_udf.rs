@@ -17,11 +17,13 @@
 use std::{any::Any, fmt::Debug, sync::Arc};
 
 use arrow_schema::{DataType, FieldRef};
+use async_trait::async_trait;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{not_impl_err, Result, ScalarValue};
+use datafusion_expr::async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl};
 use datafusion_expr::{
-    ColumnarValue, Documentation, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature,
-    Volatility,
+    ColumnarValue, Documentation, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, Volatility,
 };
 use sedona_common::sedona_internal_err;
 use sedona_schema::{datatypes::SedonaType, matchers::ArgMatcher};
@@ -71,6 +73,13 @@ pub struct SedonaScalarUDF {
     signature: Signature,
     kernels: Vec<ScalarKernelRef>,
     aliases: Vec<String>,
+    mode: SedonaScalarUDFMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SedonaScalarUDFMode {
+    Sync,
+    Async { ideal_batch_size: Option<usize> },
 }
 
 impl PartialEq for SedonaScalarUDF {
@@ -140,6 +149,72 @@ pub trait SedonaScalarKernel: Debug + Send + Sync {
     ) -> Result<ColumnarValue> {
         self.invoke_batch(arg_types, args)
     }
+
+    fn as_async(&self) -> Option<&dyn AsyncSedonaScalarKernel> {
+        None
+    }
+}
+
+#[async_trait]
+pub trait AsyncSedonaScalarKernel: Debug + Send + Sync {
+    fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>>;
+
+    fn return_type_from_args_and_scalars(
+        &self,
+        args: &[SedonaType],
+        _scalar_args: &[Option<&ScalarValue>],
+    ) -> Result<Option<SedonaType>> {
+        self.return_type(args)
+    }
+
+    async fn invoke_async_batch_from_args(
+        &self,
+        arg_types: &[SedonaType],
+        args: &[ColumnarValue],
+        return_type: &SedonaType,
+        num_rows: usize,
+        config_options: Option<&ConfigOptions>,
+    ) -> Result<ColumnarValue>;
+}
+
+impl<T> SedonaScalarKernel for T
+where
+    T: AsyncSedonaScalarKernel,
+{
+    fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+        AsyncSedonaScalarKernel::return_type(self, args)
+    }
+
+    fn return_type_from_args_and_scalars(
+        &self,
+        args: &[SedonaType],
+        scalar_args: &[Option<&ScalarValue>],
+    ) -> Result<Option<SedonaType>> {
+        AsyncSedonaScalarKernel::return_type_from_args_and_scalars(self, args, scalar_args)
+    }
+
+    fn invoke_batch(
+        &self,
+        _arg_types: &[SedonaType],
+        _args: &[ColumnarValue],
+    ) -> Result<ColumnarValue> {
+        sedona_internal_err!("async kernel cannot be called from sync context")
+    }
+
+    fn invoke_batch_from_args(
+        &self,
+        _arg_types: &[SedonaType],
+        _args: &[ColumnarValue],
+        _return_type: &SedonaType,
+        _num_rows: usize,
+        _config_options: Option<&ConfigOptions>,
+    ) -> Result<ColumnarValue> {
+        sedona_internal_err!("async kernel cannot be called from sync context")
+    }
+
+    fn as_async(&self) -> Option<&dyn AsyncSedonaScalarKernel> {
+        Some(self)
+    }
 }
 
 /// Type definition for a Scalar kernel implementation function
@@ -185,12 +260,43 @@ impl SedonaScalarUDF {
         kernels: Vec<ScalarKernelRef>,
         volatility: Volatility,
     ) -> SedonaScalarUDF {
-        let signature = Signature::user_defined(volatility);
+        Self::new_with_signature(
+            name,
+            kernels,
+            Signature::user_defined(volatility),
+            SedonaScalarUDFMode::Sync,
+        )
+    }
+
+    pub fn new_async(
+        name: &str,
+        kernels: Vec<ScalarKernelRef>,
+        volatility: Volatility,
+        ideal_async_batch_size: Option<usize>,
+    ) -> SedonaScalarUDF {
+        Self::new_with_signature(
+            name,
+            kernels,
+            Signature::user_defined(volatility),
+            SedonaScalarUDFMode::Async {
+                ideal_batch_size: ideal_async_batch_size,
+            },
+        )
+    }
+
+    fn new_with_signature(
+        name: &str,
+        kernels: Vec<ScalarKernelRef>,
+        signature: Signature,
+        mode: SedonaScalarUDFMode,
+    ) -> SedonaScalarUDF {
+        Self::assert_kernel_mode(name, &kernels, mode);
         Self {
             name: name.to_string(),
             signature,
             kernels,
             aliases: vec![],
+            mode,
         }
     }
 
@@ -201,6 +307,17 @@ impl SedonaScalarUDF {
             signature: self.signature,
             kernels: self.kernels,
             aliases,
+            mode: self.mode,
+        }
+    }
+
+    pub fn with_signature(self, signature: Signature) -> SedonaScalarUDF {
+        Self {
+            name: self.name,
+            signature,
+            kernels: self.kernels,
+            aliases: self.aliases,
+            mode: self.mode,
         }
     }
 
@@ -216,14 +333,61 @@ impl SedonaScalarUDF {
         )
     }
 
+    /// TODO(kontinuation): write doc for this
+    pub fn from_async_impl(
+        name: &str,
+        kernels: impl IntoScalarKernelRefs,
+        ideal_async_batch_size: Option<usize>,
+    ) -> SedonaScalarUDF {
+        Self::new_async(
+            name,
+            kernels.into_scalar_kernel_refs(),
+            Volatility::Immutable,
+            ideal_async_batch_size,
+        )
+    }
+
     /// Add a new kernel to a Scalar UDF
     ///
     /// Because kernels are resolved in reverse order, the new kernel will take
     /// precedence over any previously added kernels that apply to the same types.
     pub fn add_kernels(&mut self, kernels: impl IntoScalarKernelRefs) {
-        for kernel in kernels.into_scalar_kernel_refs() {
+        let kernels = kernels.into_scalar_kernel_refs();
+        Self::assert_kernel_mode(&self.name, &kernels, self.mode);
+        for kernel in kernels {
             self.kernels.push(kernel);
         }
+    }
+
+    pub fn is_async(&self) -> bool {
+        matches!(self.mode, SedonaScalarUDFMode::Async { .. })
+    }
+
+    pub fn ideal_async_batch_size(&self) -> Option<usize> {
+        match self.mode {
+            SedonaScalarUDFMode::Sync => None,
+            SedonaScalarUDFMode::Async { ideal_batch_size } => ideal_batch_size,
+        }
+    }
+
+    pub fn to_datafusion_udf(&self) -> ScalarUDF {
+        match self.mode {
+            SedonaScalarUDFMode::Sync => ScalarUDF::new_from_impl(self.clone()),
+            SedonaScalarUDFMode::Async { .. } => {
+                AsyncScalarUDF::new(Arc::new(self.clone())).into_scalar_udf()
+            }
+        }
+    }
+
+    fn assert_kernel_mode(name: &str, kernels: &[ScalarKernelRef], mode: SedonaScalarUDFMode) {
+        let expect_async = matches!(mode, SedonaScalarUDFMode::Async { .. });
+        assert!(
+            kernels
+                .iter()
+                .all(|kernel| kernel.as_async().is_some() == expect_async),
+            "{name}: all kernels must be {}",
+            if expect_async { "async" } else { "sync" }
+        );
     }
 
     fn return_type_impl(
@@ -248,6 +412,32 @@ impl SedonaScalarUDF {
             "{}({args_display}): No kernel matching arguments",
             self.name
         )
+    }
+
+    fn select_kernel<'a, 'b>(
+        &'a self,
+        args: &'b ScalarFunctionArgs,
+    ) -> Result<(&'a dyn SedonaScalarKernel, Vec<SedonaType>, SedonaType)> {
+        let arg_types = args
+            .arg_fields
+            .iter()
+            .map(|field| SedonaType::from_storage_field(field))
+            .collect::<Result<Vec<_>>>()?;
+
+        let arg_scalars = args
+            .args
+            .iter()
+            .map(|arg| {
+                if let ColumnarValue::Scalar(scalar) = arg {
+                    Some(scalar)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let (kernel, return_type) = self.return_type_impl(&arg_types, &arg_scalars)?;
+        Ok((kernel, arg_types, return_type))
     }
 }
 
@@ -287,25 +477,7 @@ impl ScalarUDFImpl for SedonaScalarUDF {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let arg_types = args
-            .arg_fields
-            .iter()
-            .map(|field| SedonaType::from_storage_field(field))
-            .collect::<Result<Vec<_>>>()?;
-
-        let arg_scalars = args
-            .args
-            .iter()
-            .map(|arg| {
-                if let ColumnarValue::Scalar(scalar) = arg {
-                    Some(scalar)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let (kernel, return_type) = self.return_type_impl(&arg_types, &arg_scalars)?;
+        let (kernel, arg_types, return_type) = self.select_kernel(&args)?;
         kernel.invoke_batch_from_args(
             &arg_types,
             &args.args,
@@ -320,10 +492,37 @@ impl ScalarUDFImpl for SedonaScalarUDF {
     }
 }
 
+#[async_trait]
+impl AsyncScalarUDFImpl for SedonaScalarUDF {
+    fn ideal_batch_size(&self) -> Option<usize> {
+        self.ideal_async_batch_size()
+    }
+
+    /// Invoke the function asynchronously with the async arguments
+    async fn invoke_async_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let (kernel, arg_types, return_type) = self.select_kernel(&args)?;
+        if let Some(async_kernel) = kernel.as_async() {
+            async_kernel
+                .invoke_async_batch_from_args(
+                    &arg_types,
+                    &args.args,
+                    &return_type,
+                    args.number_rows,
+                    Some(&*args.config_options),
+                )
+                .await
+        } else {
+            sedona_internal_err!("kernel {:?} does not support async invocation", self)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    use datafusion_common::{scalar::ScalarValue, DFSchema};
+    use arrow_array::Int32Array;
+    use datafusion_common::{config::ConfigOptions, scalar::ScalarValue, DFSchema};
     use sedona_testing::testers::ScalarUdfTester;
 
     use datafusion_expr::{lit, ExprSchemable, ScalarUDF};
@@ -333,6 +532,40 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Debug)]
+    struct AsyncInt32Kernel {
+        invoked: Arc<AtomicBool>,
+    }
+
+    impl AsyncInt32Kernel {
+        fn new_ref(invoked: Arc<AtomicBool>) -> ScalarKernelRef {
+            Arc::new(Self { invoked })
+        }
+    }
+
+    #[async_trait]
+    impl AsyncSedonaScalarKernel for AsyncInt32Kernel {
+        fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+            if args == [SedonaType::Arrow(DataType::Int32)] {
+                Ok(Some(SedonaType::Arrow(DataType::Int32)))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn invoke_async_batch_from_args(
+            &self,
+            _arg_types: &[SedonaType],
+            args: &[ColumnarValue],
+            _return_type: &SedonaType,
+            _num_rows: usize,
+            _config_options: Option<&ConfigOptions>,
+        ) -> Result<ColumnarValue> {
+            self.invoked.store(true, Ordering::SeqCst);
+            Ok(args[0].clone())
+        }
+    }
 
     #[test]
     fn udf_empty() -> Result<()> {
@@ -476,6 +709,65 @@ mod tests {
             (call_field.1.data_type(), call_field.1.is_nullable()),
             (&DataType::Float32, true)
         );
+    }
+
+    #[test]
+    fn async_kernel_errors_from_sync_context() {
+        let invoked = Arc::new(AtomicBool::new(false));
+        let udf = SedonaScalarUDF::from_async_impl(
+            "async_stub",
+            AsyncInt32Kernel::new_ref(invoked),
+            Some(7),
+        );
+        let tester = ScalarUdfTester::new(
+            udf.to_datafusion_udf(),
+            vec![SedonaType::Arrow(DataType::Int32)],
+        );
+
+        let err = tester.invoke_scalar(1i32).unwrap_err();
+        assert!(err
+            .message()
+            .contains("async functions should not be called directly"));
+    }
+
+    #[tokio::test]
+    async fn async_kernel_dispatches_from_async_context() {
+        let invoked = Arc::new(AtomicBool::new(false));
+        let udf = SedonaScalarUDF::from_async_impl(
+            "async_stub",
+            AsyncInt32Kernel::new_ref(invoked.clone()),
+            Some(7),
+        );
+        let udf: ScalarUDF = udf.to_datafusion_udf();
+        let async_udf = udf.as_async().expect("UDF should be async");
+
+        assert_eq!(async_udf.ideal_batch_size(), Some(7));
+
+        let arg_type = SedonaType::Arrow(DataType::Int32);
+        let args = ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(Arc::new(Int32Array::from(vec![
+                1, 2, 3,
+            ])))],
+            arg_fields: vec![Arc::new(arg_type.to_storage_field("", false).unwrap())],
+            number_rows: 3,
+            return_field: Arc::new(arg_type.to_storage_field("", true).unwrap()),
+            config_options: Arc::new(ConfigOptions::default()),
+        };
+
+        let result = async_udf
+            .invoke_async_with_args(args)
+            .await
+            .expect("async dispatch should succeed");
+
+        match result {
+            ColumnarValue::Array(values) => {
+                let values = values.as_any().downcast_ref::<Int32Array>().unwrap();
+                assert_eq!(values.values(), &[1, 2, 3]);
+            }
+            other => panic!("Unexpected result: {other:?}"),
+        }
+
+        assert!(invoked.load(Ordering::SeqCst));
     }
 
     #[derive(Debug)]

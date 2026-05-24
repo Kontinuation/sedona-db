@@ -498,7 +498,7 @@ impl DisplayColumn {
     /// their raw storage bytes.
     fn format_proxy(&self, array: &ArrayRef, options: &DisplayTableOptions) -> Result<ArrayRef> {
         if let Some(format) = &self.format_fn {
-            let format_udf: ScalarUDF = format.clone().into();
+            let format_udf: ScalarUDF = format.to_datafusion_udf();
 
             let options_scalar = ScalarValue::Utf8(Some(format!(
                 r#"{{"width_hint": {}}}"#,

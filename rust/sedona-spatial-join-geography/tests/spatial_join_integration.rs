@@ -122,13 +122,13 @@ fn setup_context(options: Option<SpatialJoinOptions>, batch_size: usize) -> Resu
     let mut function_set = sedona_functions::register::default_function_set();
 
     function_set.scalar_udfs().for_each(|udf| {
-        ctx.register_udf(udf.clone().into());
+        ctx.register_udf(udf.to_datafusion_udf());
     });
 
     // Register s2geography kernels
     for (name, kernel) in sedona_s2geography::register::scalar_kernels()?.into_iter() {
         let udf = function_set.add_scalar_udf_impl(name, kernel)?;
-        ctx.register_udf(udf.clone().into());
+        ctx.register_udf(udf.to_datafusion_udf());
     }
 
     Ok(ctx)

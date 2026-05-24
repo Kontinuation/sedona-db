@@ -252,8 +252,7 @@ impl InternalContext {
                     .functions
                     .scalar_udf(name)
                     .unwrap()
-                    .clone()
-                    .into(),
+                    .to_datafusion_udf(),
             );
             return Ok(());
         } else if udf.hasattr("__datafusion_scalar_udf__")? {

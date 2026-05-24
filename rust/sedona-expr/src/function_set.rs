@@ -85,7 +85,8 @@ impl FunctionSet {
     /// Consume another function set and merge its contents into this one
     pub fn merge(&mut self, other: FunctionSet) {
         for (k, v) in other.scalar_udfs.into_iter() {
-            self.scalar_udfs.insert(k, v);
+            debug_assert_eq!(k, v.name());
+            self.insert_scalar_udf(v);
         }
 
         for (k, v) in other.aggregate_udfs.into_iter() {
@@ -102,10 +103,20 @@ impl FunctionSet {
         name: &str,
         kernels: impl IntoScalarKernelRefs,
     ) -> Result<&SedonaScalarUDF> {
+        let kernels = kernels.into_scalar_kernel_refs();
         if let Some(function) = self.scalar_udf_mut(name) {
+            if function.is_async() != kernels.iter().all(|kernel| kernel.as_async().is_some()) {
+                return datafusion_common::internal_err!(
+                    "{name}: cannot mix sync and async kernels in one SedonaScalarUDF"
+                );
+            }
             function.add_kernels(kernels);
         } else {
-            let function = SedonaScalarUDF::from_impl(name, kernels);
+            let function = if kernels.iter().all(|kernel| kernel.as_async().is_some()) {
+                SedonaScalarUDF::from_async_impl(name, kernels, None)
+            } else {
+                SedonaScalarUDF::from_impl(name, kernels)
+            };
             self.insert_scalar_udf(function);
         }
 
@@ -150,7 +161,7 @@ mod tests {
 
     use crate::{
         aggregate_udf::{SedonaAccumulator, SedonaAccumulatorRef},
-        scalar_udf::SimpleSedonaScalarKernel,
+        scalar_udf::{AsyncSedonaScalarKernel, SimpleSedonaScalarKernel},
     };
 
     use super::*;
@@ -213,6 +224,116 @@ mod tests {
             .into_iter()
             .collect::<HashSet<_>>()
         );
+    }
+
+    #[test]
+    fn function_set_with_async_scalar_udfs() {
+        let mut functions = FunctionSet::new();
+
+        let sync_udf = SedonaScalarUDF::new(
+            "sync_udf",
+            vec![SimpleSedonaScalarKernel::new_ref(
+                ArgMatcher::new(
+                    vec![ArgMatcher::is_arrow(DataType::Boolean)],
+                    SedonaType::Arrow(DataType::Boolean),
+                ),
+                Arc::new(|_, _| Ok(ColumnarValue::Scalar(ScalarValue::Boolean(None)))),
+            )],
+            Volatility::Immutable,
+        );
+        functions.insert_scalar_udf(sync_udf);
+
+        #[derive(Debug)]
+        struct AsyncTestKernel;
+
+        #[async_trait::async_trait]
+        impl AsyncSedonaScalarKernel for AsyncTestKernel {
+            fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+                if args == [SedonaType::Arrow(DataType::Utf8)] {
+                    Ok(Some(SedonaType::Arrow(DataType::Utf8)))
+                } else {
+                    Ok(None)
+                }
+            }
+
+            async fn invoke_async_batch_from_args(
+                &self,
+                _arg_types: &[SedonaType],
+                args: &[ColumnarValue],
+                _return_type: &SedonaType,
+                _num_rows: usize,
+                _config_options: Option<&datafusion_common::config::ConfigOptions>,
+            ) -> Result<ColumnarValue> {
+                Ok(args[0].clone())
+            }
+        }
+
+        let async_udf = SedonaScalarUDF::from_async_impl("async_udf", AsyncTestKernel, Some(5));
+        functions.insert_scalar_udf(async_udf);
+
+        assert_eq!(functions.scalar_udfs().count(), 2);
+        assert!(!functions.scalar_udf("sync_udf").unwrap().is_async());
+        assert!(functions.scalar_udf("async_udf").unwrap().is_async());
+        assert_eq!(
+            functions
+                .scalar_udf("async_udf")
+                .unwrap()
+                .ideal_async_batch_size(),
+            Some(5)
+        );
+        assert!(functions
+            .scalar_udf("async_udf")
+            .unwrap()
+            .to_datafusion_udf()
+            .as_async()
+            .is_some());
+    }
+
+    #[test]
+    fn function_set_rejects_mixed_sync_async_kernels() {
+        let mut functions = FunctionSet::new();
+
+        let sync_kernel = SimpleSedonaScalarKernel::new_ref(
+            ArgMatcher::new(
+                vec![ArgMatcher::is_arrow(DataType::Boolean)],
+                SedonaType::Arrow(DataType::Boolean),
+            ),
+            Arc::new(|_, _| Ok(ColumnarValue::Scalar(ScalarValue::Boolean(None)))),
+        );
+
+        #[derive(Debug)]
+        struct AsyncBoolKernel;
+
+        #[async_trait::async_trait]
+        impl AsyncSedonaScalarKernel for AsyncBoolKernel {
+            fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
+                if args == [SedonaType::Arrow(DataType::Boolean)] {
+                    Ok(Some(SedonaType::Arrow(DataType::Boolean)))
+                } else {
+                    Ok(None)
+                }
+            }
+
+            async fn invoke_async_batch_from_args(
+                &self,
+                _arg_types: &[SedonaType],
+                args: &[ColumnarValue],
+                _return_type: &SedonaType,
+                _num_rows: usize,
+                _config_options: Option<&datafusion_common::config::ConfigOptions>,
+            ) -> Result<ColumnarValue> {
+                Ok(args[0].clone())
+            }
+        }
+
+        functions.add_scalar_udf_impl("mixed", sync_kernel).unwrap();
+        let err = functions
+            .add_scalar_udf_impl("mixed", AsyncBoolKernel)
+            .unwrap_err();
+
+        assert!(err
+            .message()
+            .contains("cannot mix sync and async kernels in one SedonaScalarUDF"));
     }
 
     #[derive(Debug, Clone)]

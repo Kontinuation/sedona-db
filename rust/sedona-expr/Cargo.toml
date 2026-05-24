@@ -33,8 +33,10 @@ result_large_err = "allow"
 [dev-dependencies]
 rstest = { workspace = true }
 sedona-testing = { workspace = true }
+tokio = { workspace = true }
 
 [dependencies]
+async-trait = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }

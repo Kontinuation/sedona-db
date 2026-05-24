@@ -291,13 +291,16 @@ impl SedonaContext {
 
     /// Register all functions in a [FunctionSet] with this context
     pub fn register_function_set(&mut self, function_set: FunctionSet) {
-        for udf in function_set.scalar_udfs() {
-            self.functions.insert_scalar_udf(udf.clone());
-            self.ctx.register_udf(udf.clone().into());
+        let scalar_udfs = function_set.scalar_udfs().cloned().collect::<Vec<_>>();
+        let aggregate_udfs = function_set.aggregate_udfs().cloned().collect::<Vec<_>>();
+
+        self.functions.merge(function_set);
+
+        for udf in scalar_udfs {
+            self.ctx.register_udf(udf.to_datafusion_udf());
         }
 
-        for udf in function_set.aggregate_udfs() {
-            self.functions.insert_aggregate_udf(udf.clone());
+        for udf in aggregate_udfs {
             self.ctx.register_udaf(udf.clone().into());
         }
     }
@@ -309,7 +312,7 @@ impl SedonaContext {
     ) -> Result<()> {
         for (name, kernel) in kernels {
             let udf = self.functions.add_scalar_udf_impl(name, kernel)?;
-            self.ctx.register_udf(udf.clone().into());
+            self.ctx.register_udf(udf.to_datafusion_udf());
         }
 
         Ok(())

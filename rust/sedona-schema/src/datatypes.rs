@@ -157,6 +157,7 @@ impl SedonaType {
     pub fn from_storage_field(field: &Field) -> Result<SedonaType> {
         match ExtensionType::from_field(field) {
             Some(ext) => Self::from_extension_type(ext),
+            None if field.data_type() == &*RASTER_DATATYPE => Ok(RASTER),
             None => Ok(Self::Arrow(field.data_type().clone())),
         }
     }
@@ -525,6 +526,17 @@ mod tests {
             "Wkb({...})"
         );
         assert_eq!(RASTER.to_string(), "Raster");
+    }
+
+    #[test]
+    fn sedona_type_raster_without_extension_metadata() {
+        let mut storage_field = RASTER.to_storage_field("", true).unwrap();
+        storage_field = storage_field.with_metadata(Default::default());
+
+        assert_eq!(
+            SedonaType::from_storage_field(&storage_field).unwrap(),
+            RASTER
+        );
     }
 
     #[test]

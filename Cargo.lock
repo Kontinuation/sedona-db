@@ -5756,6 +5756,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-schema",
+ "async-trait",
  "datafusion-common",
  "datafusion-expr",
  "datafusion-physical-expr",
@@ -5767,6 +5768,7 @@ dependencies = [
  "sedona-testing",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -6131,6 +6133,7 @@ dependencies = [
  "arrow-array",
  "arrow-buffer",
  "arrow-schema",
+ "async-trait",
  "criterion",
  "datafusion-common",
  "datafusion-expr",

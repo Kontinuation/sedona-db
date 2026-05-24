@@ -17,42 +17,117 @@
 
 //! RS_FromPath UDF - Load out-db raster from file path.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::Array;
 use arrow_schema::DataType;
+use async_trait::async_trait;
 use datafusion_common::cast::as_string_array;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::error::Result;
+use datafusion_common::error::{DataFusionError, Result};
+#[cfg(test)]
 use datafusion_common::ScalarValue;
-use datafusion_expr::{ColumnarValue, Volatility};
-use sedona_common::sedona_internal_err;
-use sedona_expr::scalar_udf::{SedonaScalarKernel, SedonaScalarUDF};
+use datafusion_expr::{ColumnarValue, Signature, TypeSignature, Volatility};
+use sedona_expr::scalar_udf::{AsyncSedonaScalarKernel, SedonaScalarUDF};
 use sedona_raster::builder::RasterBuilder;
 use sedona_schema::datatypes::{SedonaType, RASTER};
 use sedona_schema::matchers::ArgMatcher;
+use tokio::task;
 
 use crate::gdal_common::with_gdal;
 use crate::gdal_dataset_provider::configure_thread_local_options;
 use crate::utils::append_as_outdb_raster;
 
+static RS_FROMPATH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+    Signature::one_of(
+        vec![
+            TypeSignature::Exact(vec![DataType::Utf8]),
+            TypeSignature::Exact(vec![DataType::Utf8View]),
+            TypeSignature::Exact(vec![DataType::LargeUtf8]),
+        ],
+        Volatility::Volatile,
+    )
+});
+
 pub fn rs_frompath_udf() -> SedonaScalarUDF {
-    SedonaScalarUDF::new(
+    SedonaScalarUDF::new_async(
         "rs_frompath",
         vec![Arc::new(RsFromPath)],
         Volatility::Volatile,
+        None,
     )
+    .with_signature(RS_FROMPATH_SIGNATURE.clone())
 }
 
 #[derive(Debug)]
 pub(crate) struct RsFromPath;
 
-impl SedonaScalarKernel for RsFromPath {
+#[cfg(test)]
+fn has_array_arg(args: &[ColumnarValue]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg, ColumnarValue::Array(_)))
+}
+
+fn infer_num_iterations(args: &[ColumnarValue]) -> Option<usize> {
+    args.iter().find_map(|arg| match arg {
+        ColumnarValue::Array(array) => Some(array.len()),
+        ColumnarValue::Scalar(_) => None,
+    })
+}
+
+fn build_rs_frompath_array(
+    args: &[ColumnarValue],
+    num_iterations: usize,
+    config_options: Option<&ConfigOptions>,
+) -> Result<Arc<dyn Array>> {
+    with_gdal(|gdal| {
+        configure_thread_local_options(gdal, config_options)?;
+
+        let paths = args[0]
+            .cast_to(&DataType::Utf8, None)?
+            .into_array_of_size(num_iterations)?;
+        let path_array = as_string_array(&paths)?;
+
+        let mut builder = RasterBuilder::new(path_array.len());
+        for path_opt in path_array {
+            if let Some(path) = path_opt {
+                append_as_outdb_raster(gdal, path, &mut builder)?;
+            } else {
+                builder.append_null()?;
+            }
+        }
+
+        Ok(Arc::new(builder.finish()?) as Arc<dyn Array>)
+    })
+}
+
+#[cfg(test)]
+fn invoke_rs_frompath(
+    args: Vec<ColumnarValue>,
+    num_rows: usize,
+    config_options: Option<ConfigOptions>,
+) -> Result<ColumnarValue> {
+    let result = build_rs_frompath_array(
+        &args,
+        infer_num_iterations(&args).unwrap_or_else(|| num_rows.max(1)),
+        config_options.as_ref(),
+    )?;
+
+    match has_array_arg(&args) {
+        true => Ok(ColumnarValue::Array(result)),
+        false => Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+            &result, 0,
+        )?)),
+    }
+}
+
+#[async_trait]
+impl AsyncSedonaScalarKernel for RsFromPath {
     fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>> {
         ArgMatcher::new(vec![ArgMatcher::is_string()], RASTER).match_args(args)
     }
 
-    fn invoke_batch_from_args(
+    async fn invoke_async_batch_from_args(
         &self,
         _arg_types: &[SedonaType],
         args: &[ColumnarValue],
@@ -60,67 +135,40 @@ impl SedonaScalarKernel for RsFromPath {
         num_rows: usize,
         config_options: Option<&ConfigOptions>,
     ) -> Result<ColumnarValue> {
-        with_gdal(|gdal| {
-            configure_thread_local_options(gdal, config_options)?;
+        let args = args.to_vec();
+        let config_options = config_options.cloned();
 
-            let num_iterations = args
-                .iter()
-                .find_map(|arg| match arg {
-                    ColumnarValue::Array(array) => Some(array.len()),
-                    ColumnarValue::Scalar(_) => None,
-                })
-                .unwrap_or_else(|| num_rows.max(1));
-
-            let paths = args[0]
-                .cast_to(&DataType::Utf8, None)?
-                .into_array_of_size(num_iterations)?;
-            let path_array = as_string_array(&paths)?;
-
-            let mut builder = RasterBuilder::new(path_array.len());
-            for path_opt in path_array {
-                if let Some(path) = path_opt {
-                    append_as_outdb_raster(gdal, path, &mut builder)?;
-                } else {
-                    builder.append_null()?;
-                }
-            }
-
-            let result: Arc<dyn Array> = Arc::new(builder.finish()?);
-
-            match args
-                .iter()
-                .any(|arg| matches!(arg, ColumnarValue::Array(_)))
-            {
-                true => Ok(ColumnarValue::Array(result)),
-                false => Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
-                    &result, 0,
-                )?)),
-            }
+        task::spawn_blocking(move || {
+            build_rs_frompath_array(
+                &args,
+                infer_num_iterations(&args).unwrap_or_else(|| num_rows.max(1)),
+                config_options.as_ref(),
+            )
+            .map(ColumnarValue::Array)
         })
-    }
-
-    fn invoke_batch(
-        &self,
-        _arg_types: &[SedonaType],
-        _args: &[ColumnarValue],
-    ) -> Result<ColumnarValue> {
-        sedona_internal_err!("Should not be called because invoke_batch_from_args() is implemented")
+        .await
+        .map_err(|err| DataFusionError::External(Box::new(err)))?
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::StringArray;
-    use datafusion_common::cast::{as_struct_array, as_uint64_array};
+    use arrow_array::{StringArray, StructArray};
+    use datafusion_common::cast::as_struct_array;
     use datafusion_expr::ScalarUDFImpl;
-    use sedona_expr::scalar_udf::SedonaScalarKernel;
-    use sedona_schema::raster::{metadata_indices, raster_indices};
+    use sedona_raster::array::RasterStructArray;
+    use sedona_raster::traits::RasterRef;
     use sedona_testing::data::test_raster;
 
     #[test]
     fn test_rs_from_path_udf_name() {
         assert_eq!(rs_frompath_udf().name(), "rs_frompath");
+    }
+
+    #[test]
+    fn test_rs_from_path_async_udf_is_async() {
+        assert!(rs_frompath_udf().to_datafusion_udf().as_async().is_some());
     }
 
     fn assert_raster_dimensions(
@@ -129,42 +177,29 @@ mod tests {
         width: u64,
         height: u64,
     ) {
+        fn assert_struct_array_dimensions(
+            struct_arr: &StructArray,
+            expected_len: usize,
+            width: u64,
+            height: u64,
+        ) {
+            let raster_array = RasterStructArray::new(struct_arr);
+            assert_eq!(raster_array.len(), expected_len);
+
+            for idx in 0..expected_len {
+                let raster = raster_array.get(idx).unwrap();
+                assert_eq!(raster.metadata().width(), width);
+                assert_eq!(raster.metadata().height(), height);
+            }
+        }
+
         match result {
             ColumnarValue::Array(arr) => {
                 let struct_arr = as_struct_array(arr).unwrap();
-                assert_eq!(struct_arr.len(), expected_len);
-
-                let metadata_struct =
-                    as_struct_array(struct_arr.column(raster_indices::METADATA)).unwrap();
-                for idx in 0..expected_len {
-                    let actual_width =
-                        as_uint64_array(metadata_struct.column(metadata_indices::WIDTH))
-                            .unwrap()
-                            .value(idx);
-                    let actual_height =
-                        as_uint64_array(metadata_struct.column(metadata_indices::HEIGHT))
-                            .unwrap()
-                            .value(idx);
-
-                    assert_eq!(actual_width, width);
-                    assert_eq!(actual_height, height);
-                }
+                assert_struct_array_dimensions(struct_arr, expected_len, width, height);
             }
             ColumnarValue::Scalar(ScalarValue::Struct(struct_arr)) => {
-                assert_eq!(struct_arr.len(), 1);
-
-                let metadata_struct =
-                    as_struct_array(struct_arr.column(raster_indices::METADATA)).unwrap();
-                let actual_width = as_uint64_array(metadata_struct.column(metadata_indices::WIDTH))
-                    .unwrap()
-                    .value(0);
-                let actual_height =
-                    as_uint64_array(metadata_struct.column(metadata_indices::HEIGHT))
-                        .unwrap()
-                        .value(0);
-
-                assert_eq!(actual_width, width);
-                assert_eq!(actual_height, height);
+                assert_struct_array_dimensions(struct_arr, expected_len, width, height);
             }
             other => panic!("Unexpected result: {other:?}"),
         }
@@ -177,48 +212,24 @@ mod tests {
         let paths = Arc::new(StringArray::from(vec![path.as_str()]));
         let input = ColumnarValue::Array(paths);
 
-        let kernel = RsFromPath;
-        let result = kernel
-            .invoke_batch_from_args(&[], &[input], &SedonaType::Arrow(DataType::Null), 0, None)
-            .expect("Should invoke successfully");
+        let result = invoke_rs_frompath(vec![input], 0, None).expect("Should invoke successfully");
 
         assert_raster_dimensions(&result, 1, 10, 10);
 
         let scalar_input = ColumnarValue::Scalar(ScalarValue::Utf8(Some(path.clone())));
-        let scalar_result = kernel
-            .invoke_batch_from_args(
-                &[],
-                &[scalar_input],
-                &SedonaType::Arrow(DataType::Null),
-                0,
-                None,
-            )
+        let scalar_result = invoke_rs_frompath(vec![scalar_input], 0, None)
             .expect("Should invoke successfully for scalar path");
 
         assert_raster_dimensions(&scalar_result, 1, 10, 10);
 
         let multi_paths = Arc::new(StringArray::from(vec![path.as_str(), path.as_str()]));
-        let multi_result = kernel
-            .invoke_batch_from_args(
-                &[],
-                &[ColumnarValue::Array(multi_paths)],
-                &SedonaType::Arrow(DataType::Null),
-                0,
-                None,
-            )
+        let multi_result = invoke_rs_frompath(vec![ColumnarValue::Array(multi_paths)], 0, None)
             .expect("Should invoke successfully for multiple paths");
 
         assert_raster_dimensions(&multi_result, 2, 10, 10);
 
         let empty_paths = Arc::new(StringArray::from(Vec::<&str>::new()));
-        let empty_result = kernel
-            .invoke_batch_from_args(
-                &[],
-                &[ColumnarValue::Array(empty_paths)],
-                &SedonaType::Arrow(DataType::Null),
-                0,
-                None,
-            )
+        let empty_result = invoke_rs_frompath(vec![ColumnarValue::Array(empty_paths)], 0, None)
             .expect("Should invoke successfully for empty paths");
 
         match empty_result {
@@ -237,8 +248,7 @@ mod tests {
         let input =
             ColumnarValue::Array(Arc::new(StringArray::from(vec![Some(path.as_str()), None])));
 
-        let result = RsFromPath
-            .invoke_batch_from_args(&[], &[input], &SedonaType::Arrow(DataType::Null), 0, None)
+        let result = invoke_rs_frompath(vec![input], 0, None)
             .expect("Should invoke successfully for null-containing input");
 
         match result {
@@ -248,18 +258,10 @@ mod tests {
                 assert!(!struct_arr.is_null(0));
                 assert!(struct_arr.is_null(1));
 
-                let metadata_struct =
-                    as_struct_array(struct_arr.column(raster_indices::METADATA)).unwrap();
-                let actual_width = as_uint64_array(metadata_struct.column(metadata_indices::WIDTH))
-                    .unwrap()
-                    .value(0);
-                let actual_height =
-                    as_uint64_array(metadata_struct.column(metadata_indices::HEIGHT))
-                        .unwrap()
-                        .value(0);
-
-                assert_eq!(actual_width, 10);
-                assert_eq!(actual_height, 10);
+                let raster_array = RasterStructArray::new(struct_arr);
+                let raster = raster_array.get(0).unwrap();
+                assert_eq!(raster.metadata().width(), 10);
+                assert_eq!(raster.metadata().height(), 10);
             }
             other => panic!("Expected array result, got {other:?}"),
         }
@@ -270,8 +272,7 @@ mod tests {
         let missing_path = "/definitely/missing/rs_from_path_test.tif";
         let input = ColumnarValue::Scalar(ScalarValue::Utf8(Some(missing_path.to_string())));
 
-        let err = RsFromPath
-            .invoke_batch_from_args(&[], &[input], &SedonaType::Arrow(DataType::Null), 0, None)
+        let err = invoke_rs_frompath(vec![input], 0, None)
             .expect_err("Missing path should return an error");
 
         let err_message = err.to_string();
