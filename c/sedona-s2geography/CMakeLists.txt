@@ -32,10 +32,16 @@ set(BUILD_SHARED_LIBS
     OFF
     CACHE BOOL "" FORCE)
 
-# Try to find s2 via find_package first (e.g., from vcpkg which has Windows patches)
-find_package(s2 QUIET)
+# Prefer externally packaged s2 only on Windows, where vcpkg carries the needed patches.
+# Elsewhere, vendoring is more reliable than inheriting whatever toolchain CMake was given.
+if(WIN32)
+  find_package(s2 QUIET)
+endif()
 
-if(NOT s2_FOUND)
+if(s2_FOUND)
+  message(STATUS "Found s2 via find_package")
+  set(S2_BUILT_FROM_SUBDIRECTORY FALSE)
+else()
   # Build s2geometry using its own CMake (v0.12.0 has proper add_subdirectory support).
   set(BUILD_TESTS
       OFF
@@ -45,9 +51,6 @@ if(NOT s2_FOUND)
       CACHE BOOL "" FORCE)
   add_subdirectory(s2geometry)
   set(S2_BUILT_FROM_SUBDIRECTORY TRUE)
-else()
-  message(STATUS "Found s2 via find_package")
-  set(S2_BUILT_FROM_SUBDIRECTORY FALSE)
 endif()
 
 if(WIN32 AND NOT MSVC)
