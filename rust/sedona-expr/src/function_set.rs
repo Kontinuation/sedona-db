@@ -16,7 +16,7 @@
 // under the License.
 use crate::{
     aggregate_udf::{IntoSedonaAccumulatorRefs, SedonaAggregateUDF},
-    scalar_udf::{IntoScalarKernelRefs, SedonaScalarUDF},
+    scalar_udf::{classify_kernel_async_mode, IntoScalarKernelRefs, SedonaScalarUDF},
 };
 use datafusion_common::error::Result;
 use datafusion_expr::{AggregateUDFImpl, ScalarUDFImpl};
@@ -84,8 +84,7 @@ impl FunctionSet {
 
     /// Consume another function set and merge its contents into this one
     pub fn merge(&mut self, other: FunctionSet) {
-        for (k, v) in other.scalar_udfs.into_iter() {
-            debug_assert_eq!(k, v.name());
+        for (_k, v) in other.scalar_udfs.into_iter() {
             self.insert_scalar_udf(v);
         }
 
@@ -104,15 +103,16 @@ impl FunctionSet {
         kernels: impl IntoScalarKernelRefs,
     ) -> Result<&SedonaScalarUDF> {
         let kernels = kernels.into_scalar_kernel_refs();
+        let incoming_is_async = classify_kernel_async_mode(&kernels)?;
         if let Some(function) = self.scalar_udf_mut(name) {
-            if function.is_async() != kernels.iter().all(|kernel| kernel.as_async().is_some()) {
+            if function.is_async() != incoming_is_async {
                 return datafusion_common::internal_err!(
                     "{name}: cannot mix sync and async kernels in one SedonaScalarUDF"
                 );
             }
             function.add_kernels(kernels);
         } else {
-            let function = if kernels.iter().all(|kernel| kernel.as_async().is_some()) {
+            let function = if incoming_is_async {
                 SedonaScalarUDF::from_async_impl(name, kernels, None)
             } else {
                 SedonaScalarUDF::from_impl(name, kernels)

@@ -82,6 +82,23 @@ enum SedonaScalarUDFMode {
     Async { ideal_batch_size: Option<usize> },
 }
 
+/// Classify a kernel list as fully sync or fully async.
+///
+/// Returns `Ok(false)` if all kernels are sync, `Ok(true)` if all kernels are
+/// async, and an error if sync and async kernels are mixed.
+pub(crate) fn classify_kernel_async_mode(kernels: &[ScalarKernelRef]) -> Result<bool> {
+    let any_async = kernels.iter().any(|kernel| kernel.as_async().is_some());
+    let any_sync = kernels.iter().any(|kernel| kernel.as_async().is_none());
+
+    match (any_sync, any_async) {
+        (true, false) | (false, false) => Ok(false),
+        (false, true) => Ok(true),
+        (true, true) => {
+            sedona_internal_err!("cannot mix sync and async kernels in one SedonaScalarUDF")
+        }
+    }
+}
+
 impl PartialEq for SedonaScalarUDF {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
@@ -150,11 +167,23 @@ pub trait SedonaScalarKernel: Debug + Send + Sync {
         self.invoke_batch(arg_types, args)
     }
 
+    /// Return this kernel as an async kernel, if available.
+    ///
+    /// SedonaDB uses this hook to determine whether all kernels in a
+    /// [SedonaScalarUDF] are synchronous or asynchronous, which in turn controls
+    /// whether the UDF is registered with DataFusion's sync or async scalar UDF path.
     fn as_async(&self) -> Option<&dyn AsyncSedonaScalarKernel> {
         None
     }
 }
 
+/// Async user-defined function implementation
+///
+/// Implement this trait for kernels that must be invoked asynchronously.
+/// Implementers should define the type-resolution methods and
+/// [AsyncSedonaScalarKernel::invoke_async_batch_from_args]. The blanket
+/// [SedonaScalarKernel] implementation for this trait ensures these kernels are
+/// treated as async-only and return an error if invoked from the synchronous path.
 #[async_trait]
 pub trait AsyncSedonaScalarKernel: Debug + Send + Sync {
     fn return_type(&self, args: &[SedonaType]) -> Result<Option<SedonaType>>;
@@ -167,6 +196,12 @@ pub trait AsyncSedonaScalarKernel: Debug + Send + Sync {
         self.return_type(args)
     }
 
+    /// Compute a batch of results asynchronously
+    ///
+    /// Implementers should put their async execution logic here. This method is
+    /// the async counterpart to [SedonaScalarKernel::invoke_batch_from_args] and
+    /// receives the resolved argument types, return type, row count, and optional
+    /// execution-time configuration.
     async fn invoke_async_batch_from_args(
         &self,
         arg_types: &[SedonaType],
@@ -333,7 +368,12 @@ impl SedonaScalarUDF {
         )
     }
 
-    /// TODO(kontinuation): write doc for this
+    /// Create an async SedonaScalarUDF from one or more kernels
+    ///
+    /// This constructor creates a [Volatility::Immutable] function with no
+    /// documentation consisting only of async kernel implementations. The
+    /// optional `ideal_async_batch_size` is forwarded to DataFusion's async UDF
+    /// execution path to control the preferred batch size for async invocation.
     pub fn from_async_impl(
         name: &str,
         kernels: impl IntoScalarKernelRefs,
@@ -381,10 +421,10 @@ impl SedonaScalarUDF {
 
     fn assert_kernel_mode(name: &str, kernels: &[ScalarKernelRef], mode: SedonaScalarUDFMode) {
         let expect_async = matches!(mode, SedonaScalarUDFMode::Async { .. });
+        let actual_async = classify_kernel_async_mode(kernels)
+            .unwrap_or_else(|err| panic!("{name}: {}", err.message()));
         assert!(
-            kernels
-                .iter()
-                .all(|kernel| kernel.as_async().is_some() == expect_async),
+            actual_async == expect_async,
             "{name}: all kernels must be {}",
             if expect_async { "async" } else { "sync" }
         );

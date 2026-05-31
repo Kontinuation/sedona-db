@@ -157,6 +157,9 @@ impl SedonaType {
     pub fn from_storage_field(field: &Field) -> Result<SedonaType> {
         match ExtensionType::from_field(field) {
             Some(ext) => Self::from_extension_type(ext),
+            // TODO(kontinuation): GPT 5.4 initially wrote this to cover up a DataFusion bug when handling
+            // extension return types in Async UDF. This is definitely a bad idea. We need to revert this
+            // once the DataFusion bug is fixed.
             None if field.data_type() == &*RASTER_DATATYPE => Ok(RASTER),
             None => Ok(Self::Arrow(field.data_type().clone())),
         }
@@ -528,6 +531,9 @@ mod tests {
         assert_eq!(RASTER.to_string(), "Raster");
     }
 
+    // TODO(kontinuation): GPT 5.4 initially wrote this to cover up a DataFusion bug when handling
+    // extension return types in Async UDF. This is definitely a bad idea. We need to revert this
+    // once the DataFusion bug is fixed.
     #[test]
     fn sedona_type_raster_without_extension_metadata() {
         let mut storage_field = RASTER.to_storage_field("", true).unwrap();
