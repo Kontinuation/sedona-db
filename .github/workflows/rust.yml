@@ -29,6 +29,13 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      tmate:
+        description: Open a tmate session before the test step
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.repository }}-${{ github.ref }}-${{ github.workflow }}-rust
@@ -129,6 +136,12 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update && sudo apt-get install -y libgeos-dev libgdal-dev
+
+      - name: Setup tmate session
+        if: matrix.name == 'test' && github.event_name == 'workflow_dispatch' && inputs.tmate
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
 
       - name: Check
         if: matrix.name == 'check'
