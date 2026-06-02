@@ -361,7 +361,7 @@ mod tests {
 
     use crate::driver::DriverManager;
     use crate::gdal_dyn_bindgen::{OGRwkbGeometryType, GDAL_OF_READONLY, GDAL_OF_VECTOR};
-    use crate::global::with_global_gdal_api;
+    use crate::global::{lock_gpkg_tests, with_global_gdal_api};
     use crate::vector::layer::Layer;
     use crate::vsi::unlink_mem_file;
 
@@ -434,6 +434,7 @@ mod tests {
 
     #[test]
     fn test_create_vector_layer() {
+        let _gpkg_test_guard = lock_gpkg_tests();
         with_global_gdal_api(|api| {
             let path = "/vsimem/test_dataset_create_vector_layer.gpkg";
             let driver = DriverManager::get_driver_by_name(api, "GPKG").unwrap();
@@ -459,6 +460,7 @@ mod tests {
 
     #[test]
     fn test_open_vector_dataset_with_open_ex() {
+        let _gpkg_test_guard = lock_gpkg_tests();
         with_global_gdal_api(|api| {
             let path = "/vsimem/test_dataset_open_vector.gpkg";
             let driver = DriverManager::get_driver_by_name(api, "GPKG").unwrap();

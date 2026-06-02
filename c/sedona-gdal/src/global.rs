@@ -214,6 +214,14 @@ where
     Ok(func(&Gdal::new(api)))
 }
 
+#[cfg(test)]
+pub(crate) fn lock_gpkg_tests() -> std::sync::MutexGuard<'static, ()> {
+    static GPKG_TEST_MUTEX: Mutex<()> = Mutex::new(());
+    GPKG_TEST_MUTEX
+        .lock()
+        .expect("GeoPackage test mutex should not be poisoned")
+}
+
 /// Verify that the GDAL library meets the minimum version requirement.
 ///
 /// We use `GDALVersionInfo("VERSION_NUM")` instead of `GDALCheckVersion` because

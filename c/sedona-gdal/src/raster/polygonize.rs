@@ -134,11 +134,12 @@ mod tests {
     fn test_polygonize_connectivity_affects_regions() {
         use crate::dataset::LayerOptions;
         use crate::driver::DriverManager;
-        use crate::global::with_global_gdal_api;
+        use crate::global::{lock_gpkg_tests, with_global_gdal_api};
         use crate::raster::types::Buffer;
         use crate::vector::feature::FieldDefn;
         use crate::vsi::unlink_mem_file;
 
+        let _gpkg_test_guard = lock_gpkg_tests();
         with_global_gdal_api(|api| {
             let mem_driver = DriverManager::get_driver_by_name(api, "MEM").unwrap();
             let raster_ds = mem_driver.create("", 3, 3, 1).unwrap();
@@ -219,11 +220,12 @@ mod tests {
     fn test_polygonize_with_mask_band_restricts_output() {
         use crate::dataset::LayerOptions;
         use crate::driver::DriverManager;
-        use crate::global::with_global_gdal_api;
+        use crate::global::{lock_gpkg_tests, with_global_gdal_api};
         use crate::raster::types::Buffer;
         use crate::vector::feature::FieldDefn;
         use crate::vsi::unlink_mem_file;
 
+        let _gpkg_test_guard = lock_gpkg_tests();
         with_global_gdal_api(|api| {
             let mem_driver = DriverManager::get_driver_by_name(api, "MEM").unwrap();
             let raster_ds = mem_driver.create("", 3, 3, 2).unwrap();

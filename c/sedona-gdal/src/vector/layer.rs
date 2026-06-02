@@ -130,12 +130,13 @@ mod tests {
     use crate::dataset::{Dataset, LayerOptions};
     use crate::driver::DriverManager;
     use crate::gdal_dyn_bindgen::OGRwkbGeometryType;
-    use crate::global::with_global_gdal_api;
+    use crate::global::{lock_gpkg_tests, with_global_gdal_api};
     use crate::vector::geometry::Geometry;
     use crate::vsi::unlink_mem_file;
 
     #[test]
     fn test_layer_iteration_and_reset() {
+        let _gpkg_test_guard = lock_gpkg_tests();
         with_global_gdal_api(|api| {
             let path = "/vsimem/test_layer_iteration.gpkg";
             let driver = DriverManager::get_driver_by_name(api, "GPKG").unwrap();
